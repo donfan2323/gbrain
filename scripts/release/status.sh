@@ -26,9 +26,13 @@ if [ -L "$CURRENT_LINK" ]; then
       const fs = require("fs");
       const m = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       console.log(`  version:     ${m.version}`);
+      console.log(`  bundle_type: ${m.bundle_type}`);
       console.log(`  git_sha:     ${m.git_sha_short} (dirty=${m.source_dirty})`);
       console.log(`  built_at:    ${m.built_at}`);
-      console.log(`  checksum:    ${m.checksum_sha256}`);
+      const bunInfo = m.bun_runtime ? (m.bun_runtime.version + " (" + m.bun_runtime.sha256 + ")") : "unknown";
+      console.log("  bun runtime: " + bunInfo);
+      console.log(`  launcher:    ${m.launcher_checksum_sha256}`);
+      console.log(`  node_modules digest: ${m.node_modules_digest_sha256}`);
     ' "$CUR/manifest.json"
   fi
 else
