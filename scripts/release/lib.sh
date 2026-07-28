@@ -187,6 +187,44 @@ is_protected_release() {
 }
 
 # ---------------------------------------------------------------------------
+# Deploy/rollback mutual-exclusion lock. mkdir-based (atomic on POSIX),
+# PID-tracked, stale-holder reaping. Shared by deploy.sh and rollback.sh —
+# previously duplicated verbatim in both (found by architect review during
+# this Unit's final design pass); a future edit to one without the other
+# would have silently desynced locking behavior.
+# ---------------------------------------------------------------------------
+
+DEPLOY_LOCK_DIR="$GBRAIN_PROD_ROOT/.deploy-lock"
+DEPLOY_LOCK_HELD=0
+
+acquire_deploy_lock() {
+  local tries=0
+  while ! mkdir "$DEPLOY_LOCK_DIR" 2>/dev/null; do
+    if [ -f "$DEPLOY_LOCK_DIR/pid" ]; then
+      local holder_pid
+      holder_pid="$(cat "$DEPLOY_LOCK_DIR/pid" 2>/dev/null || echo "")"
+      if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
+        log "stale deploy lock held by dead pid $holder_pid — removing"
+        rm -rf "$DEPLOY_LOCK_DIR"
+        continue
+      fi
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -ge "${GBRAIN_DEPLOY_LOCK_MAX_TRIES:-30}" ]; then
+      die "another deploy/rollback appears to be in progress (lock: $DEPLOY_LOCK_DIR) — refusing to run concurrently"
+    fi
+    sleep "${GBRAIN_DEPLOY_LOCK_SLEEP:-1}"
+  done
+  mkdir -p "$DEPLOY_LOCK_DIR"
+  echo $$ > "$DEPLOY_LOCK_DIR/pid"
+  DEPLOY_LOCK_HELD=1
+}
+
+release_deploy_lock() {
+  [ "$DEPLOY_LOCK_HELD" = "1" ] && rm -rf "$DEPLOY_LOCK_DIR"
+}
+
+# ---------------------------------------------------------------------------
 # Service control. Real mode uses launchctl (macOS). Test mode manages the
 # release binary as a plain background process so the deploy/rollback/
 # smoke-test logic is fully exercisable without registering a real launchd

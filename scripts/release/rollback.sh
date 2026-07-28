@@ -15,38 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 SCRIPT_LOG_NAME="rollback"
 
-LOCK_DIR="$GBRAIN_PROD_ROOT/.deploy-lock"
-
-acquire_deploy_lock() {
-  local tries=0
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    if [ -f "$LOCK_DIR/pid" ]; then
-      local holder_pid
-      holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")"
-      if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
-        log "stale deploy lock held by dead pid $holder_pid — removing"
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    fi
-    tries=$((tries + 1))
-    if [ "$tries" -ge "${GBRAIN_DEPLOY_LOCK_MAX_TRIES:-30}" ]; then
-      die "a deploy/rollback appears to already be in progress (lock: $LOCK_DIR) — refusing to run concurrently"
-    fi
-    sleep "${GBRAIN_DEPLOY_LOCK_SLEEP:-1}"
-  done
-  mkdir -p "$LOCK_DIR"
-  echo $$ > "$LOCK_DIR/pid"
-}
-
-LOCK_HELD=0
-release_deploy_lock() {
-  [ "$LOCK_HELD" = "1" ] && rm -rf "$LOCK_DIR"
-}
 trap release_deploy_lock EXIT
-
 acquire_deploy_lock
-LOCK_HELD=1
 
 [ -L "$CURRENT_LINK" ] || die "no 'current' release exists — nothing to roll back from"
 [ -L "$PREVIOUS_LINK" ] || die "no 'previous' release exists — nothing to roll back to. (Only one deploy has ever happened, or previous was never set.)"

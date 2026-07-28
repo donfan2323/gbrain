@@ -21,38 +21,8 @@ RELEASE_DIR="$(resolve_release_path "$1")"
 
 mkdir -p "$RELEASES_DIR" "$SHARED_DIR" "$SHARED_LOGS_DIR" "$SHARED_BACKUPS_DIR"
 
-LOCK_DIR="$GBRAIN_PROD_ROOT/.deploy-lock"
-
-acquire_deploy_lock() {
-  local tries=0
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    if [ -f "$LOCK_DIR/pid" ]; then
-      local holder_pid
-      holder_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")"
-      if [ -n "$holder_pid" ] && ! kill -0 "$holder_pid" 2>/dev/null; then
-        log "stale deploy lock held by dead pid $holder_pid — removing"
-        rm -rf "$LOCK_DIR"
-        continue
-      fi
-    fi
-    tries=$((tries + 1))
-    if [ "$tries" -ge "${GBRAIN_DEPLOY_LOCK_MAX_TRIES:-30}" ]; then
-      die "another deploy appears to be in progress (lock: $LOCK_DIR) — refusing double-deploy"
-    fi
-    sleep "${GBRAIN_DEPLOY_LOCK_SLEEP:-1}"
-  done
-  mkdir -p "$LOCK_DIR"
-  echo $$ > "$LOCK_DIR/pid"
-}
-
-LOCK_HELD=0
-release_deploy_lock() {
-  [ "$LOCK_HELD" = "1" ] && rm -rf "$LOCK_DIR"
-}
 trap release_deploy_lock EXIT
-
 acquire_deploy_lock
-LOCK_HELD=1
 log "deploy lock acquired (pid $$) for $RELEASE_DIR"
 
 # --- 1. Preflight. Never touches current/previous or the service.
@@ -63,12 +33,24 @@ MANIFEST_VERSION="$(bun -e '
   console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version);
 ' "$RELEASE_DIR/manifest.json")"
 
-# --- 2. Record rollback target (may be empty on a first-ever deploy).
+# --- 2. Record rollback target (may be empty on a first-ever deploy), AND
+# whatever `previous` already pointed to before this attempt. Without
+# capturing OLD_PREVIOUS, an auto-rollback-on-failure below would leave
+# `previous` pointing at the same release as `current` (both = OLD_CURRENT)
+# instead of restoring the state this deploy attempt actually started from
+# — silently losing the older release's protected-from-cleanup status and
+# making a subsequent manual rollback.sh a no-op (found by architect review
+# during this Unit's final design pass).
 OLD_CURRENT=""
 if [ -L "$CURRENT_LINK" ]; then
   OLD_CURRENT="$(readlink "$CURRENT_LINK")"
 fi
+OLD_PREVIOUS=""
+if [ -L "$PREVIOUS_LINK" ]; then
+  OLD_PREVIOUS="$(readlink "$PREVIOUS_LINK")"
+fi
 log "current release before this deploy: ${OLD_CURRENT:-<none — first deploy>}"
+log "previous release before this deploy: ${OLD_PREVIOUS:-<none>}"
 
 # --- 3. Stop.
 log "stopping service"
@@ -133,6 +115,14 @@ service_stop
 wait_for_port_free 15 || true
 atomic_symlink "$OLD_CURRENT" "$CURRENT_LINK"
 log "current rolled back -> $OLD_CURRENT"
+# Restore `previous` to what it was before this deploy attempt (may be
+# empty, if this was only the second deploy ever) — undoing step 5's
+# `previous <- OLD_CURRENT` above, so a failed+rolled-back attempt leaves
+# the two-slot history exactly as it was, not collapsed to one release.
+if [ -n "$OLD_PREVIOUS" ]; then
+  atomic_symlink "$OLD_PREVIOUS" "$PREVIOUS_LINK"
+  log "previous restored -> $OLD_PREVIOUS"
+fi
 update_plist_and_start "$OLD_CURRENT"
 
 if "$SCRIPT_DIR/smoke-test.sh"; then
