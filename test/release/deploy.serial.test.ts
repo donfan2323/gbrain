@@ -186,7 +186,11 @@ describe('deploy.sh', () => {
         15_000,
       );
       expect(result.status).not.toBe(0);
-      expect(result.stdout + result.stderr).toMatch(/refusing double-deploy/);
+      // Message unified in lib.sh's shared acquire_deploy_lock (previously
+      // duplicated per-script with slightly different wording) — asserting
+      // on the "refusing" verb + "concurrent"/"progress" framing rather
+      // than the exact pre-refactor string.
+      expect(result.stdout + result.stderr).toMatch(/refusing to run concurrently|already.*in progress/);
       // Lock dir left in place (not silently removed out from under the
       // "other" in-progress deploy).
       expect(existsSync(lockDir)).toBe(true);
