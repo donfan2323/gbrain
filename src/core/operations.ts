@@ -16,7 +16,7 @@ import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
 import type { HybridSearchMeta } from './types.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, isRemoteAutoLinkEnabled, isRemoteAutoTimelineEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from './link-extraction.ts';
 import { isFactsBackstopEligible } from './facts/eligibility.ts';
 import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
@@ -769,7 +769,7 @@ const get_page: Operation = {
 
 const put_page: Operation = {
   name: 'put_page',
-  description: 'Write/update a page (markdown with frontmatter). Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` — capture reads the file as a Buffer with a binary-NUL guard and adds provenance write-through (v0.39.3.0).',
+  description: 'Creates or overwrites a page in the gbrain knowledge base (markdown with frontmatter) — not a generic file-write tool. Requires write scope; not available to read-only connections. Chunks, embeds, reconciles tags, and (when auto_link/auto_timeline are enabled) extracts + reconciles graph links and timeline entries. For large content on Windows (pipe-buffer limit ~45KB) or any file-as-input workflow, use `gbrain capture --file PATH --slug SLUG` instead.',
   params: {
     slug: { type: 'string', required: true, description: 'Page slug' },
     content: { type: 'string', required: true, description: 'Full markdown content with YAML frontmatter' },
@@ -943,15 +943,28 @@ const put_page: Operation = {
     // transaction). Runs even on status='skipped' so reconciliation catches drift
     // between the page text and the links table. Failures are non-blocking.
     //
-    // SECURITY: skipped for remote (MCP) callers. Auto-link's bare-slug regex
-    // matches `people/X` etc. anywhere in page text, including code fences,
-    // quoted strings, and prompt-injected content. An untrusted page can plant
-    // arbitrary outbound links by including `see meetings/board-q1` in its body.
-    // Combined with the backlink boost in hybridSearch, attacker-placed targets
-    // would surface higher in search. Local CLI users (ctx.remote=false) opt
-    // into this behavior; MCP/remote writes do not.
+    // SECURITY: fully disabled by default for remote (MCP) callers. Auto-link's
+    // bare-slug regex matches `people/X` etc. anywhere in page text, including
+    // code fences, quoted strings, and prompt-injected content. An untrusted
+    // page can plant arbitrary outbound links by including `see meetings/board-q1`
+    // in its body. Combined with the backlink boost in hybridSearch, attacker-
+    // placed targets would surface higher in search. Local CLI users
+    // (ctx.remote=false) opt into the full local behavior below unconditionally.
+    //
+    // v0.43 (dashboard-h0cfe, client-agnostic remote auto-link): remote callers
+    // may ADDITIONALLY opt into a narrower path, gated by the same transport
+    // boundary (ctx.remote — never client name/vendor/User-Agent) plus a
+    // separate, default-OFF config flag (isRemoteAutoLinkEnabled /
+    // isRemoteAutoTimelineEnabled). Links created there are tagged
+    // link_source='remote-auto' (runAutoLink's linkSourceTag opt), which
+    // excludes them from getBacklinkCounts' ranking boost (pglite-engine.ts /
+    // postgres-engine.ts) while still counting toward link_count/orphan-
+    // reduction/graph traversal, and NEVER includes frontmatter-authored
+    // incoming-direction edges (an untrusted page could otherwise attribute a
+    // relationship onto an arbitrary existing page it doesn't own without
+    // writing to it). This closes the threat above without loosening it.
     let autoLinks:
-      | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
+      | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[]; truncated?: number }
       | { error: string }
       | { skipped: 'remote' }
       | undefined;
@@ -968,6 +981,41 @@ const put_page: Operation = {
     if (ctx.remote !== false && !trustedWorkspace) {
       autoLinks = { skipped: 'remote' };
       autoTimeline = { skipped: 'remote' };
+      if (result.parsedPage) {
+        try {
+          const remoteLinkEnabled = await isRemoteAutoLinkEnabled(ctx.engine);
+          if (remoteLinkEnabled) {
+            autoLinks = await runAutoLink(ctx.engine, slug, result.parsedPage, {
+              ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+              linkSourceTag: 'remote-auto',
+              maxCandidates: REMOTE_AUTO_LINK_MAX_CANDIDATES,
+            });
+          }
+        } catch (e) {
+          autoLinks = { error: e instanceof Error ? e.message : String(e) };
+        }
+        try {
+          const remoteTimelineEnabled = await isRemoteAutoTimelineEnabled(ctx.engine);
+          if (remoteTimelineEnabled) {
+            const fullContent = result.parsedPage.compiled_truth + '\n' + result.parsedPage.timeline;
+            const entries = parseTimelineEntries(fullContent);
+            if (entries.length > 0) {
+              const batch = entries.map(e => ({
+                slug,
+                date: e.date,
+                summary: e.summary,
+                detail: e.detail || '',
+              }));
+              const created = await ctx.engine.addTimelineEntriesBatch(batch, { auditSite: 'mcp.put_page.remote_auto' });
+              autoTimeline = { created };
+            } else {
+              autoTimeline = { created: 0 };
+            }
+          }
+        } catch (e) {
+          autoTimeline = { error: e instanceof Error ? e.message : String(e) };
+        }
+      }
     } else if (result.parsedPage) {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
@@ -1130,12 +1178,18 @@ const put_page: Operation = {
  * counted; the overall function never throws (catch in put_page handler covers
  * extraction errors).
  */
+// v0.43 (dashboard-h0cfe): cap on candidate links per put_page call when
+// `linkSourceTag` is set (remote-auto path only). Defense-in-depth against
+// one page flooding the graph with edges; excess candidates are dropped
+// (not silently — surfaced via the `truncated` field on the return value).
+const REMOTE_AUTO_LINK_MAX_CANDIDATES = 50;
+
 async function runAutoLink(
   engine: BrainEngine,
   slug: string,
   parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
-  opts?: { sourceId?: string },
-): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }> {
+  opts?: { sourceId?: string; linkSourceTag?: string; maxCandidates?: number },
+): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[]; truncated?: number }> {
   const fullContent = parsed.compiled_truth + '\n' + parsed.timeline;
   // v0.31.8 (codex OV-2): thread sourceId through every read + write inside
   // reconcileLinks. Without this the FS walker reads cross-source links/slugs
@@ -1182,8 +1236,37 @@ async function runAutoLink(
   // but SCOPED to the frontmatter edges this page authored via
   // (link_source='frontmatter' AND origin_slug = slug). We never touch
   // frontmatter edges authored by OTHER pages.
-  const out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
-  const inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+  let out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
+  let inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+
+  // v0.43 (dashboard-h0cfe, remote auto-link threat model): when a
+  // linkSourceTag is supplied (remote-caller opt-in path only — never set
+  // for local CLI or trusted-subagent callers), narrow the candidate set:
+  //  - drop self-links (a page mentioning its own slug must never create
+  //    a self-loop edge — the general markdown/bare-slug path has no such
+  //    guard otherwise, unlike the basename-wikilink path).
+  //  - drop ALL incoming-direction candidates entirely. Frontmatter
+  //    `direction: incoming` fields let a page attribute a relationship
+  //    edge onto an arbitrary EXISTING page (fuzzy-resolved) without ever
+  //    writing to it — out of scope for v1 remote automation regardless of
+  //    the ranking-boost exclusion below, since that risk is about graph
+  //    integrity, not just search ranking.
+  //  - cap the remaining candidate count (defense-in-depth), surfacing the
+  //    drop count rather than silently truncating.
+  //  - retag every surviving candidate with linkSourceTag so it (a) writes
+  //    to the DB under that tag and (b) is excluded from getBacklinkCounts'
+  //    ranking boost (pglite-engine.ts / postgres-engine.ts).
+  let truncated = 0;
+  if (opts?.linkSourceTag != null) {
+    out = out.filter(c => c.targetSlug !== slug);
+    inc = [];
+    if (opts.maxCandidates != null && out.length > opts.maxCandidates) {
+      truncated = out.length - opts.maxCandidates;
+      out = out.slice(0, opts.maxCandidates);
+    }
+    const tag = opts.linkSourceTag;
+    out = out.map(c => ({ ...c, linkSource: tag }));
+  }
 
   // Run getLinks + addLink/removeLink loops inside a single transaction so that
   // concurrent put_page calls on the same slug can't race the reconciliation:
@@ -1205,7 +1288,13 @@ async function runAutoLink(
     const existingOut = await tx.getLinks(slug, sourceOpts);
     // Incoming: we only look at frontmatter edges WE authored (origin_slug=slug).
     // Non-frontmatter and other-page frontmatter edges survive untouched.
-    const existingInRaw = await tx.getBacklinks(slug, sourceOpts);
+    //
+    // v0.43: the remote-auto path (linkSourceTag set) never creates incoming
+    // edges (inc is forced empty above), so it must never READ or reconcile
+    // them either — a remote-auto call on a page that also has pre-existing
+    // LOCALLY-authored incoming frontmatter edges must leave them completely
+    // untouched, not remove them for "not being in this call's incKeys".
+    const existingInRaw = opts?.linkSourceTag != null ? [] : await tx.getBacklinks(slug, sourceOpts);
     const existingIn = existingInRaw.filter(
       l => l.link_source === 'frontmatter' && l.origin_slug === slug,
     );
@@ -1218,11 +1307,21 @@ async function runAutoLink(
     // survive after the wikilink is deleted from the page OR the
     // link_resolution.global_basename flag is turned off (out no longer
     // includes it, so the stale-removal loop below must be allowed to drop it).
-    const reconcilableOut = existingOut.filter(
-      l => l.link_source === 'markdown' || l.link_source == null ||
-           l.link_source === 'wikilink-resolved' ||
-           (l.link_source === 'frontmatter' && l.origin_slug === slug),
-    );
+    //
+    // v0.43: when linkSourceTag is set (remote-auto), scope reconciliation
+    // to ONLY edges previously created under that same tag. This call's
+    // `out` set only ever contains that tag's candidates, so reconciling
+    // against the broader local-mode categories (markdown/wikilink-resolved/
+    // frontmatter) would incorrectly flag pre-existing LOCALLY-authored
+    // edges as "stale" (not in this call's outKeys) and delete them —
+    // remote-auto must never touch edges it didn't itself create.
+    const reconcilableOut = opts?.linkSourceTag != null
+      ? existingOut.filter(l => l.link_source === opts.linkSourceTag)
+      : existingOut.filter(
+          l => l.link_source === 'markdown' || l.link_source == null ||
+               l.link_source === 'wikilink-resolved' ||
+               (l.link_source === 'frontmatter' && l.origin_slug === slug),
+        );
 
     const outKeys = new Set(out.map(c =>
       `${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`
@@ -1298,12 +1397,12 @@ async function runAutoLink(
     return { created, removed, errors };
   });
 
-  return { ...result, unresolved };
+  return { ...result, unresolved, ...(truncated > 0 ? { truncated } : {}) };
 }
 
 const delete_page: Operation = {
   name: 'delete_page',
-  description: 'Soft-delete a page. The row is hidden from search and from get_page/list_pages, but is recoverable via restore_page within 72h. The autopilot purge phase hard-deletes after the recovery window. Pass include_deleted: true to get_page to verify the soft-delete landed.',
+  description: 'Soft-deletes a page in the gbrain knowledge base (not a permanent delete) — hides it from search and from get_page/list_pages, but keeps it recoverable via restore_page within 72h (hard-deleted afterward by the autopilot purge phase). Requires write scope; not available to read-only connections. This is a destructive-leaning operation — confirm with the user before calling it. Pass include_deleted: true to get_page to verify the soft-delete landed.',
   params: {
     slug: { type: 'string', required: true },
   },
@@ -1846,7 +1945,7 @@ const takes_calibration: Operation = {
 
 const think: Operation = {
   name: 'think',
-  description: 'Multi-hop synthesis across pages + takes + graph. Pulls relevant evidence and produces a cited answer with conflict + gap analysis.',
+  description: 'Runs multi-hop synthesis across gbrain pages, takes, and the link graph to produce a cited answer with conflict + gap analysis. This is a gbrain knowledge-base operation, not a request for the calling model\'s own reasoning process. Requires write scope; not available to read-only connections — read-only callers should use search or query instead.',
   scope: 'write',
   params: {
     question: { type: 'string', required: true, description: 'The question to think about' },
@@ -2225,7 +2324,7 @@ const get_timeline: Operation = {
 
 const get_stats: Operation = {
   name: 'get_stats',
-  description: 'Brain statistics (page count, chunk count, etc.)',
+  description: 'gbrain\'s full administrative statistics (page count, chunk count, and related internals). Requires admin scope; not available to read-only connections. For basic version/page/chunk counts under read scope, use get_brain_identity instead.',
   params: {},
   handler: async (ctx) => {
     return ctx.engine.getStats();
@@ -2236,7 +2335,7 @@ const get_stats: Operation = {
 
 const get_health: Operation = {
   name: 'get_health',
-  description: 'Brain health dashboard (embed coverage, stale pages, orphans)',
+  description: 'gbrain\'s own internal health dashboard (embed coverage, stale pages, orphans) — not the health of ChatGPT or any other connected service. Requires admin scope; not available to read-only connections. For basic version/page/chunk counts under read scope, use get_brain_identity instead (it does not include health diagnostics).',
   params: {},
   handler: async (ctx) => {
     return ctx.engine.getHealth();
@@ -2260,7 +2359,7 @@ const get_health: Operation = {
  */
 const get_brain_identity: Operation = {
   name: 'get_brain_identity',
-  description: 'Brain identity + counters for thin-client banner. Returns version, engine kind, and page/chunk counts. Read-scope.',
+  description: 'Lightweight gbrain identity and basic counters (version, engine kind, page count, chunk count). Read scope — available to read-only connections. This is not a full health report or admin statistics; get_health and get_stats require admin scope and return more detail.',
   params: {},
   handler: async (ctx) => {
     const stats = await ctx.engine.getStats();
@@ -2380,11 +2479,12 @@ const list_brain_skillpack: Operation = {
 const advisor: Operation = {
   name: 'advisor',
   description:
-    'Ranked, read-only "what to do next" for this brain: version drift, pending migrations, ' +
+    'Ranked, read-only "what to do next" for this gbrain instance: version drift, pending migrations, ' +
     'schema-pack issues, stalled jobs, usage-shape gaps, and setup smells. Each finding has a ' +
-    'severity, why-it-matters, and the exact fix command. Never mutates. Tell the user; ask ' +
-    'before running any fix. Gated by mcp.publish_advisor (separate from mcp.publish_skills ' +
-    'because diagnostics are not prose skills).',
+    'severity, why-it-matters, and the exact fix command. Never mutates — tell the user the findings ' +
+    'and ask before running any fix. May be disabled by the operator (mcp.publish_advisor); throws a ' +
+    'permission_denied error in that case. Covers different ground than get_health or run_doctor (both ' +
+    'admin scope) — not a drop-in replacement for either.',
   params: {},
   handler: async (ctx) => {
     // Publish gate: a remote caller needs mcp.publish_advisor=true. Local
@@ -2518,7 +2618,7 @@ const get_status_snapshot: Operation = {
  */
 const run_doctor: Operation = {
   name: 'run_doctor',
-  description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface).',
+  description: 'Runs gbrain\'s internal health checks and returns a structured DoctorReport. Requires admin scope; not available to read-only connections. Covers similar ground to advisor (read scope) but returns a differently-shaped report — the two are not interchangeable.',
   params: {},
   handler: async (ctx) => {
     const { doctorReportRemote } = await import('../commands/doctor.ts');
@@ -2551,7 +2651,7 @@ const get_versions: Operation = {
 
 const revert_version: Operation = {
   name: 'revert_version',
-  description: 'Revert page to a previous version',
+  description: 'Overwrites a gbrain page\'s current content with one of its previous versions — a destructive, write-scope operation. Requires write scope; not available to read-only connections. Confirm with the user before calling it.',
   params: {
     slug: { type: 'string', required: true },
     version_id: { type: 'number', required: true },
@@ -2937,7 +3037,7 @@ const submit_job: Operation = {
 //      (agent.use_gateway_loop is auto-on for submit_agent jobs).
 const submit_agent: Operation = {
   name: 'submit_agent',
-  description: 'Submit an LLM agent job that the worker dispatches via the gateway-native tool loop. Requires the `agent` OAuth scope. Tools, source, slug prefixes, max concurrency, and daily budget are bound at OAuth client registration time.',
+  description: 'Submits an LLM agent job to gbrain\'s own job queue, dispatched via the gateway-native tool loop. Requires the `agent` OAuth scope — a scope independent from read/write/admin, bound to allowed tools, source, slug prefixes, concurrency, and daily budget at OAuth client registration time. Not available unless the connecting OAuth client was registered with agent scope.',
   params: {
     prompt: { type: 'string', required: true, description: 'User prompt for the agent' },
     model: { type: 'string', description: 'provider:model string (defaults to models.tier.subagent)' },
@@ -3131,7 +3231,7 @@ const list_jobs: Operation = {
 
 const cancel_job: Operation = {
   name: 'cancel_job',
-  description: 'Cancel a waiting, active, or delayed job',
+  description: 'Cancels a waiting, active, or delayed job in gbrain\'s own job queue (not an external task scheduler). Requires admin scope; not available to read-only connections.',
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
@@ -3149,7 +3249,7 @@ const cancel_job: Operation = {
 
 const retry_job: Operation = {
   name: 'retry_job',
-  description: 'Re-queue a failed or dead job for retry',
+  description: 'Re-queues a failed or dead job in gbrain\'s own job queue for another attempt. Requires admin scope; not available to read-only connections.',
   params: {
     id: { type: 'number', required: true, description: 'Job ID' },
   },
@@ -3215,7 +3315,7 @@ const resume_job: Operation = {
 
 const replay_job: Operation = {
   name: 'replay_job',
-  description: 'Replay a completed/failed/dead job, optionally with modified data',
+  description: 'Replays a completed, failed, or dead job in gbrain\'s own job queue, optionally with modified input data. Requires admin scope; not available to read-only connections.',
   params: {
     id: { type: 'number', required: true, description: 'Source job ID to replay' },
     data_overrides: { type: 'object', required: false, description: 'Data fields to override (merged with original)' },
@@ -3714,12 +3814,12 @@ const get_recent_transcripts: Operation = {
 const whoami: Operation = {
   name: 'whoami',
   description:
-    'Introspect the calling identity. Returns one of three transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
+    'Introspects the calling identity for this gbrain connection only (not a ' +
+    'general auth check for other services). Returns one of three transport ' +
+    'shapes: {transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
     '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
     '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
-    'context is ambiguous (remote=true without auth) — fail-closed posture ' +
-    'mirroring the v0.26.9 trust-boundary contract.',
+    'context is ambiguous (remote=true without auth).',
   params: {},
   scope: 'read',
   handler: async (ctx) => {
@@ -3842,9 +3942,11 @@ const sources_add: Operation = {
 const sources_list: Operation = {
   name: 'sources_list',
   description:
-    'List registered sources with page counts and remote_url. v0.28 surfaces ' +
-    'the new remote_url field so a remote MCP caller can confirm a source is ' +
-    'managed by clone+pull rather than user-supplied path.',
+    'Lists the content sources (git repos or similar) registered in this ' +
+    'gbrain instance, with page counts and remote_url — not a list of ' +
+    'external data sources for other apps. v0.28 surfaces remote_url so a ' +
+    'remote MCP caller can confirm a source is managed by clone+pull rather ' +
+    'than a user-supplied path.',
   params: {
     include_archived: { type: 'boolean', description: 'Include soft-deleted sources.' },
   },
@@ -3863,10 +3965,11 @@ const sources_list: Operation = {
 const sources_remove: Operation = {
   name: 'sources_remove',
   description:
-    'Hard-remove a source (cascades pages/chunks/embeddings). Refuses to ' +
-    'delete the auto-managed clone dir unless its resolved path is confined ' +
-    'under $GBRAIN_HOME/clones/ (realpath+lstat — symlink-safe). For most ' +
-    'workflows prefer sources_archive for the soft-delete path.',
+    'Permanently removes a source from this gbrain instance, cascading the ' +
+    'deletion to its pages, chunks, and embeddings — this cannot be undone. ' +
+    'Requires sources_admin scope; not available to read-only connections. ' +
+    'Refuses to delete the auto-managed clone dir unless its resolved path ' +
+    'is confined under $GBRAIN_HOME/clones/ (realpath+lstat — symlink-safe).',
   params: {
     id: { type: 'string', required: true },
     confirm_destructive: {
@@ -3897,7 +4000,8 @@ const sources_remove: Operation = {
 const sources_status: Operation = {
   name: 'sources_status',
   description:
-    'Per-source diagnostic. Returns clone_state ("healthy" | "missing" | ' +
+    'Runs a per-source sync diagnostic for this gbrain instance (not a ' +
+    'general connectivity check). Returns clone_state ("healthy" | "missing" | ' +
     '"not-a-dir" | "no-git" | "url-drift" | "corrupted" | "not-applicable") ' +
     'so a remote MCP caller can diagnose whether the on-disk clone is ' +
     'syncable without SSH access to the brain host.',
@@ -4717,7 +4821,7 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'Applies a batch of schema-pack mutations to this gbrain instance\'s ontology (add/remove/update type, alias, prefix, link type, extractable flag, expert routing). Requires admin scope; not available to read-only connections. ATOMIC: all mutations in the batch succeed or all roll back (one audit-log batch_id). This changes gbrain\'s schema for all future ingestion — review the mutation list before calling it. Mutation shape per ApplyMutationsRequest type.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {
@@ -4893,7 +4997,7 @@ const reload_schema_pack: Operation = {
 // what they would have gotten with the right grants.
 const run_onboard: Operation = {
   name: 'run_onboard',
-  description: 'Probe brain health + optionally submit onboard remediations. Admin scope required. Protected handlers (LLM-bearing) require run_protected_onboard scope ADDITIONALLY.',
+  description: 'Probes this gbrain instance\'s health and, depending on mode, submits automated remediations. Requires admin scope; not available to read-only connections. LLM-bearing remediation handlers additionally require the run_protected_onboard scope. Modes other than the default \'check\' can make write changes — confirm with the user before using \'auto\' or \'auto-with-prompt\'.',
   params: {
     mode: { type: 'string', description: "'check' (default), 'auto', or 'auto-with-prompt'" },
     target_score: { type: 'number', description: 'Target brain_score (default 90)' },

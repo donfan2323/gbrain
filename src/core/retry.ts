@@ -90,6 +90,8 @@ export const BATCH_AUDIT_SITES = [
   'extract.stale',
   // operations.ts MCP put_page auto-link path.
   'mcp.put_page.autolink',
+  // operations.ts remote-caller opt-in auto-timeline path (v0.43, dashboard-h0cfe).
+  'mcp.put_page.remote_auto',
   // sync.ts/reindex.ts orchestrator labels.
   'sync.import_file',
   'reindex.markdown',

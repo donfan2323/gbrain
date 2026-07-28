@@ -3289,11 +3289,20 @@ export class PGLiteEngine implements BrainEngine {
     // for the full rationale. `IS DISTINCT FROM` is NULL-safe so legacy
     // rows with NULL link_source still count toward backlinks.
     // PGLite needs explicit cast for array binding (does not auto-serialize JS arrays).
+    //
+    // v0.43 (remote auto-link threat model, dashboard-h0cfe): also filter
+    // 'remote-auto' — links created by put_page's remote-caller opt-in path
+    // (operations.ts runAutoLink linkSourceTag). These still count toward
+    // link_count/orphan-reduction/graph traversal (getLinks/getBacklinks),
+    // just not toward this ranking boost — an untrusted remote page must
+    // not be able to inflate an existing page's search ranking by planting
+    // a bare-slug mention of it. Same NULL-safe `IS DISTINCT FROM` pattern.
     const { rows } = await this.db.query(
       `SELECT p.slug AS slug, COUNT(l.id)::int AS cnt
        FROM pages p
        LEFT JOIN links l ON l.to_page_id = p.id
          AND l.link_source IS DISTINCT FROM 'mentions'
+         AND l.link_source IS DISTINCT FROM 'remote-auto'
        WHERE p.slug = ANY($1::text[])
        GROUP BY p.slug`,
       [slugs]

@@ -3455,12 +3455,21 @@ export class PostgresEngine implements BrainEngine {
     // --by-mention run, boosting popular-mention pages over intentional-
     // backlink pages. `IS DISTINCT FROM` is NULL-safe so legacy rows with
     // NULL link_source still count (NULL != 'mentions' → row included).
+    //
+    // v0.43 (remote auto-link threat model, dashboard-h0cfe): also filter
+    // 'remote-auto' — links created by put_page's remote-caller opt-in path
+    // (operations.ts runAutoLink linkSourceTag). These still count toward
+    // link_count/orphan-reduction/graph traversal (getLinks/getBacklinks),
+    // just not toward this ranking boost — an untrusted remote page must
+    // not be able to inflate an existing page's search ranking by planting
+    // a bare-slug mention of it. Same NULL-safe `IS DISTINCT FROM` pattern.
     const sql = this.sql;
     const rows = await sql`
       SELECT p.slug as slug, COUNT(l.id)::int as cnt
       FROM pages p
       LEFT JOIN links l ON l.to_page_id = p.id
         AND l.link_source IS DISTINCT FROM 'mentions'
+        AND l.link_source IS DISTINCT FROM 'remote-auto'
       WHERE p.slug = ANY(${slugs}::text[])
       GROUP BY p.slug
     `;
