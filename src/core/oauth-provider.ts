@@ -29,6 +29,8 @@ import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
+// TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — see oauth-diagnostic.ts. Remove with the rest of this Unit's instrumentation once root cause is confirmed.
+import { oauthDiagLog, maskClientId } from './oauth-diagnostic.ts';
 
 export interface AgentClientBindings {
   boundTools?: string[];
@@ -441,6 +443,19 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const requestedScopes = (params.scopes && params.scopes.length) ? params.scopes : allowedScopes;
     const grantedScopes = requestedScopes.filter(s => hasScope(allowedScopes, s));
 
+    // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — observation only, no behavior change.
+    oauthDiagLog({
+      event: 'authorize_provider_scope_validation',
+      client_id: maskClientId(client.client_id),
+      redirect_uri: params.redirectUri,
+      requested_scopes: requestedScopes,
+      granted_scopes: grantedScopes,
+      code_challenge_present: params.codeChallenge !== undefined,
+      code_challenge_method: 'S256',
+      resource: params.resource?.toString(),
+      state_present: params.state !== undefined,
+    });
+
     await this.sql`
       INSERT INTO oauth_codes (code_hash, client_id, scopes, code_challenge,
                                 code_challenge_method, redirect_uri, state, resource, expires_at)
@@ -450,6 +465,12 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
               ${params.redirectUri}, ${params.state || null},
               ${params.resource?.toString() || null}, ${expiresAt})
     `;
+
+    oauthDiagLog({
+      event: 'authorize_provider_code_created',
+      client_id: maskClientId(client.client_id),
+      authorization_code_issued: true,
+    });
 
     // Redirect back with the code
     const redirectUrl = new URL(params.redirectUri);
@@ -472,6 +493,12 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         AND client_id = ${client.client_id}
         AND expires_at > ${Math.floor(Date.now() / 1000)}
     `;
+    // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — observation only, no behavior change.
+    oauthDiagLog({
+      event: 'token_pkce_challenge_lookup',
+      client_id: maskClientId(client.client_id),
+      result: rows.length > 0 ? 'found' : 'not_found_or_expired',
+    });
     if (rows.length === 0) throw new Error('Authorization code not found or expired');
     return rows[0].code_challenge as string;
   }
@@ -515,12 +542,30 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
             AND expires_at > ${now}
           RETURNING client_id, scopes, resource
         `;
+    // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — observation only, no behavior change.
+    // rows.length === 0 here means the atomic client_id + redirect_uri + expiry
+    // binding failed to match — i.e. wrong client, wrong redirect_uri, code
+    // already consumed, or code expired. This single query is the join point
+    // for all of those checks, so we can only report the combined result.
+    oauthDiagLog({
+      event: 'token_authorization_code_exchange',
+      client_id: maskClientId(client.client_id),
+      redirect_uri_checked: redirectUri,
+      redirect_uri_provided: redirectUri !== undefined,
+      result: rows.length > 0 ? 'matched' : 'no_match_client_redirect_or_expiry',
+    });
     if (rows.length === 0) throw new Error('Authorization code not found or expired');
 
     const codeRow = rows[0];
 
     // Issue tokens
     const scopes = (codeRow.scopes as string[]) || [];
+    oauthDiagLog({
+      event: 'token_issuance',
+      client_id: maskClientId(client.client_id),
+      granted_scopes: scopes,
+      access_token_issued: true,
+    });
     return this.issueTokens(client.client_id, scopes, resource, true);
   }
 

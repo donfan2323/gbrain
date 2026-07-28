@@ -20,7 +20,7 @@ import { safeHexEqual } from '../core/timing-safe.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { mcpAuthRouter, createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { OAuthTokenRevocationRequestSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { BrainEngine } from '../core/engine.ts';
@@ -30,6 +30,9 @@ import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oa
 import type { SqlQuery } from '../core/oauth-provider.ts';
 import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
+// TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24; extended Unit E-4) — see core/oauth-diagnostic.ts. Remove with the rest of this Unit's instrumentation once root cause is confirmed.
+import { oauthDiagLog, maskClientId, maskRemoteAddress } from '../core/oauth-diagnostic.ts';
+import { ingressDiagLog, extractSafeQueryFields } from '../core/ingress-diagnostic.ts';
 import { paramDefToSchema } from '../mcp/tool-defs.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
@@ -591,6 +594,92 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.set('trust proxy', resolveTrustProxy(process.env.GBRAIN_HTTP_TRUST_PROXY));
 
   // ---------------------------------------------------------------------------
+  // TEMPORARY DIAGNOSTIC MIDDLEWARE (Unit E-6, 2026-07-25) — full HTTP ingress
+  // observation. Registered before anything else (cookie parsing, CORS,
+  // OAuth router, MCP routes) so it sees literally every request that reaches
+  // this process: known and unknown paths, every method, requests that never
+  // match any route (404) and ones rejected before the OAuth/MCP routers run.
+  // Read-only observation only — never alters status codes, headers, or
+  // response bodies. Separate log file and separate module
+  // (core/ingress-diagnostic.ts) from the Unit E-1/E-4 OAuth-specific
+  // diagnostic log; this does not modify that log or its behavior.
+  //
+  // req.path/req.originalUrl are captured into local consts at entry, not
+  // re-read in the finish/close handlers — Unit E-4 found that Express
+  // sub-router mounting rewrites req.path by the time a later handler runs,
+  // which would otherwise silently log the wrong path.
+  // ---------------------------------------------------------------------------
+  app.use((req, res, next) => {
+    const requestId = randomBytes(8).toString('hex');
+    const startTime = Date.now();
+    const path = req.path;
+    const originalUrl = req.originalUrl.split('?')[0];
+    const safeQuery = extractSafeQueryFields(req.query as Record<string, unknown>);
+
+    ingressDiagLog({
+      event: 'http_ingress_request_received',
+      request_id: requestId,
+      method: req.method,
+      original_url: originalUrl,
+      path,
+      query_key_names: Object.keys(req.query ?? {}),
+      protocol: req.protocol,
+      host: req.headers.host,
+      user_agent: req.headers['user-agent'],
+      accept: req.headers.accept,
+      content_type: req.headers['content-type'],
+      content_length: req.headers['content-length'],
+      origin: req.headers.origin,
+      referer: req.headers.referer,
+      access_control_request_method: req.headers['access-control-request-method'],
+      access_control_request_headers: req.headers['access-control-request-headers'],
+      masked_remote_address: maskRemoteAddress(req.ip),
+      x_forwarded_for_present: req.headers['x-forwarded-for'] !== undefined,
+      forwarded_present: req.headers.forwarded !== undefined,
+      ...safeQuery,
+    });
+
+    res.on('finish', () => {
+      ingressDiagLog({
+        event: 'http_ingress_response_finished',
+        request_id: requestId,
+        path,
+        status: res.statusCode,
+        duration_ms: Date.now() - startTime,
+        response_content_type: res.get('content-type'),
+        response_content_length: res.get('content-length'),
+        headers_sent: res.headersSent,
+        connection_aborted: false,
+      });
+    });
+
+    res.on('close', () => {
+      if (res.writableEnded) return; // normal completion already logged above
+      ingressDiagLog({
+        event: 'http_ingress_connection_aborted',
+        request_id: requestId,
+        path,
+        duration_ms: Date.now() - startTime,
+        headers_sent: res.headersSent,
+        connection_aborted: true,
+      });
+    });
+
+    res.on('error', (err: NodeJS.ErrnoException) => {
+      ingressDiagLog({
+        event: 'http_ingress_stream_error',
+        request_id: requestId,
+        path,
+        duration_ms: Date.now() - startTime,
+        error_class: err?.constructor?.name,
+        error_code: err?.code,
+      });
+    });
+
+    next();
+  });
+
+  // ---------------------------------------------------------------------------
   // Cookie parsing — required for /admin auth (express 5 has no built-in)
   // ---------------------------------------------------------------------------
   app.use(cookieParser());
@@ -622,7 +711,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   };
-  app.use('/mcp', cors(corsOAuthOptions));
+  app.use(['/mcp', '/mcp-v2'], cors(corsOAuthOptions));
   app.use('/token', cors(corsOAuthOptions));
   app.use('/authorize', cors(corsOAuthOptions));
   app.use('/register', cors(corsOAuthOptions));
@@ -893,8 +982,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Patch the SDK's OAuth metadata to include client_credentials grant type.
   // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
   // the response and add client_credentials before it reaches the client.
+  // Unit E-4: also applies to the openid-configuration compat route below,
+  // which reuses the same createOAuthMetadata() output — without this, the
+  // two discovery documents would silently diverge (the exact "contradiction
+  // between existing metadata" the task requires avoiding).
   app.use((req, res, next) => {
-    if (req.path === '/.well-known/oauth-authorization-server' && req.method === 'GET') {
+    if (
+      (req.path === '/.well-known/oauth-authorization-server' || req.path === '/.well-known/openid-configuration')
+      && req.method === 'GET'
+    ) {
       const origJson = res.json.bind(res);
       (res as any).json = (body: any) => {
         if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
@@ -914,6 +1010,205 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       };
     }
     next();
+  });
+
+  // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — redacted OAuth handshake
+  // logging for a ChatGPT Connector "connection failed" investigation.
+  // Observation only: never alters status codes, redirect targets, or
+  // response bodies. Placed BEFORE the SDK's authRouter so it also sees
+  // requests the SDK itself rejects (invalid client_id, redirect_uri
+  // mismatch, bad response_type, etc.) before gbrain's own provider methods
+  // are ever called. Remove once root cause is confirmed — see
+  // core/oauth-diagnostic.ts and gbrain Unit E-1.
+  app.use((req, res, next) => {
+    if (req.path !== '/authorize' && req.path !== '/token') { next(); return; }
+    const requestId = randomBytes(8).toString('hex');
+    const startedAt = Date.now();
+    const isAuthorize = req.path === '/authorize';
+
+    try {
+      if (isAuthorize) {
+        oauthDiagLog({
+          event: 'authorize_request_received',
+          request_id: requestId,
+          method: req.method,
+          path: req.path,
+          client_id: maskClientId(req.query.client_id as string | undefined),
+          redirect_uri: req.query.redirect_uri,
+          response_type: req.query.response_type,
+          requested_scope: req.query.scope,
+          state_present: req.query.state !== undefined,
+          code_challenge_present: req.query.code_challenge !== undefined,
+          code_challenge_method: req.query.code_challenge_method,
+          resource: req.query.resource,
+          effective_public_url: publicUrl || `http://localhost:${port}`,
+        });
+      } else {
+        oauthDiagLog({
+          event: 'token_request_received',
+          request_id: requestId,
+          method: req.method,
+          path: req.path,
+          grant_type: req.body?.grant_type,
+          client_id: maskClientId(req.body?.client_id),
+          redirect_uri: req.body?.redirect_uri,
+          code_present: req.body?.code !== undefined,
+          code_verifier_present: req.body?.code_verifier !== undefined,
+          resource: req.body?.resource,
+          content_type: req.headers['content-type'],
+        });
+      }
+    } catch (e) {
+      try {
+        console.error('[oauth-diagnostic] request log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+      } catch { /* give up silently */ }
+    }
+
+    const origRedirect = res.redirect.bind(res);
+    (res as any).redirect = (...args: unknown[]) => {
+      try {
+        const location = String(args[args.length - 1] ?? '');
+        let authorizationCodeIssued = false;
+        let oauthError: string | undefined;
+        try {
+          const u = new URL(location);
+          authorizationCodeIssued = u.searchParams.has('code');
+          oauthError = u.searchParams.get('error') || undefined;
+        } catch { /* location wasn't a parseable absolute URL; leave both unset */ }
+        oauthDiagLog({
+          event: 'authorize_response_redirect',
+          request_id: requestId,
+          http_status: res.statusCode,
+          authorization_code_issued: authorizationCodeIssued,
+          oauth_error: oauthError,
+          duration_ms: Date.now() - startedAt,
+        });
+      } catch (e) {
+        try {
+          console.error('[oauth-diagnostic] redirect log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+        } catch { /* give up silently */ }
+      }
+      return (origRedirect as (...a: unknown[]) => Response)(...args);
+    };
+
+    if (!isAuthorize) {
+      const origJson = res.json.bind(res);
+      (res as any).json = (body: any) => {
+        try {
+          oauthDiagLog({
+            event: 'token_response_body',
+            request_id: requestId,
+            http_status: res.statusCode,
+            access_token_issued: body?.access_token !== undefined,
+            refresh_token_issued: body?.refresh_token !== undefined,
+            oauth_error: body?.error,
+            oauth_error_description_present: body?.error_description !== undefined,
+          });
+        } catch (e) {
+          try {
+            console.error('[oauth-diagnostic] token response log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+          } catch { /* give up silently */ }
+        }
+        return origJson(body);
+      };
+    }
+
+    res.on('finish', () => {
+      try {
+        if (isAuthorize && res.statusCode !== 302 && res.statusCode !== 303) {
+          // authorize() normally redirects (302/303). A different status here
+          // means the SDK's own router rejected the request (e.g. unknown
+          // client_id, redirect_uri not registered, unsupported
+          // response_type) before gbrain's provider.authorize() was ever
+          // called — so no authorize_provider_* event will exist for this
+          // request_id.
+          oauthDiagLog({
+            event: 'authorize_response_non_redirect',
+            request_id: requestId,
+            http_status: res.statusCode,
+            result: 'rejected_before_provider',
+          });
+        }
+      } catch (e) {
+        try {
+          console.error('[oauth-diagnostic] finish log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+        } catch { /* give up silently */ }
+      }
+    });
+
+    next();
+  });
+
+  // TEMPORARY DIAGNOSTIC (Unit E-4, 2026-07-24) — evidence-gathering only:
+  // logs metadata about requests to the three discovery endpoints (method,
+  // path, query, status, user-agent, masked remote address, request id).
+  // Never logs response bodies. Placed before authRouter so it also sees the
+  // /.well-known/oauth-authorization-server and /.well-known/oauth-protected-
+  // resource requests the SDK itself serves, plus the openid-configuration
+  // compat route added just below. Remove with the rest of the Unit E
+  // instrumentation once root cause is confirmed — see core/oauth-diagnostic.ts.
+  const DISCOVERY_PATHS = new Set([
+    '/.well-known/oauth-authorization-server',
+    '/.well-known/openid-configuration',
+    '/.well-known/oauth-protected-resource',
+  ]);
+  app.use((req, res, next) => {
+    if (!DISCOVERY_PATHS.has(req.path)) { next(); return; }
+    const requestId = randomBytes(8).toString('hex');
+    // Capture the path now, at the app-level mount point. Some of these
+    // routes (oauth-authorization-server, oauth-protected-resource) are
+    // served by SDK sub-routers mounted at a path prefix; by the time
+    // res.on('finish') fires below, req.path has been rewritten relative to
+    // that sub-router's mount point (often just "/"). Re-reading req.path
+    // in the finish handler would silently log the wrong path for those two
+    // endpoints, so the original value is captured here instead.
+    const requestPath = req.path;
+    try {
+      oauthDiagLog({
+        event: 'discovery_request_received',
+        request_id: requestId,
+        method: req.method,
+        path: requestPath,
+        query: req.query,
+        user_agent: req.headers['user-agent'],
+        remote_address: maskRemoteAddress(req.ip),
+      });
+    } catch (e) {
+      try {
+        console.error('[oauth-diagnostic] discovery request log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+      } catch { /* give up silently */ }
+    }
+    res.on('finish', () => {
+      try {
+        oauthDiagLog({
+          event: 'discovery_response_finished',
+          request_id: requestId,
+          path: requestPath,
+          http_status: res.statusCode,
+        });
+      } catch (e) {
+        try {
+          console.error('[oauth-diagnostic] discovery response log failed (sanitized, non-fatal):', e instanceof Error ? e.message : 'unknown error');
+        } catch { /* give up silently */ }
+      }
+    });
+    next();
+  });
+
+  // TEMPORARY COMPAT ENDPOINT (Unit E-4, 2026-07-24) — OIDC Discovery-style
+  // alias. Some OAuth/OIDC-aware clients probe /.well-known/openid-configuration
+  // in addition to (or instead of) the RFC 8414
+  // /.well-known/oauth-authorization-server path the SDK implements; gbrain's
+  // SDK version does not register that path at all (confirmed in Unit E-3 by
+  // reading node_modules/@modelcontextprotocol/sdk's router.js — no route for
+  // it exists there). This route reuses the SDK's own exported
+  // createOAuthMetadata(authRouterOptions) — the exact same pure function the
+  // SDK calls internally for oauth-authorization-server — so the two documents
+  // are guaranteed to be identical in content. Does not modify the SDK, does
+  // not touch /authorize, /token, PKCE, or DCR in any way. Remove alongside
+  // the rest of the Unit E instrumentation once root cause is confirmed.
+  app.get('/.well-known/openid-configuration', (req, res) => {
+    res.status(200).json(createOAuthMetadata(authRouterOptions));
   });
 
   app.use(authRouter);
@@ -1611,12 +1906,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (not 404) so probing clients (claude.ai, etc.) recognize this as an MCP
   // endpoint, not a missing route. Without this, clients display "endpoint not
   // found" instead of "endpoint exists but no SSE channel."
-  app.get('/mcp', (_req: Request, res: Response) => {
+  // /mcp-v2 is registered alongside /mcp using the same middleware and handlers.
+  // This alternate endpoint is retained for ChatGPT connector compatibility.
+  app.get(['/mcp', '/mcp-v2'], (_req: Request, res: Response) => {
     res.set('Allow', 'POST, DELETE');
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post(['/mcp', '/mcp-v2'], requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 

@@ -56,22 +56,22 @@ export const GET_RECENT_TRANSCRIPTS_DESCRIPTION =
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const LIST_PAGES_DESCRIPTION =
-  "List pages with optional filters. " +
+  "Lists pages in the gbrain knowledge base with optional filters (not a generic file listing). " +
   "For 'what's recent / what did I touch this week' questions, use list_pages " +
   "with sort=updated_desc instead of semantic search.";
 
 export const QUERY_DESCRIPTION =
-  "Hybrid search with vector + keyword + multi-query expansion. " +
-  "For personal/emotional questions ('what's going on with me', 'anything notable', " +
-  "'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
+  "Hybrid search (vector + keyword + multi-query expansion) over the gbrain knowledge base " +
+  "(not the web, email, or calendar). For personal/emotional questions ('what's going on with me', " +
+  "'anything notable', 'how am I feeling'), prefer get_recent_salience, find_anomalies, or " +
   "get_recent_transcripts. Semantic search returns polished pages and misses " +
   "recent activity bursts. Do NOT assume words like 'crazy', 'notable', or 'big' " +
   "mean impressive — they often mean difficult or emotionally charged.";
 
 export const SEARCH_DESCRIPTION =
-  "Keyword search using full-text search. For personal/emotional questions, " +
-  "prefer get_recent_salience or find_anomalies — they surface activity bursts " +
-  "without needing a search term. " +
+  "Full-text keyword search over the gbrain knowledge base (not the web, email, or calendar). " +
+  "For personal/emotional questions, prefer get_recent_salience or find_anomalies — they surface " +
+  "activity bursts without needing a search term. " +
   "For code-symbol questions (callers, callees, definitions, blast radius), use " +
   "code_callers / code_callees / code_def / code_refs instead — those return " +
   "structural graph data, not text chunks.";
