@@ -9,6 +9,14 @@ restart. That's exactly what caused an incident: a session temporarily
 stashed unrelated uncommitted changes and unknowingly broke the live
 ChatGPT Connector's `/mcp-v2` route until the stash was restored.
 
+**Status: LIVE in production since 2026-07-29.** `com.user.gbrain` runs
+`ProgramArguments[0] = /Users/lab/AI_Production/gbrain/current/bin/gbrain`.
+The cutover, a full smoke test, a restart-recovery test, and a genuine
+rollback-then-redeploy cycle were all executed against real production and
+are documented with raw command/output evidence in the Phase 6 review
+bundle (separate from this repo; ask the operator for its current
+location).
+
 ## Design
 
 ```
@@ -241,6 +249,142 @@ itself (a real mistake made — and caught — while validating this pipeline:
 setting `GBRAIN_HOME` directly to a `.gbrain`-named directory makes gbrain
 look for a nonexistent nested `.gbrain/.gbrain` and report "No brain
 configured").
+
+## Daily / routine operations
+
+A quick health check needs no arguments and touches nothing:
+
+```
+scripts/release/status.sh
+```
+
+This shows `current`/`previous` and their manifests, the full release list,
+and a live `/health` ping — read-only, safe to run anytime, including while
+the service is up.
+
+Recommended cadence: run `status.sh` before AND after any manual change to
+this machine that could plausibly affect gbrain (OS updates, Bun upgrades,
+disk-space cleanups, etc.), not just before/after an intentional gbrain
+deploy.
+
+### Release retention policy
+
+Keep the last **3** releases (`--max-keep 3`) — enough to roll back through
+two prior deploys if a regression is caught late, without unbounded disk
+growth (each release currently runs ~400MB due to its own `node_modules`
+copy; three releases is well under 2GB, negligible against this machine's
+free disk space at time of writing, ~190GB).
+
+Run cleanup **manually, after confirming a new deploy is stable** (i.e.,
+after a deploy you don't intend to roll back from) — not on an automatic
+schedule, since automatic deletion during an active incident could destroy
+the one release you needed to roll back to:
+
+```
+scripts/release/cleanup.sh --max-keep 3           # dry run first — always
+scripts/release/cleanup.sh --max-keep 3 --apply   # then actually delete
+```
+
+`current` and `previous` are never deleted by `cleanup.sh` regardless of
+age or count, so this is always safe to run even right after a deploy.
+
+## Backup verification
+
+Every `deploy.sh`/`rollback.sh` run leaves a fresh data backup under
+`shared/backups/<timestamp>-pre-<release>/` and a plist backup
+(`shared/backups/com.user.gbrain.plist.<timestamp>.bak`) — no separate
+backup step is needed for a routine deploy. To verify a specific backup is
+intact (e.g., before trusting it for a real restore):
+
+```bash
+# Compare a backup's file count/size sanity against the live data dir
+du -sh /Users/lab/AI_Production/gbrain/shared/backups/<timestamp>-pre-*/
+du -sh /Users/lab/.gbrain
+
+# Full byte-for-byte verification against the live dir (only meaningful if
+# nothing has written to ~/.gbrain since that backup was taken — if in
+# doubt, stop the service first)
+find /Users/lab/AI_Production/gbrain/shared/backups/<timestamp>-pre-*/ -type f \
+  | sort | xargs shasum -a 256 > /tmp/backup.sha256
+find /Users/lab/.gbrain -type f | sort | xargs shasum -a 256 > /tmp/live.sha256
+diff <(awk '{print $1}' /tmp/backup.sha256 | sort) <(awk '{print $1}' /tmp/live.sha256 | sort)
+```
+
+For an independent, deliberately-taken backup outside the deploy pipeline's
+own automatic one (e.g., before a risky manual operation), follow the same
+"stop service → `cp -a ~/.gbrain <dest>` → hash-compare → restart" sequence
+used for the Phase 6 pre-cutover backup — see that backup's own
+`RESTORE-PROCEDURE.md` (path recorded in the Phase 6 review bundle) for a
+concrete worked example.
+
+## Incident diagnosis
+
+### OAuth / authentication failures
+
+1. Confirm the service is actually up first (`curl -s
+   http://127.0.0.1:8765/health`) — an OAuth failure on a DOWN service is a
+   launchd problem, not an OAuth problem; see the next subsection.
+2. Confirm OAuth discovery itself responds:
+   `curl -s http://127.0.0.1:8765/.well-known/oauth-authorization-server`
+   — if this fails but `/health` succeeds, the HTTP server is up but
+   something in the OAuth provider init path is broken; check
+   `/Users/lab/Library/Logs/gbrain.log` for errors around server startup.
+3. Confirm the client count looks right — every service startup prints
+   `Clients:   N` in its banner (`grep "Clients:" /Users/lab/Library/Logs/gbrain.log`).
+   A sudden drop suggests a genuine data problem (wrong data dir mounted,
+   or a bad restore); a sudden large increase with DCR-related log lines
+   suggests unwanted self-registration (see `SECURITY.md` re: `--enable-dcr`,
+   which should be `disabled` per this deploy's plist — confirm via the
+   same startup banner).
+4. If a SPECIFIC client can no longer authenticate but others still work,
+   the client's token likely expired (`expires_at` in its `whoami` result)
+   or was revoked — this is expected behavior requiring re-authorization on
+   the client's own side, not a server-side problem.
+5. This pipeline never touches OAuth/PKCE/Caddy/Tailscale configuration —
+   if the issue is specifically about external reachability (not local
+   `127.0.0.1:8765` behavior), it is a Caddy/Tailscale problem, out of this
+   pipeline's scope entirely.
+
+### launchd failures
+
+1. `launchctl print gui/$(id -u)/com.user.gbrain` — check `state`. If it's
+   not `running`, check `last exit code` in the same output.
+2. `launchctl list | grep gbrain` — if this returns nothing, the service
+   isn't registered at all; `launchctl bootstrap gui/$(id -u)
+   ~/Library/LaunchAgents/com.user.gbrain.plist` re-registers it from the
+   current plist.
+3. Check the plist is syntactically valid:
+   `plutil -lint ~/Library/LaunchAgents/com.user.gbrain.plist`.
+4. Check `ProgramArguments[0]` actually points at something that exists:
+   `ls -la $(plutil -extract ProgramArguments.0 raw ~/Library/LaunchAgents/com.user.gbrain.plist)`.
+   If `current` is a dangling symlink (its target release was deleted),
+   `scripts/release/rollback.sh` or a fresh `deploy.sh` are the fix — never
+   hand-edit the symlink.
+5. Full tail of the service's own log for the actual crash reason:
+   `tail -100 /Users/lab/Library/Logs/gbrain.log`.
+
+## Creating a review bundle for a future change
+
+For any future change to this pipeline (a new script, a behavior change, a
+bug fix), assemble a review bundle following the same shape used for this
+Unit's own development and for the Phase 6 cutover itself:
+
+1. `START-HERE.md` (reading order), `FINAL-REPORT.md` (status banner +
+   what changed + evidence + a Review Readiness Checklist),
+   `ACCEPTANCE-MATRIX.md` (one-page test summary), `FILE-TREE.md` (every
+   file, one-line purpose each).
+2. `evidence/` — raw command/stdout/stderr/exit-code logs for every
+   claim made in the report. No "trust me, it passed" without a log to
+   back it.
+3. `manifest.sha256` + a zip-integrity log proving the shipped ZIP
+   round-trips byte-for-byte (build → zip → unzip fresh → rehash → diff,
+   exit 0).
+4. A whole-bundle secret re-scan (OAuth client ID/secret shapes, bearer
+   tokens, generic API-key shapes, PEM headers) with real hits vs. the
+   scanner's own pattern-definition strings clearly distinguished.
+5. Submit for adversarial review before any production change; do not
+   cut over production until that review reaches zero required findings
+   and the user gives explicit go-ahead.
 
 ## Emergency recovery
 
