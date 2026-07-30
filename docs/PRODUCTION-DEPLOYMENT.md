@@ -17,6 +17,41 @@ are documented with raw command/output evidence in the Phase 6 review
 bundle (separate from this repo; ask the operator for its current
 location).
 
+## Quick Reference: 30-minute recovery path
+
+For an operator who has never seen this pipeline before and needs the
+service back up now. Each step is read-only until step 4 — confirm the
+diagnosis before acting.
+
+1. **Is it actually down?** `curl -s http://127.0.0.1:8765/health` — a
+   fast, safe check (< 1s). Do NOT run the bare `gbrain health` CLI
+   subcommand for this — see the warning below.
+2. **Is launchd tracking it?** `launchctl list | grep gbrain`. No output
+   → not registered at all, go to "launchd failures" below. A PID and
+   exit-status pair → it's registered; check the exit status.
+3. **What does the log say?** `tail -50 /Users/lab/Library/Logs/gbrain.log`
+   — the last startup banner or crash reason is almost always here.
+4. **Try the safe, already-tested restart**:
+   `launchctl kickstart -k gui/$(id -u)/com.user.gbrain` — this is the
+   exact mechanism validated in both the Phase 6 restart-recovery test
+   and the Phase 7 recovery drill: it force-restarts the service, and
+   launchd's `KeepAlive`/`SuccessfulExit=false` config brings it back
+   automatically. Expect ~5-10 seconds of downtime. Re-check step 1
+   after.
+5. **Still down?** Go to "Emergency recovery" further down this
+   document.
+
+**Do NOT run the bare `gbrain health` CLI command against a live
+production instance** — verified during the Phase 7 audit: unlike
+`gbrain doctor --fast` (which detects the running server via IPC and
+returns in under a second), plain `gbrain health` opens its own direct
+PGLite connection and will BLOCK for the full 30-second lock-acquire
+timeout, then fail with `Timed out waiting for PGLite lock` — even
+though the service itself is completely healthy. Use `curl .../health`,
+`gbrain doctor --fast`, or the `get_health`/`get_stats` MCP tools (via
+an already-connected client) instead; all three respond in under a
+second against a live instance.
+
 ## Design
 
 ```
@@ -393,8 +428,16 @@ If `rollback.sh` itself reports its own smoke test failed:
 1. Check the service log: `tail -100 /Users/lab/Library/Logs/gbrain.log`.
 2. Check for a stuck PGLite lock — `pglite-lock.ts`'s own error message
    names the holding PID; only remove the lock if that PID is confirmed
-   dead (`ps -p <PID>`):
-   `ls -la /Users/lab/.gbrain/.gbrain-lock` → `rm -rf` only if genuinely stale.
+   dead (`ps -p <PID>`). **Verified correct path (Phase 7 audit — this
+   section previously named the wrong path)**:
+   `cat /Users/lab/.gbrain/brain.pglite/.gbrain-lock/lock` — a JSON file
+   (`{"pid":...,"acquired_at":...,"refreshed_at":...,"command":...}`)
+   inside the `.gbrain-lock` directory, itself nested under
+   `brain.pglite/` (NOT directly under `.gbrain/`). Only
+   `rm -rf /Users/lab/.gbrain/brain.pglite/.gbrain-lock` if the `pid` in
+   that JSON is confirmed dead — a live holder's lock is never safe to
+   remove by hand (see `pglite-lock.ts`'s #2348 comment: a live-but-wedged
+   holder must never be reaped, only a genuinely dead PID).
 3. Check which release `current` actually points to: `readlink
    /Users/lab/AI_Production/gbrain/current`.
 4. Restart the service by hand and re-run `scripts/release/smoke-test.sh`.
