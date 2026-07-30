@@ -131,7 +131,7 @@ atomic_symlink() {
 scan_for_secrets() {
   local target="$1"
   local found=0
-  local pattern='sk-[A-Za-z0-9_-]{10,}|gbrain_cl_[a-f0-9]{16,}|gbrain_code_[a-f0-9]{16,}|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+  local pattern='sk-[A-Za-z0-9_-]{10,}|gbrain_cl_[a-f0-9]{16,}|gbrain_cs_[a-f0-9]{16,}|gbrain_code_[a-f0-9]{16,}|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
   if [ -f "$target" ]; then
     if grep -EIq "$pattern" "$target" 2>/dev/null; then
       log "SECRET SCAN: pattern match in $target (value redacted)"

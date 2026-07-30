@@ -128,7 +128,7 @@ describe('build-release.sh', () => {
 
           // #14: secrets must never be present in the published artifact
           // itself (re-testing #3's refusal path from the artifact side).
-          const secretPattern = /sk-[A-Za-z0-9_-]{10,}|gbrain_cl_[a-f0-9]{16,}|gbrain_code_[a-f0-9]{16,}|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+          const secretPattern = /sk-[A-Za-z0-9_-]{10,}|gbrain_cl_[a-f0-9]{16,}|gbrain_cs_[a-f0-9]{16,}|gbrain_code_[a-f0-9]{16,}|AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
           const manifestText = readFileSync(join(releaseDir, 'manifest.json'), 'utf8');
           const checksumsText = readFileSync(join(releaseDir, 'checksums.txt'), 'utf8');
           expect(manifestText).not.toMatch(secretPattern);
