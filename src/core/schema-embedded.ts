@@ -641,6 +641,45 @@ CREATE TABLE IF NOT EXISTS mcp_request_log (
 );
 
 -- ============================================================
+-- Principal Identity Foundation (Phase 9B / Universal Knowledge Layer)
+--
+-- Design reference (in priority order): PHASE9A-IDENTITY-MODEL-DECISION.md,
+-- PHASE9A-AUTHORIZATION-INVARIANTS.md, PHASE9B-IMPLEMENTATION-SCOPE-PROPOSAL.md.
+--
+-- principal_kinds is an open-world registry: new kinds are added via INSERT,
+-- never via schema/migration change (AUTHZ-INV-015). kind_id/label are
+-- display + audit metadata ONLY. Authorization code MUST NOT branch on
+-- them (AUTHZ-INV-001) — Capability is decided by oauth_clients.scope via
+-- hasScope(), independently of any Principal or its kind.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS principal_kinds (
+  id          TEXT PRIMARY KEY,
+  label       TEXT NOT NULL,
+  description TEXT
+);
+
+INSERT INTO principal_kinds (id, label, description) VALUES
+  ('human',   'Human',   'A human operator or account holder.'),
+  ('service', 'Service', 'A non-interactive service or server-to-server integration.'),
+  ('agent',   'Agent',   'An autonomous or semi-autonomous AI agent.'),
+  ('device',  'Device',  'A physical or virtual device.'),
+  ('unknown', 'Unknown', 'Principal kind not yet determined or not applicable.')
+  ON CONFLICT (id) DO NOTHING;
+
+-- principals: the top-level identity that a Client (oauth_clients) MAY
+-- optionally be attributed to. Phase 9B is foundation-only: no create/
+-- revoke API is exposed, revoked_at is not acted upon, and no code path
+-- reads principals for authorization decisions (attribution/audit only).
+-- Rows are never physically deleted (monitor audit references survive).
+CREATE TABLE IF NOT EXISTS principals (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind_id      TEXT NOT NULL DEFAULT 'unknown' REFERENCES principal_kinds(id),
+  display_name TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at   TIMESTAMPTZ
+);
+
+-- ============================================================
 -- OAuth 2.1: clients, tokens, authorization codes
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -664,7 +703,17 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   bound_brain_id          TEXT NULL,
   bound_slug_prefixes     TEXT[] NULL,
   bound_max_concurrent    INTEGER NOT NULL DEFAULT 1,
-  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Phase 9B (Universal Identity Foundation): optional attribution to a
+  -- Principal. NULL means "unattributed" — a fully valid, permanently
+  -- supported state (AUTHZ-INV-003/004), NOT a degraded or denied state.
+  -- Never auto-populated: no client_name/product-name inference, no
+  -- backfill (PHASE9A-IDENTITY-MODEL-DECISION.md §3, AUTHZ-INV-012).
+  -- Phase 9B models 1 Client -> 0..1 Principal only; a future Phase may
+  -- extend this to a join table if multi-Principal Client sharing becomes
+  -- a real requirement (PHASE9A-IDENTITY-MODEL-DECISION.md §2-4) — this
+  -- column does not preclude that extension.
+  principal_id            UUID REFERENCES principals(id) ON DELETE SET NULL
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the write-source scope;
 -- federated_read is the read-source array. Migrations v60-v65 land both
@@ -673,6 +722,14 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+-- Phase 9B (v125): fresh installs get this index inline (the column above
+-- includes it); pre-v125 brains get both the column and this index via
+-- migrate.ts v125. PGLiteEngine/PostgresEngine#applyForwardReferenceBootstrap
+-- add principal_kinds/principals/oauth_clients.principal_id ahead of this
+-- statement on pre-v125 brains so this CREATE INDEX never crashes on a
+-- missing column (mirrors the idx_oauth_clients_source_id pattern above).
+CREATE INDEX IF NOT EXISTS idx_oauth_clients_principal_id
+  ON oauth_clients(principal_id) WHERE principal_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,
