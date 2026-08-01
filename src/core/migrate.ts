@@ -5671,6 +5671,63 @@ export const MIGRATIONS: Migration[] = [
 `);
     },
   },
+  {
+    version: 125,
+    name: 'principal_identity_foundation',
+    // Phase 9B (Universal Identity Foundation). Design reference (priority
+    // order): PHASE9A-IDENTITY-MODEL-DECISION.md, PHASE9A-AUTHORIZATION-
+    // INVARIANTS.md, PHASE9B-IMPLEMENTATION-SCOPE-PROPOSAL.md.
+    //
+    // Fully additive: two new tables + one nullable FK column on
+    // oauth_clients. No existing column, scope, or authorization behavior
+    // is touched. principal_kinds/principals/oauth_clients.principal_id
+    // also exist inline in schema.sql/pglite-schema.ts for fresh installs —
+    // every statement here is IF NOT EXISTS / ON CONFLICT DO NOTHING so it
+    // is a safe no-op on fresh installs and idempotent on re-run.
+    //
+    // Internal review (Migration) after original delivery found this
+    // migration was handler-only despite being pure SQL, which meant it
+    // skipped runMigrationSQLWithRetry's 3-attempt backoff, the
+    // SET LOCAL statement_timeout override (required on poolers like
+    // Supabase), and the 57014/MigrationRetryExhausted operator-diagnostic
+    // path — all of which are gated on `if (sql)` in runMigrations. The
+    // ALTER TABLE below takes ACCESS EXCLUSIVE on oauth_clients, the
+    // hottest table on the auth path; on a live upgrade under lock
+    // contention this migration would have aborted with a raw driver
+    // error and no retry instead of the 10-minute-timeout/3-retry/
+    // pg_terminate_backend-hint treatment every other DDL migration gets.
+    // Moved to `sql:` (statements are pure DDL/seed-data, no TypeScript
+    // needed) so it gets the same safety wrapper as every other migration
+    // in this file; `handler` is now just the completion log line.
+    sql: `
+      CREATE TABLE IF NOT EXISTS principal_kinds (
+        id          TEXT PRIMARY KEY,
+        label       TEXT NOT NULL,
+        description TEXT
+      );
+      INSERT INTO principal_kinds (id, label, description) VALUES
+        ('human',   'Human',   'A human operator or account holder.'),
+        ('service', 'Service', 'A non-interactive service or server-to-server integration.'),
+        ('agent',   'Agent',   'An autonomous or semi-autonomous AI agent.'),
+        ('device',  'Device',  'A physical or virtual device.'),
+        ('unknown', 'Unknown', 'Principal kind not yet determined or not applicable.')
+        ON CONFLICT (id) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS principals (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        kind_id      TEXT NOT NULL DEFAULT 'unknown' REFERENCES principal_kinds(id),
+        display_name TEXT,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        revoked_at   TIMESTAMPTZ
+      );
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS principal_id UUID REFERENCES principals(id) ON DELETE RESTRICT;
+      CREATE INDEX IF NOT EXISTS idx_oauth_clients_principal_id
+        ON oauth_clients(principal_id) WHERE principal_id IS NOT NULL;
+    `,
+    idempotent: true,
+    handler: async () => {
+      process.stderr.write(`  v125: principal_kinds + principals tables added; oauth_clients.principal_id (nullable) added — foundation only, not used in authorization\n`);
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

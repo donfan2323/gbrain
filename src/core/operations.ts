@@ -305,6 +305,35 @@ export interface AuthInfo {
    * case (back-compat).
    */
   allowedSources?: string[];
+  /**
+   * Phase 9B (Universal Identity Foundation): the Principal this Client
+   * (`oauth_clients.client_id`) is attributed to, if any. Sourced from
+   * `oauth_clients.principal_id` at token-verification time (same JOIN
+   * pattern as `sourceId`/`allowedSources` above — no extra round trip).
+   *
+   * Undefined when the client has no Principal attribution (a fully valid,
+   * permanent state — NOT a degraded or denied one, see
+   * PHASE9A-AUTHORIZATION-INVARIANTS.md AUTHZ-INV-003/004) or when the
+   * brain predates migration v125.
+   *
+   * NOT used in any authorization decision (AUTHZ-INV-001): attribution/
+   * audit metadata only. Capability is decided exclusively by `scopes`
+   * via `hasScope()`, independently of this field.
+   */
+  principalId?: string;
+  /**
+   * Phase 9B: the attributed Principal's kind — the stable
+   * `principal_kinds.id` (e.g. 'human', 'service', 'agent', 'device',
+   * 'unknown'), NOT the display `label`. Callers needing a human-readable
+   * label should resolve it themselves via `principal_kinds` — kept out of
+   * AuthInfo in Phase 9B to avoid baking a display-only value into a
+   * structure that may feed authorization-adjacent code paths.
+   *
+   * Undefined under the same conditions as `principalId` (no attribution,
+   * or pre-v125 brain). NOT used in any authorization decision
+   * (AUTHZ-INV-001) — see `principalId` above.
+   */
+  principalKind?: string;
 }
 
 export interface OperationContext {

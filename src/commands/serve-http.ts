@@ -28,7 +28,7 @@ import { operations, OperationError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import { GBrainOAuthProvider, validateTokenEndpointAuthMethod } from '../core/oauth-provider.ts';
 import type { SqlQuery } from '../core/oauth-provider.ts';
-import { hasScope, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
+import { authorizeOperation, ALLOWED_SCOPES_LIST, normalizeScopesInput } from '../core/scope.ts';
 import { summarizeMcpParams, dispatchToolCall } from '../mcp/dispatch.ts';
 // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24; extended Unit E-4) — see core/oauth-diagnostic.ts. Remove with the rest of this Unit's instrumentation once root cause is confirmed.
 import { oauthDiagLog, maskClientId, maskRemoteAddress } from '../core/oauth-diagnostic.ts';
@@ -2001,8 +2001,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // sources_admin / users_admin scopes resolve through the same
       // hierarchy. Plain string includes() at this site would have made
       // sources_admin tokens look like they couldn't even read.)
-      const requiredScope = op.scope || 'read';
-      if (!hasScope(authInfo.scopes, requiredScope)) {
+      //
+      // Phase 9B: the decision itself (requiredScope + hasScope check) is
+      // extracted to scope.ts's authorizeOperation() so the authorization-
+      // invariant test suite can import and exercise this exact function
+      // rather than a hand-copy. Everything below (mcp_request_log,
+      // broadcast, dispatch) stays here — those are HTTP-transport
+      // concerns, not part of the authorization decision.
+      const { allowed, requiredScope } = authorizeOperation(authInfo.scopes, op);
+      if (!allowed) {
         // v0.28.10: persist scope-rejected attempts. Same operator-visibility
         // motivation as the unknown-op path — and it makes the v0.26.3
         // persistence regression test reliable across both rejection paths.

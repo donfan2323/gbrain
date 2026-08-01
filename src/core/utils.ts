@@ -254,15 +254,24 @@ export function isUndefinedColumnError(error: unknown, column: string): boolean 
  * degrade to "no rows" rather than crash (e.g. resolveSlugWithAlias on
  * pre-v104 brains, dangling_aliases doctor check on pre-v104 brains).
  *
+ * Phase 9B (REQUIRED-4 remediation): optional `table` narrows the match the
+ * same way `isUndefinedColumnError`'s `column` param does — when passed, the
+ * table name must additionally appear in the message, so a genuinely
+ * unrelated missing-table error (a different bug) isn't silently absorbed
+ * as "this specific table hasn't been migrated in yet." Omitting `table`
+ * preserves the original broad behavior for existing callers.
+ *
  * Anything else falls through and caller MUST re-throw.
  */
-export function isUndefinedTableError(error: unknown): boolean {
+export function isUndefinedTableError(error: unknown, table?: string): boolean {
   const code = typeof error === 'object' && error !== null && 'code' in error
     ? String((error as { code?: unknown }).code)
     : '';
-  if (code === '42P01') return true;
   const message = error instanceof Error ? error.message : String(error);
-  return /relation .* does not exist|no such table|undefined table/i.test(message);
+  const isUndefinedTable = code === '42P01' || /relation .* does not exist|no such table|undefined table/i.test(message);
+  if (!isUndefinedTable) return false;
+  if (table === undefined) return true;
+  return message.includes(table);
 }
 
 const _warnedKeys = new Set<string>();

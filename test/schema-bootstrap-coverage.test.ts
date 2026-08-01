@@ -171,6 +171,15 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // v121 — referenced by the timeline event lookup and dedup indexes before
   // the numbered migration can add the column on an existing brain.
   { kind: 'column', table: 'timeline_entries', column: 'event_page_id' },
+  // Phase 9B (v125, principal_identity_foundation) — forward-referenced by
+  // `CREATE INDEX idx_oauth_clients_principal_id ON oauth_clients(principal_id)
+  // WHERE principal_id IS NOT NULL` and by oauth_clients.principal_id's own
+  // FK to principals(id). Pre-v125 brains have oauth_clients without this
+  // column and without either new table; bootstrap adds all three before
+  // SCHEMA_SQL replay creates the index.
+  { kind: 'table',  name: 'principal_kinds' },
+  { kind: 'table',  name: 'principals' },
+  { kind: 'column', table: 'oauth_clients', column: 'principal_id' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -243,6 +252,13 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
+
+      -- Phase 9B (v125): strip principal_id + its index, then the two new
+      -- tables (column/FK first, so the DROP TABLEs need no CASCADE).
+      DROP INDEX IF EXISTS idx_oauth_clients_principal_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;
+      DROP TABLE IF EXISTS principals;
+      DROP TABLE IF EXISTS principal_kinds;
 
       -- v0.40.3.0 v90 + v91 column strips so applyForwardReferenceBootstrap
       -- has work to do. Only strip pages columns + the trigger; sources
