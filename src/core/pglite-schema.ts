@@ -874,6 +874,35 @@ CREATE INDEX IF NOT EXISTS idx_mcp_log_time_agent ON mcp_request_log(created_at,
 CREATE INDEX IF NOT EXISTS idx_mcp_log_agent_time ON mcp_request_log(agent_name, created_at DESC);
 
 -- ============================================================
+-- Principal Identity Foundation (Phase 9B / Universal Knowledge Layer)
+--
+-- Mirrors src/schema.sql — see that file for the full design-reference
+-- comment. DRIFT WARNING applies: keep in sync with schema.sql/
+-- schema-embedded.ts (test/e2e/schema-drift.test.ts enforces parity).
+-- ============================================================
+CREATE TABLE IF NOT EXISTS principal_kinds (
+  id          TEXT PRIMARY KEY,
+  label       TEXT NOT NULL,
+  description TEXT
+);
+
+INSERT INTO principal_kinds (id, label, description) VALUES
+  ('human',   'Human',   'A human operator or account holder.'),
+  ('service', 'Service', 'A non-interactive service or server-to-server integration.'),
+  ('agent',   'Agent',   'An autonomous or semi-autonomous AI agent.'),
+  ('device',  'Device',  'A physical or virtual device.'),
+  ('unknown', 'Unknown', 'Principal kind not yet determined or not applicable.')
+  ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS principals (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind_id      TEXT NOT NULL DEFAULT 'unknown' REFERENCES principal_kinds(id),
+  display_name TEXT,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at   TIMESTAMPTZ
+);
+
+-- ============================================================
 -- OAuth 2.1: clients, tokens, authorization codes
 -- ============================================================
 CREATE TABLE IF NOT EXISTS oauth_clients (
@@ -898,7 +927,11 @@ CREATE TABLE IF NOT EXISTS oauth_clients (
   bound_brain_id          TEXT NULL,
   bound_slug_prefixes     TEXT[] NULL,
   bound_max_concurrent    INTEGER NOT NULL DEFAULT 1,
-  created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Phase 9B: optional attribution to a Principal. NULL = unattributed,
+  -- a fully valid permanent state (AUTHZ-INV-003/004). See schema.sql
+  -- for the full rationale comment.
+  principal_id            UUID REFERENCES principals(id) ON DELETE RESTRICT
 );
 -- v0.34.1 (#861, D13 + #876): source_id is the OAuth client's write-source
 -- scope; federated_read is its read-source array (a federated client can
@@ -909,6 +942,14 @@ CREATE INDEX IF NOT EXISTS idx_oauth_clients_source_id
   ON oauth_clients(source_id) WHERE source_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_oauth_clients_federated_read
   ON oauth_clients USING GIN (federated_read);
+-- Phase 9B (v125): fresh installs get this index inline (the column above
+-- includes it); pre-v125 brains get both the column and this index via
+-- migrate.ts v125. PGLiteEngine#applyForwardReferenceBootstrap adds
+-- principal_kinds/principals/oauth_clients.principal_id ahead of this
+-- statement on pre-v125 brains so this CREATE INDEX never crashes on a
+-- missing column (mirrors the idx_oauth_clients_source_id pattern above).
+CREATE INDEX IF NOT EXISTS idx_oauth_clients_principal_id
+  ON oauth_clients(principal_id) WHERE principal_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS oauth_tokens (
   token_hash   TEXT PRIMARY KEY,

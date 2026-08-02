@@ -23,7 +23,7 @@ import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprot
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
-import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
+import { hashToken, generateToken, isUndefinedColumnError, isUndefinedTableError } from './utils.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
@@ -647,44 +647,90 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // unmigrated brains degrade to "no source scope" rather than refusing
     // every token verification.
     let oauthRows: Record<string, unknown>[];
+    // Phase 9B (v125): principal_id/principal_kind resolved via LEFT JOIN
+    // to principals in the SAME query (no extra round trip, same design
+    // goal as the source_id/federated_read JOIN below). principal_kind is
+    // read directly off principals.kind_id (a NOT NULL TEXT FK column)
+    // rather than via a further JOIN to principal_kinds — see the
+    // REQUIRED-1 perf remediation note below. On a pre-v125 brain the
+    // outer catch below detects the missing column/table and falls back
+    // to the pre-Phase-9B query chain unchanged — principalId/
+    // principalKind simply stay undefined on AuthInfo in that case.
     try {
       oauthRows = await this.sql`
         SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
-               c.source_id, c.federated_read
+               c.source_id, c.federated_read, c.principal_id, p.kind_id AS principal_kind
         FROM oauth_tokens t
         LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+        LEFT JOIN principals p ON p.id = c.principal_id
         WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
       `;
-    } catch (err) {
-      // v0.34.1: pre-v60 brain → source_id column missing. Pre-v61 brain →
-      // federated_read column missing. Both classes degrade to legacy
-      // projection so auth keeps working until the operator runs
-      // apply-migrations. Probe both column names so partial-upgrade brains
-      // (v60 applied but v61 didn't yet) also fall through cleanly.
-      if (isUndefinedColumnError(err, 'source_id') || isUndefinedColumnError(err, 'federated_read')) {
-        // Try the v60-only projection first (source_id but no federated_read).
+    } catch (err0) {
+      if (
+        isUndefinedColumnError(err0, 'principal_id')
+        // REQUIRED-4 remediation: narrowed to the Phase 9B table this exact
+        // query references (principals) instead of any undefined-table
+        // error. An unrelated missing-table error (e.g. oauth_tokens/
+        // oauth_clients themselves absent — a brain broken far beyond "just
+        // pre-Phase-9B") now hits `throw err0` below directly instead of
+        // being silently absorbed here and retried one level in.
+        //
+        // REQUIRED-1 (Phase 9B perf review): this query no longer JOINs
+        // principal_kinds — principal_kind is read straight off
+        // principals.kind_id (NOT NULL, FK-enforced, so the JOIN was a
+        // provable no-op that only re-fetched a value the outer JOIN
+        // already had) — so an undefined-table error naming
+        // principal_kinds can no longer occur on this exact query and the
+        // corresponding disjunct was removed.
+        || isUndefinedTableError(err0, 'principals')
+        || isUndefinedColumnError(err0, 'source_id')
+        || isUndefinedColumnError(err0, 'federated_read')
+      ) {
+        // Pre-v125 brain (no principal_id/principals/principal_kinds yet),
+        // or pre-v60/v61 brain (no source_id/federated_read yet). Fall
+        // back to the pre-Phase-9B query chain below, unmodified.
         try {
           oauthRows = await this.sql`
-            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+            SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name,
+                   c.source_id, c.federated_read
             FROM oauth_tokens t
             LEFT JOIN oauth_clients c ON c.client_id = t.client_id
             WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
           `;
-        } catch (err2) {
-          if (isUndefinedColumnError(err2, 'source_id')) {
-            // Truly pre-v60: no source_id either. Pre-v0.34 projection.
-            oauthRows = await this.sql`
-              SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
-              FROM oauth_tokens t
-              LEFT JOIN oauth_clients c ON c.client_id = t.client_id
-              WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
-            `;
+        } catch (err) {
+          // v0.34.1: pre-v60 brain → source_id column missing. Pre-v61 brain →
+          // federated_read column missing. Both classes degrade to legacy
+          // projection so auth keeps working until the operator runs
+          // apply-migrations. Probe both column names so partial-upgrade brains
+          // (v60 applied but v61 didn't yet) also fall through cleanly.
+          if (isUndefinedColumnError(err, 'source_id') || isUndefinedColumnError(err, 'federated_read')) {
+            // Try the v60-only projection first (source_id but no federated_read).
+            try {
+              oauthRows = await this.sql`
+                SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name, c.source_id
+                FROM oauth_tokens t
+                LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+              `;
+            } catch (err2) {
+              if (isUndefinedColumnError(err2, 'source_id')) {
+                // Truly pre-v60: no source_id either. Pre-v0.34 projection.
+                oauthRows = await this.sql`
+                  SELECT t.client_id, t.scopes, t.expires_at, t.resource, c.client_name
+                  FROM oauth_tokens t
+                  LEFT JOIN oauth_clients c ON c.client_id = t.client_id
+                  WHERE t.token_hash = ${tokenHash} AND t.token_type = 'access'
+                `;
+              } else {
+                throw err2;
+              }
+            }
           } else {
-            throw err2;
+            throw err;
           }
         }
       } else {
-        throw err;
+        throw err0;
       }
     }
 
@@ -721,6 +767,12 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // operations.ts prefers this array over scalar sourceId when set
         // and non-empty.
         allowedSources,
+        // Phase 9B (v125): undefined when the client has no Principal
+        // attribution (a valid, permanent state — not degraded/denied)
+        // or on a pre-v125 brain (row.principal_id key absent entirely
+        // in that case, since the fallback query above never selects it).
+        principalId: (row.principal_id as string | null | undefined) ?? undefined,
+        principalKind: (row.principal_kind as string | null | undefined) ?? undefined,
       } as CoreAuthInfo as SdkAuthInfo;
     }
 

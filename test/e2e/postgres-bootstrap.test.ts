@@ -117,4 +117,74 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
       expect(JSON.stringify(r.proconfig ?? [])).toContain('search_path=');
     }
   });
+
+  // Phase 9B (internal review addendum, Database-REQ2): the forward-
+  // reference bootstrap's needsPrincipalIdBootstrap branch
+  // (postgres-engine.ts:991-1021) — the only thing preventing
+  // `CREATE INDEX idx_oauth_clients_principal_id` in SCHEMA_SQL from
+  // aborting initSchema on a pre-v125 Postgres brain — had zero automated
+  // Postgres coverage before this test. test/principal-schema-parity.test.ts
+  // covers the equivalent PGLite path only; test/e2e/schema-drift.test.ts
+  // compares two FRESH databases, so oauth_clients_exists is always false
+  // there and the bootstrap branch is structurally never entered. Mirrors
+  // principal-schema-parity.test.ts's strip/rebuild pattern against this
+  // file's real PostgresEngine.
+  test('PostgresEngine bootstrap restores Phase 9B objects on a pre-v125 brain (needsPrincipalIdBootstrap)', async () => {
+    await engine.initSchema(); // bring to LATEST first
+    const conn = (engine as any).sql;
+
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_oauth_clients_principal_id;
+      ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;
+      DROP TABLE IF EXISTS principals CASCADE;
+      DROP TABLE IF EXISTS principal_kinds CASCADE;
+    `);
+    await engine.setConfig('version', '124');
+
+    // The path under test: full PostgresEngine.initSchema(), including the
+    // needsPrincipalIdBootstrap branch, SCHEMA_SQL replay (which contains
+    // the forward-referenced CREATE INDEX this bootstrap exists to
+    // protect), and the runMigrations chain re-applying v125.
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+
+    const tables = await conn`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = current_schema() AND table_name IN ('principals', 'principal_kinds')
+    `;
+    expect(tables.length).toBe(2);
+
+    const colCheck = await conn`
+      SELECT column_name FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'oauth_clients' AND column_name = 'principal_id'
+    `;
+    expect(colCheck).toHaveLength(1);
+
+    const idxCheck = await conn`
+      SELECT indexname FROM pg_indexes
+      WHERE schemaname = current_schema() AND indexname = 'idx_oauth_clients_principal_id'
+    `;
+    expect(idxCheck).toHaveLength(1);
+
+    const fkCheck = await conn`
+      SELECT tc.constraint_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+      WHERE tc.table_name = 'oauth_clients' AND kcu.column_name = 'principal_id' AND tc.constraint_type = 'FOREIGN KEY'
+    `;
+    expect(fkCheck.length).toBeGreaterThanOrEqual(1);
+
+    const seedCheck = await conn`SELECT id FROM principal_kinds ORDER BY id`;
+    expect(seedCheck.map((r: { id: string }) => r.id)).toEqual(['agent', 'device', 'human', 'service', 'unknown']);
+  });
+
+  test('PostgresEngine.initSchema is idempotent for Phase 9B objects on a brain already at LATEST', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    const before = await conn`SELECT count(*)::int AS n FROM principal_kinds`;
+    await engine.initSchema();
+    const after = await conn`SELECT count(*)::int AS n FROM principal_kinds`;
+    expect(after[0].n).toBe(before[0].n);
+  });
 });

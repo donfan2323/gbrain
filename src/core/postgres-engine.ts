@@ -563,6 +563,12 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'oauth_clients' AND column_name = 'federated_read') AS oauth_clients_federated_read_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'principal_kinds') AS principal_kinds_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'principals') AS principals_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'oauth_clients' AND column_name = 'principal_id') AS oauth_clients_principal_id_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema = current_schema() AND table_name = 'sources') AS sources_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'sources' AND column_name = 'archived') AS sources_archived_exists,
@@ -636,6 +642,22 @@ export class PostgresEngine implements BrainEngine {
     // SCHEMA_SQL crash without them.
     const needsOauthClientsBootstrap = probe.oauth_clients_exists
       && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
+    // Phase 9B (v125, principal_identity_foundation): idx_oauth_clients_principal_id
+    // in SCHEMA_SQL references oauth_clients.principal_id, which in turn
+    // requires the principals/principal_kinds tables to exist for its FK.
+    // Pre-v125 brains crash on that CREATE INDEX without this. Bootstrap adds
+    // the two new tables + the column before SCHEMA_SQL replay creates the
+    // index; v125 runs later via runMigrations and is idempotent (all
+    // statements are IF NOT EXISTS / ON CONFLICT DO NOTHING).
+    const probePrincipal = probe as unknown as {
+      principal_kinds_exists?: boolean;
+      principals_exists?: boolean;
+      oauth_clients_principal_id_exists?: boolean;
+    };
+    const needsPrincipalIdBootstrap = probe.oauth_clients_exists
+      && (!probePrincipal.principal_kinds_exists
+          || !probePrincipal.principals_exists
+          || !probePrincipal.oauth_clients_principal_id_exists);
     // v0.26.5 (v34): sources.archived + archived_at + archive_expires_at added
     // for soft-delete lifecycle. SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS sources`
     // is a no-op on pre-existing sources tables (won't add columns), so the
@@ -709,7 +731,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
         && !needsPagesLinksExtractedAt
-        && !needsTimelineEventPageId) return;
+        && !needsTimelineEventPageId
+        && !needsPrincipalIdBootstrap) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -962,6 +985,38 @@ export class PostgresEngine implements BrainEngine {
       // source of truth for the FK and indexes and runs idempotently afterward.
       await conn.unsafe(`
         ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS event_page_id INTEGER;
+      `);
+    }
+
+    if (needsPrincipalIdBootstrap) {
+      // v125 (principal_identity_foundation): principal_kinds + principals
+      // tables, and oauth_clients.principal_id + its partial index.
+      // idx_oauth_clients_principal_id in SCHEMA_SQL crashes on pre-v125
+      // brains without these. Bootstrap mirrors the v125 shape; v125 runs
+      // later via runMigrations and is idempotent (IF NOT EXISTS / ON
+      // CONFLICT DO NOTHING throughout, matching migrate.ts's version-125 entry).
+      await conn.unsafe(`
+        CREATE TABLE IF NOT EXISTS principal_kinds (
+          id          TEXT PRIMARY KEY,
+          label       TEXT NOT NULL,
+          description TEXT
+        );
+        INSERT INTO principal_kinds (id, label, description) VALUES
+          ('human',   'Human',   'A human operator or account holder.'),
+          ('service', 'Service', 'A non-interactive service or server-to-server integration.'),
+          ('agent',   'Agent',   'An autonomous or semi-autonomous AI agent.'),
+          ('device',  'Device',  'A physical or virtual device.'),
+          ('unknown', 'Unknown', 'Principal kind not yet determined or not applicable.')
+          ON CONFLICT (id) DO NOTHING;
+        CREATE TABLE IF NOT EXISTS principals (
+          id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          kind_id      TEXT NOT NULL DEFAULT 'unknown' REFERENCES principal_kinds(id),
+          display_name TEXT,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          revoked_at   TIMESTAMPTZ
+        );
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS principal_id UUID
+          REFERENCES principals(id) ON DELETE RESTRICT;
       `);
     }
   }

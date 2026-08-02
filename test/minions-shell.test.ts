@@ -282,12 +282,23 @@ describe('shell-audit: computeAuditFilename', () => {
 
 describe('shell-audit: write', () => {
   let tmpDir: string;
+  // v0.42 (shard-composition regression, gbrain#2823 recurrence): this used
+  // to unconditionally `delete process.env.GBRAIN_AUDIT_DIR` in afterAll,
+  // which wipes out the shared-bootstrap-preload scratch dir
+  // (test/helpers/audit-dir-preload.ts) for the REST of this bun process
+  // instead of restoring it — any later file in the same shard (e.g.
+  // test/audit/audit-dir-preload.test.ts) then falls through to the real
+  // ~/.gbrain/audit. Capture the pre-existing value once (module load,
+  // after the preload has already run) and restore exactly that, matching
+  // the established pattern in test/subagent-audit.test.ts.
+  const savedAuditDir = process.env.GBRAIN_AUDIT_DIR;
   beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shell-audit-test-'));
     process.env.GBRAIN_AUDIT_DIR = tmpDir;
   });
   afterAll(() => {
-    delete process.env.GBRAIN_AUDIT_DIR;
+    if (savedAuditDir === undefined) delete process.env.GBRAIN_AUDIT_DIR;
+    else process.env.GBRAIN_AUDIT_DIR = savedAuditDir;
   });
 
   test('GBRAIN_AUDIT_DIR env override resolves to the custom dir', () => {

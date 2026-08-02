@@ -90,6 +90,27 @@ export function isScope(s: string): s is Scope {
 }
 
 /**
+ * The production authorization decision: given a caller's granted scopes
+ * and an operation's declared required scope (default 'read' when
+ * unspecified), decide whether the call is allowed.
+ *
+ * Extracted from `src/commands/serve-http.ts`'s CallToolRequestSchema
+ * handler (behavior-identical pure move, no semantic change) so that
+ * `test/authorization-invariant-matrix.test.ts` can import and exercise
+ * the REAL production gate instead of maintaining a hand-copy that can
+ * silently drift from it. serve-http.ts calls this, then separately
+ * handles HTTP-specific concerns (mcp_request_log persistence, SSE
+ * broadcast, dispatch) around the allowed/denied result.
+ */
+export function authorizeOperation(
+  grantedScopes: readonly string[],
+  op: { scope?: Scope },
+): { allowed: boolean; requiredScope: Scope } {
+  const requiredScope = op.scope ?? 'read';
+  return { allowed: hasScope(grantedScopes, requiredScope), requiredScope };
+}
+
+/**
  * Validate that every scope in the input is allowed. Throws on the first
  * unknown scope. Used at OAuth client registration time (CLI, DCR, manual).
  */
