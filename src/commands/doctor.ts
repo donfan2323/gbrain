@@ -51,6 +51,9 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import { parseScopeString } from '../core/scope.ts';
+import { operationsByName } from '../core/operations.ts';
+import { delegationScopeShortfalls } from '../core/delegation-capability.ts';
 
 export interface Check {
   name: string;
@@ -2457,6 +2460,144 @@ export async function checkOauthConfidentialHealth(engine: BrainEngine): Promise
 }
 
 /**
+ * Phase 9E-1 (dashboard-f5jd5) — delegation_capability_health.
+ *
+ * Read-only, no auto-fix. Surfaces `submit_agent`-delegation OAuth-client
+ * bindings that are structurally valid (never denied at request time) but
+ * risky or unintended, per `PHASE9E-DELEGATION-DOMAIN-MODEL.md` and the
+ * 2026-08-03 AUTHZ-INV-005/016/017 revisions:
+ *
+ *  - `agent` scope with no `bound_tools` — the client can never delegate
+ *    successfully (submit_agent's own `no_bindings` check denies it).
+ *  - a write-capable bound tool with no `bound_slug_prefixes` grant —
+ *    delegated writes fall back to the legacy per-job sandbox (AUTHZ-INV-016,
+ *    a safe but likely-unintended fallback).
+ *  - `bound_source_id` unset — delegated jobs fall back to the `'default'`
+ *    source (tracked separately as dashboard-z7a1o; this check only reports,
+ *    does not fix).
+ *  - AUTHZ-INV-017 scope shortfall — the client's own OAuth scopes don't
+ *    cover the `required_scope` of every tool it can hand to a child job.
+ *    Phase 9E-1 is warn-only (delegation still succeeds, recorded with
+ *    `reason_code: 'delegation_scope_shortfall'`); this check surfaces the
+ *    same condition proactively instead of waiting for it to show up in the
+ *    audit trail.
+ *  - legacy `allowed_slug_prefixes: []` job records — informational only.
+ *    Behaviorally identical to `null` at exercise time both before and
+ *    after the 9E-1 normalization fix (`enforceSubagentSlugFence`'s
+ *    `allowList && allowList.length > 0` guard treats them the same); no
+ *    backfill was performed (AUTHZ-INV-016 §既存データ), so pre-fix rows may
+ *    still show this shape. Bounded to the most recent 5000 jobs (by `id`,
+ *    the primary key — no new index required) to keep the scan cheap on
+ *    brains with a large job history.
+ *
+ * None of these findings represent an active authorization bypass — every
+ * one already fails closed or falls back to a documented-safe default — so
+ * all findings surface at `status: 'warn'`, never `'fail'`.
+ */
+export async function checkDelegationCapabilityHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{
+      client_id: string;
+      scope: string | null;
+      bound_tools: string[] | null;
+      bound_slug_prefixes: string[] | null;
+      bound_source_id: string | null;
+    }>(
+      `SELECT client_id, scope, bound_tools, bound_slug_prefixes, bound_source_id
+         FROM oauth_clients
+        WHERE deleted_at IS NULL
+          AND ('agent' = ANY (string_to_array(scope, ' ')) OR bound_tools IS NOT NULL)`,
+    );
+
+    const noBoundTools: string[] = [];
+    const writeWithoutSlugGrant: string[] = [];
+    const scopeShortfall: string[] = [];
+    const sourceUnset: string[] = [];
+
+    for (const r of rows) {
+      const scopes = parseScopeString(r.scope);
+      const boundTools = r.bound_tools ?? [];
+      const hasSlugGrant = (r.bound_slug_prefixes ?? []).length > 0;
+
+      if (scopes.includes('agent') && boundTools.length === 0) {
+        noBoundTools.push(r.client_id);
+      }
+      if (boundTools.some(t => operationsByName[t]?.scope === 'write') && !hasSlugGrant) {
+        writeWithoutSlugGrant.push(r.client_id);
+      }
+      if (boundTools.length > 0 && !r.bound_source_id) {
+        sourceUnset.push(r.client_id);
+      }
+      if (boundTools.length > 0) {
+        const shortfalls = delegationScopeShortfalls(
+          boundTools, scopes, tool => (operationsByName[tool]?.scope as string | undefined) ?? 'read',
+        );
+        if (shortfalls.length > 0) {
+          scopeShortfall.push(r.client_id);
+        }
+      }
+    }
+
+    let legacyJobPrefixCount = 0;
+    try {
+      const [legacyRow] = await engine.executeRaw<{ legacy_count: number }>(
+        `SELECT count(*)::int AS legacy_count
+           FROM (SELECT data FROM minion_jobs ORDER BY id DESC LIMIT 5000) recent
+          WHERE data->>'allowed_slug_prefixes' = '[]'`,
+      );
+      legacyJobPrefixCount = legacyRow?.legacy_count ?? 0;
+    } catch {
+      // minion_jobs may not exist yet on some deployments — non-fatal, omit.
+    }
+
+    const fmt = (ids: string[]) => ids.slice(0, 5).join(', ') + (ids.length > 5 ? ` (+${ids.length - 5} more)` : '');
+    const findings: string[] = [];
+    if (noBoundTools.length > 0) {
+      findings.push(
+        `${noBoundTools.length} client(s) have "agent" scope but no bound_tools (${fmt(noBoundTools)}) — these can never delegate successfully (submit_agent denies with reason_code=no_bindings). Fix: re-register with --bound-tools T1,T2,....`,
+      );
+    }
+    if (writeWithoutSlugGrant.length > 0) {
+      findings.push(
+        `${writeWithoutSlugGrant.length} client(s) bind a write-capable tool with no bound_slug_prefixes grant (${fmt(writeWithoutSlugGrant)}) — delegated writes fall back to the legacy per-job sandbox instead of an explicit namespace (AUTHZ-INV-016; safe but likely unintended). Fix: re-register with --bound-slug-prefixes if a specific write namespace was intended.`,
+      );
+    }
+    if (scopeShortfall.length > 0) {
+      findings.push(
+        `${scopeShortfall.length} client(s) bind tool(s) whose required_scope their own scope does not cover (${fmt(scopeShortfall)}) — AUTHZ-INV-017 shortfall, currently warn-only (Phase 9E-1): delegation still succeeds but is recorded with reason_code=delegation_scope_shortfall. Fix: add the missing scope(s), or remove the uncovered tool(s) from --bound-tools.`,
+      );
+    }
+    if (sourceUnset.length > 0) {
+      findings.push(
+        `${sourceUnset.length} client(s) bind tools but leave bound_source_id unset (${fmt(sourceUnset)}) — delegated jobs fall back to the "default" source (tracked separately, dashboard-z7a1o). Fix: re-register with --bound-source SOURCE if a non-default source was intended.`,
+      );
+    }
+    if (legacyJobPrefixCount > 0) {
+      findings.push(
+        `${legacyJobPrefixCount} of the most recent 5000 job(s) still store the legacy allowed_slug_prefixes=[] shape from before the Phase 9E-1 normalization fix — informational only, behaviorally identical to null, no action needed.`,
+      );
+    }
+
+    if (findings.length === 0) {
+      return {
+        name: 'delegation_capability_health',
+        status: 'ok',
+        message: rows.length === 0
+          ? 'No agent-delegation-capable OAuth clients registered'
+          : `${rows.length} agent-delegation-capable OAuth client(s) checked; no risky configurations found`,
+      };
+    }
+    return { name: 'delegation_capability_health', status: 'warn', message: findings.join(' | ') };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.toLowerCase().includes('relation') && msg.toLowerCase().includes('does not exist')) {
+      return { name: 'delegation_capability_health', status: 'ok', message: 'OAuth not configured (skipping)' };
+    }
+    return { name: 'delegation_capability_health', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
+/**
  * v0.37.7.0 — Tier 5M autopilot_lock_scope (PID-safe hint per codex CF11).
  *
  * Detects stale autopilot lockfiles. When `GBRAIN_HOME` is set, the
@@ -2466,6 +2607,47 @@ export async function checkOauthConfidentialHealth(engine: BrainEngine): Promise
  * different brain's lock. Hint includes PID + a `ps -p` check so
  * the user verifies before deleting.
  */
+/**
+ * Phase 9C (Universal Audit Event Integration) — audit_events durability
+ * indicators. Design reference: PHASE9C-FAILURE-AND-DURABILITY-POLICY.md
+ * §6-5. Three file-based, process-boundary-independent signals:
+ *
+ *   - audit_spill_pending: unreplayed audit-spill-*.jsonl line count.
+ *     Non-zero means DB writes failed at some point and fell back to
+ *     disk; `gbrain audit replay-spill` clears it.
+ *   - audit-spill-corrupt.jsonl non-empty: replay found malformed or
+ *     DB-rejected rows and quarantined them instead of dropping them —
+ *     requires operator investigation, replay-spill alone won't clear it.
+ *   - audit-critical-failures.log non-empty: a double failure (DB insert
+ *     AND spill both failed) or a Class-1-revocation audit gap occurred.
+ *
+ * Any of the three non-zero/non-empty fails doctor — this is the
+ * concrete mechanism behind "the loss of an audit event must be
+ * detectable" (AUTHZ-INV-013).
+ */
+export async function checkAuditDurability(): Promise<Check> {
+  const { countPendingSpillLines, isCorruptSpillNonEmpty, isCriticalFailuresNonEmpty } =
+    await import('../core/audit/audit-events-spill.ts');
+  const [pending, corrupt, critical] = await Promise.all([
+    countPendingSpillLines(),
+    isCorruptSpillNonEmpty(),
+    isCriticalFailuresNonEmpty(),
+  ]);
+  if (pending === 0 && !corrupt && !critical) {
+    return { name: 'audit_durability', status: 'ok', message: 'No pending audit spill, no quarantined rows, no critical failures.' };
+  }
+  const parts: string[] = [];
+  if (pending > 0) parts.push(`${pending} pending spill line(s) (run \`gbrain audit replay-spill\`)`);
+  if (corrupt) parts.push('audit-spill-corrupt.jsonl is non-empty (quarantined rows need investigation)');
+  if (critical) parts.push('audit-critical-failures.log is non-empty (double failure or revocation audit gap occurred)');
+  return {
+    name: 'audit_durability',
+    status: 'fail',
+    message: parts.join('; '),
+    details: { audit_spill_pending: pending, audit_spill_corrupt_nonempty: corrupt, audit_critical_failures_nonempty: critical },
+  };
+}
+
 export function checkAutopilotLockScope(): Check {
   try {
     const canonical = gbrainPath('autopilot.lock');
@@ -7320,9 +7502,16 @@ export async function buildChecks(
     // 5L — oauth_confidential_client_health (success-path probe per codex CF8)
     progress.heartbeat('oauth_confidential_client_health');
     checks.push(await checkOauthConfidentialHealth(engine));
+    // Phase 9E-1 (dashboard-f5jd5) — delegation_capability_health: risky-but-
+    // not-denied submit_agent delegation bindings (AUTHZ-INV-016/017).
+    progress.heartbeat('delegation_capability_health');
+    checks.push(await checkDelegationCapabilityHealth(engine));
     // 5M — autopilot_lock_scope (PID-safe hint per codex CF11)
     progress.heartbeat('autopilot_lock_scope');
     checks.push(checkAutopilotLockScope());
+    // Phase 9C — audit_durability (spill_pending / corrupt / critical-failures)
+    progress.heartbeat('audit_durability');
+    checks.push(await checkAuditDurability());
     // v0.41.6.0 D3 — stale_locks (gbrain_cycle_locks rows with ttl_expires_at < NOW())
     progress.heartbeat('stale_locks');
     checks.push(await checkStaleLocks(engine, { fix: doFix, dryRun }));

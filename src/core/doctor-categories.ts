@@ -128,11 +128,13 @@ export const SKILL_CHECK_NAMES: ReadonlySet<string> = new Set([
  */
 export const OPS_CHECK_NAMES: ReadonlySet<string> = new Set([
   'alternative_providers',
+  'audit_durability',
   'autopilot_fanout_concurrency',
   'autopilot_lock_scope',
   'batch_retry_health',
   'brainstorm_health',
   'connection',
+  'delegation_capability_health',
   'federation_health',
   'home_dir_in_worktree',
   'index_audit',

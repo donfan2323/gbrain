@@ -24,6 +24,8 @@ import { loadConfig, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { sqlQueryForEngine, executeRawJsonb, type SqlQuery } from '../core/sql-query.ts';
+import { parseScopeString, hasScope } from '../core/scope.ts';
+import { operationsByName } from '../core/operations.ts';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -410,7 +412,20 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
       case '--bound-brain': out.boundBrainId = requireValue(); i += 2; break;
       case '--bound-slug-prefixes': {
         const v = requireValue();
-        out.boundSlugPrefixes = v.split(',').map(s => s.trim()).filter(Boolean);
+        // Phase 9E-1 (dashboard-f5jd5): hard-reject evidence-losing input
+        // BEFORE the old .filter(Boolean) step, which used to silently turn
+        // "" into [] and "a/,,b/" into ["a/","b/"] with no trace of the
+        // operator's likely typo. An explicit empty grant has no legitimate
+        // use case at registration time (AUTHZ-INV-016 — omit the flag
+        // entirely to leave slug prefixes ungranted).
+        if (v === '') {
+          throw new Error('--bound-slug-prefixes must not be an empty string; omit the flag entirely to leave slug prefixes ungranted');
+        }
+        const segments = v.split(',').map(s => s.trim());
+        if (segments.some(s => s.length === 0)) {
+          throw new Error(`--bound-slug-prefixes contains an empty prefix segment (check for a stray comma): "${v}"`);
+        }
+        out.boundSlugPrefixes = segments;
         i += 2; break;
       }
       case '--bound-max-concurrent': {
@@ -443,6 +458,61 @@ export function parseRegisterClientArgs(args: string[]): RegisterClientArgs {
   return out;
 }
 
+export interface RegisterClientRisk {
+  readonly code: string;
+  readonly message: string;
+}
+
+/**
+ * Phase 9E-1 (dashboard-f5jd5): pure, read-only risk scan over already-parsed
+ * `register-client` args. Non-blocking — `registerClient()` prints these as
+ * warnings and registration still proceeds. Evidence-losing input (empty
+ * `--bound-slug-prefixes`, empty CSV segments) is hard-rejected earlier,
+ * inside `parseRegisterClientArgs` itself, not here.
+ */
+export function checkRegisterClientArgsForRisks(parsed: RegisterClientArgs): readonly RegisterClientRisk[] {
+  const risks: RegisterClientRisk[] = [];
+  const scopes = parseScopeString(parsed.scopes);
+  const boundTools = parsed.boundTools ?? [];
+
+  if (scopes.includes('agent') && boundTools.length === 0) {
+    risks.push({
+      code: 'agent_scope_without_bound_tools',
+      message: '"agent" scope is set but --bound-tools is empty/未指定 — this client can never successfully delegate (submit_agent denies every request with no_bindings). Fix: pass --bound-tools T1,T2,... or drop the "agent" scope.',
+    });
+  }
+
+  const boundSlugPrefixes = parsed.boundSlugPrefixes ?? [];
+  const writeToolsBound = boundTools.filter(t => operationsByName[t]?.scope === 'write');
+  if (writeToolsBound.length > 0 && boundSlugPrefixes.length === 0) {
+    risks.push({
+      code: 'write_tool_without_slug_grant',
+      message: `--bound-tools includes write-capable tool(s) (${writeToolsBound.join(', ')}) but --bound-slug-prefixes is empty/未指定 — delegated writes fall back to the legacy per-job sandbox instead of an explicit slug grant (AUTHZ-INV-016). This fallback is safe but is likely not what was intended. Fix: pass --bound-slug-prefixes if a specific write namespace was intended.`,
+    });
+  }
+
+  if (boundTools.length > 0 && !parsed.boundSourceId) {
+    risks.push({
+      code: 'bound_source_id_unset',
+      message: '--bound-tools is set but --bound-source is 未指定 — delegated jobs fall back to the "default" source (tracked separately as dashboard-z7a1o, not changed by this check). Fix: pass --bound-source SOURCE if a non-default source was intended.',
+    });
+  }
+
+  if (boundTools.length > 0) {
+    const shortfalls = boundTools
+      .map(tool => ({ tool, requiredScope: operationsByName[tool]?.scope as string | undefined }))
+      .filter((s): s is { tool: string; requiredScope: string } => !!s.requiredScope && !hasScope(scopes, s.requiredScope));
+    if (shortfalls.length > 0) {
+      risks.push({
+        code: 'delegation_scope_shortfall',
+        message: `--bound-tools includes tool(s) whose required_scope this client's own --scopes does not cover (AUTHZ-INV-017): ${shortfalls.map(s => `${s.tool} needs "${s.requiredScope}"`).join(', ')}. "agent" scope only grants the right to initiate delegation, not the delegated tools' own required scopes. Currently warn-only (Phase 9E-1) — submit_agent still allows delegation but records this shortfall on the audit trail. Fix: add the missing scope(s) to --scopes, or remove the tool(s) from --bound-tools.`,
+      });
+    }
+  }
+
+  return risks;
+}
+
 async function registerClient(name: string, args: string[]) {
   if (!name) {
     console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD]');
@@ -456,6 +526,11 @@ async function registerClient(name: string, args: string[]) {
     console.error('Usage: auth register-client <name> [--grant-types G] [--scopes S] [--source SOURCE] [--federated-read SRC1,SRC2,...] [--redirect-uri URI ...] [--token-endpoint-auth-method client_secret_post|client_secret_basic|none] [--bound-tools T1,T2] [--bound-source SOURCE] [--bound-brain BRAIN] [--bound-slug-prefixes P1,P2] [--bound-max-concurrent N] [--budget-usd-per-day USD]');
     process.exit(1);
   }
+  const risks = checkRegisterClientArgsForRisks(parsed);
+  for (const risk of risks) {
+    console.error(`Warning [${risk.code}]: ${risk.message}`);
+  }
+
   const { grantTypes, scopes, sourceId, federatedRead, redirectUris, tokenEndpointAuthMethod } = parsed;
   const agentBindings = parsed.boundTools || parsed.boundSourceId || parsed.boundBrainId ||
     parsed.boundSlugPrefixes || parsed.boundMaxConcurrent !== undefined || parsed.budgetUsdPerDay !== undefined

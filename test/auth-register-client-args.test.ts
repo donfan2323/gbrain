@@ -11,7 +11,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { parseRegisterClientArgs } from '../src/commands/auth.ts';
+import { parseRegisterClientArgs, checkRegisterClientArgsForRisks } from '../src/commands/auth.ts';
 
 describe('parseRegisterClientArgs', () => {
   test('empty args → all defaults', () => {
@@ -194,6 +194,174 @@ describe('parseRegisterClientArgs', () => {
     test('--budget-usd-per-day requires a currency-shaped decimal', () => {
       expect(() => parseRegisterClientArgs(['--budget-usd-per-day', '1.234'])).toThrow(/non-negative decimal/);
       expect(() => parseRegisterClientArgs(['--budget-usd-per-day', 'abc'])).toThrow(/non-negative decimal/);
+    });
+
+    // Phase 9E-1 (dashboard-f5jd5): pre-fix, --bound-slug-prefixes "" silently
+    // produced [] (via ''.split(',') -> [''] -> filter(Boolean) -> []), and
+    // "a/,,b/" silently dropped the empty middle segment -> ["a/","b/"] with
+    // zero trace of the operator's likely typo. Both now hard-error instead
+    // of destroying that evidence.
+    describe('--bound-slug-prefixes evidence-losing input (Phase 9E-1)', () => {
+      test('empty string value → throws', () => {
+        expect(() => parseRegisterClientArgs(['--bound-slug-prefixes', ''])).toThrow(/empty string/);
+      });
+
+      test('double comma (empty middle segment) → throws', () => {
+        expect(() => parseRegisterClientArgs(['--bound-slug-prefixes', 'wiki/,,people/'])).toThrow(/empty prefix segment/);
+      });
+
+      test('trailing comma (empty final segment) → throws', () => {
+        expect(() => parseRegisterClientArgs(['--bound-slug-prefixes', 'wiki/,'])).toThrow(/empty prefix segment/);
+      });
+
+      test('leading comma (empty first segment) → throws', () => {
+        expect(() => parseRegisterClientArgs(['--bound-slug-prefixes', ',wiki/'])).toThrow(/empty prefix segment/);
+      });
+
+      test('whitespace-only value → throws (trims to empty segment)', () => {
+        expect(() => parseRegisterClientArgs(['--bound-slug-prefixes', '   '])).toThrow(/empty prefix segment/);
+      });
+
+      test('well-formed single prefix still parses (no regression)', () => {
+        const out = parseRegisterClientArgs(['--bound-slug-prefixes', 'wiki/']);
+        expect(out.boundSlugPrefixes).toEqual(['wiki/']);
+      });
+
+      test('well-formed multi-prefix still parses (no regression)', () => {
+        const out = parseRegisterClientArgs(['--bound-slug-prefixes', 'wiki/agents/alice/,notes/']);
+        expect(out.boundSlugPrefixes).toEqual(['wiki/agents/alice/', 'notes/']);
+      });
+    });
+  });
+
+  describe('checkRegisterClientArgsForRisks (Phase 9E-1, warn-only)', () => {
+    test('no bound_* fields at all → no risks', () => {
+      const parsed = parseRegisterClientArgs(['--scopes', 'read']);
+      expect(checkRegisterClientArgsForRisks(parsed)).toEqual([]);
+    });
+
+    test('"agent" scope + no --bound-tools → agent_scope_without_bound_tools', () => {
+      const parsed = parseRegisterClientArgs(['--scopes', 'read agent']);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).toContain('agent_scope_without_bound_tools');
+    });
+
+    test('"agent" scope + --bound-tools set → no agent_scope_without_bound_tools risk', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read write agent',
+        '--bound-tools', 'get_page',
+        '--bound-source', 'dept-x',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('agent_scope_without_bound_tools');
+    });
+
+    test('write-capable bound tool + no --bound-slug-prefixes → write_tool_without_slug_grant', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read write agent',
+        '--bound-tools', 'put_page',
+        '--bound-source', 'dept-x',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).toContain('write_tool_without_slug_grant');
+    });
+
+    test('write-capable bound tool + --bound-slug-prefixes set → no write_tool_without_slug_grant risk', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read write agent',
+        '--bound-tools', 'put_page',
+        '--bound-source', 'dept-x',
+        '--bound-slug-prefixes', 'wiki/',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('write_tool_without_slug_grant');
+    });
+
+    test('read-only bound tool + no slug prefixes → no write_tool_without_slug_grant risk', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'get_page',
+        '--bound-source', 'dept-x',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('write_tool_without_slug_grant');
+    });
+
+    test('--bound-tools set + no --bound-source → bound_source_id_unset', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'get_page',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).toContain('bound_source_id_unset');
+    });
+
+    test('--bound-tools set + --bound-source set → no bound_source_id_unset risk', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'get_page',
+        '--bound-source', 'dept-x',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('bound_source_id_unset');
+    });
+
+    test('bound tool requires a scope the client does not hold → delegation_scope_shortfall (AUTHZ-INV-017)', () => {
+      // put_page requires "write"; client only has "agent" (+ "read").
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'put_page',
+        '--bound-source', 'dept-x',
+        '--bound-slug-prefixes', 'wiki/',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      const shortfall = risks.find(r => r.code === 'delegation_scope_shortfall');
+      expect(shortfall).toBeDefined();
+      expect(shortfall!.message).toMatch(/put_page/);
+      expect(shortfall!.message).toMatch(/write/);
+    });
+
+    test('bound tool covered by held scopes → no delegation_scope_shortfall', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read write agent',
+        '--bound-tools', 'put_page',
+        '--bound-source', 'dept-x',
+        '--bound-slug-prefixes', 'wiki/',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('delegation_scope_shortfall');
+    });
+
+    test('"admin" scope covers every bound tool (scope hierarchy) → no delegation_scope_shortfall', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'admin agent',
+        '--bound-tools', 'put_page',
+        '--bound-source', 'dept-x',
+        '--bound-slug-prefixes', 'wiki/',
+      ]);
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('delegation_scope_shortfall');
+    });
+
+    test('fully well-formed registration → zero risks', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read write agent',
+        '--bound-tools', 'get_page,put_page',
+        '--bound-source', 'dept-x',
+        '--bound-slug-prefixes', 'wiki/',
+      ]);
+      expect(checkRegisterClientArgsForRisks(parsed)).toEqual([]);
+    });
+
+    test('unknown/typo tool name in --bound-tools does not crash and is not silently reported as a scope shortfall', () => {
+      const parsed = parseRegisterClientArgs([
+        '--scopes', 'read agent',
+        '--bound-tools', 'not_a_real_tool',
+        '--bound-source', 'dept-x',
+      ]);
+      expect(() => checkRegisterClientArgsForRisks(parsed)).not.toThrow();
+      const risks = checkRegisterClientArgsForRisks(parsed);
+      expect(risks.map(r => r.code)).not.toContain('delegation_scope_shortfall');
     });
   });
 });
