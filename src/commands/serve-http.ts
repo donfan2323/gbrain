@@ -1856,6 +1856,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.status(401).json({ error: 'Session expired' });
       return;
     }
+    const { allowed } = authorizeOperation(['admin'], { scope: 'admin' });
+    if (!allowed) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
     next();
   }
 

@@ -678,3 +678,59 @@ describe('Phase 9C §2: an audit-write failure never flips a denial into an allo
     });
   });
 });
+
+// ---- Phase 9D: requireAdmin() routes through the shared Policy Decision
+// function (AUTHZ-INV-010) --------------------------------------------------
+//
+// PHASE9A-AUTHORIZATION-INVARIANTS.md's AUTHZ-INV-010 names the pre-Phase-9D
+// requireAdmin() as a known, documented violation: it completed its own
+// allow/deny decision ("cookie present and unexpired => full access") without
+// ever routing through the shared Policy Decision core (hasScope/
+// authorizeOperation) that MCP/HTTP tool calls use. PHASE9C-IMPLEMENTATION-
+// SCOPE.md §"残作業" names the fix directly: "requireAdmin を hasScope/
+// authorizeOperation 経由へ統一すること". This block is the "対応テスト候補"
+// AUTHZ-INV-010 itself calls for.
+//
+// A live-server mock-based integration test (spy on authorizeOperation,
+// confirm a real HTTP call is denied) was considered but not written: an
+// established admin session always resolves to scope=['admin'] (the
+// strongest/catch-all scope — IMPLIES.admin includes itself), so there is no
+// existing seam through which a real request could observe authorizeOperation
+// returning `allowed: false` without adding a new, currently-unneeded
+// scope-granularity knob to admin routes (out of scope here — see the Phase
+// 9D completion report's "未実施項目"). requireAdmin() is also a closure
+// defined inside serveHttp()'s function body (not independently exported),
+// and the existing admin HTTP tests exercise it via `Bun.spawn`-ed
+// subprocesses (admin-embed-spawn.serial.test.ts), which bun:test's
+// mock.module cannot intercept across a process boundary. The static-proof
+// pattern below instead follows this file's own established precedent (see
+// "Phase 9C §2: static proof" above, which already regex-extracts
+// requireAdmin()'s body for a structurally identical claim).
+describe('AUTHZ-INV-010: requireAdmin() routes its final allow/deny decision through the shared Policy Decision function, not a self-contained check', () => {
+  test('requireAdmin()\'s body calls authorizeOperation() (or hasScope()) to compute its final allow/deny result, not just a bare adminSessions membership+expiry check', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/commands/serve-http.ts', import.meta.url).pathname;
+    const source = readFileSync(path, 'utf8');
+    const match = source.match(/function requireAdmin\([^)]*\)[^{]*\{([\s\S]*?)\n  \}/);
+    expect(match).not.toBeNull();
+    const body = match![1];
+    expect(body).toContain('adminSessions'); // sanity: we captured the real body, not an empty match
+    const routesThroughSharedPolicyCore = /\bauthorizeOperation\s*\(|\bhasScope\s*\(/.test(body);
+    expect(routesThroughSharedPolicyCore).toBe(true);
+  });
+
+  test('requireAdmin()\'s body checks the shared decision\'s `allowed` result and only calls next() when it is true (the shared call is not present-but-ignored)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/commands/serve-http.ts', import.meta.url).pathname;
+    const source = readFileSync(path, 'utf8');
+    const match = source.match(/function requireAdmin\([^)]*\)[^{]*\{([\s\S]*?)\n  \}/);
+    const body = match![1];
+    // The shared call's result must be destructured/bound to something, and
+    // an `if` in the body must reference `allowed` before the final next().
+    expect(/\ballowed\b/.test(body)).toBe(true);
+    const nextIndex = body.lastIndexOf('next()');
+    const allowedCheckIndex = body.search(/if\s*\([^)]*\ballowed\b/);
+    expect(allowedCheckIndex).toBeGreaterThan(-1);
+    expect(allowedCheckIndex).toBeLessThan(nextIndex);
+  });
+});

@@ -75,9 +75,10 @@ Phase 9C: Audit Event統合(mcp_request_logのFK化 + agent-audit.tsのDB統合)
   └─ 依存: Phase 9B(Principal概念が確定していないとFK先が定まらない)
   └─ 内容: スキーマ変更(マイグレーション)、既存ログデータの整合性検証
 
-Phase 9D: Policy Decision層の一本化(管理画面requireAdminの統合)
+Phase 9D: Policy Decision層の一本化(管理画面requireAdminの統合) — **完了(2026-08-03)**
   └─ 依存: Phase 9B, 9C(監査証跡が一本化されていないと、管理画面の操作も追跡できない)
   └─ 内容: adminSessionsをCredential/Session概念に統合する設計、または明示的な別レーンとして正式に位置づけるかの判断
+  └─ **決定・実施内容**: `PHASE9A-TARGET-DOMAIN-MODEL.md`§4(Session)が既に「新規テーブルは不要。`oauth_tokens`と管理画面の`adminSessions`が既にSession概念を体現している」と確定済みだったため、ストレージ統合(テーブルマージ)は行わない — adminSessionsは引き続き独立したインメモリSession実装として維持する。Phase 9Dで実施したのは`AUTHZ-INV-010`(プロトコルアダプターは認可コアを迂回できない)の是正のみ: `requireAdmin`ミドルウェアの最終allow/deny判断を、MCP/HTTP経路と同じ共有Policy Decision関数`authorizeOperation()`/`hasScope()`経由に統一した(`src/commands/serve-http.ts`のrequireAdmin、確立済み管理セッションは常に`admin`スコープを保持するため認可挙動自体は変更なし)。詳細はBeads `dashboard-rn8t2`参照。
 
 Phase 9E: Delegation汎用化(submit_agentの1階層限定を解消)
   └─ 依存: Phase 9B(Principal間の委任として一般化するため)
