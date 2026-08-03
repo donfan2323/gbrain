@@ -725,17 +725,30 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   // PR #586 referenced oauth_clients.{token_ttl, deleted_at} +
   // mcp_request_log.{agent_name, params, error_message} without an
   // accompanying migration. v33 adds them. This test pins the round-trip:
-  // make a /mcp call -> assert all three new mcp_request_log columns
-  // persisted correctly. Without v33, the INSERT silently swallows
-  // column-doesn't-exist errors via the existing best-effort try/catch
-  // and the row never appears.
+  // make a /mcp call -> assert all three new columns persisted correctly.
+  // Without v33, the INSERT silently swallows column-doesn't-exist errors
+  // via the existing best-effort try/catch and the row never appears.
+  //
+  // Phase 9C cutover (2026-08-02, bd dashboard-blgxx): /mcp no longer
+  // writes mcp_request_log (frozen legacy table, PHASE9C-MIGRATION-AND-
+  // COMPATIBILITY-PLAN.md §1-2) — it writes audit_events instead. This
+  // test originally SELECTed mcp_request_log directly and got 0 rows after
+  // cutover (confirmed by running it against real Postgres). Per
+  // PHASE9C-ACCEPTANCE-CRITERIA.md §3's pre-declared update plan, it now
+  // reads through audit_events_compat, the read-compatibility view that
+  // unions frozen legacy rows with new audit_events rows — same column
+  // shape, so the assertions below are unchanged.
 
   test('v0.26.3: /mcp request persists agent_name + params + error_message', async () => {
     const postgres = (await import('postgres')).default;
     const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
     try {
-      // Wipe any prior log rows for our test client so we can assert exact counts.
+      // Wipe any prior rows for our test client so we can assert exact
+      // counts. mcp_request_log is included defensively (a pre-cutover
+      // binary could have left rows there in this shared test DB); all
+      // rows this test itself generates land in audit_events.
       await sql`DELETE FROM mcp_request_log WHERE token_name = ${clientId!}`;
+      await sql`DELETE FROM audit_events WHERE client_id = ${clientId!}`;
 
       // Mint a fresh write-scoped token and make a successful tools/list call.
       const tokenRes = await fetch(`${BASE}/token`, {
@@ -759,7 +772,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
 
       const rows = await sql`
         SELECT operation, status, agent_name, params, error_message
-        FROM mcp_request_log
+        FROM audit_events_compat
         WHERE token_name = ${clientId!}
         ORDER BY created_at ASC
       ` as unknown as Array<Record<string, unknown>>;
@@ -988,8 +1001,10 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       await mcpCall(access_token, 'tools/list');
       await new Promise(r => setTimeout(r, 250));
 
+      // Phase 9C cutover (bd dashboard-blgxx): read through audit_events_compat
+      // (see the header comment on the v0.26.3 round-trip test above for why).
       const oauthRows = await sql`
-        SELECT agent_name FROM mcp_request_log
+        SELECT agent_name FROM audit_events_compat
         WHERE token_name = ${clientId!}
         ORDER BY created_at DESC LIMIT 1
       ` as unknown as Array<{ agent_name: string }>;

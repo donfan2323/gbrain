@@ -227,6 +227,14 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
 
       DROP INDEX IF EXISTS idx_mcp_log_agent_time;
       DROP INDEX IF EXISTS idx_mcp_log_time_agent;
+      -- Phase 9C's audit_events_compat/audit_events_attribution_gaps (v127)
+      -- SELECT FROM mcp_request_log.agent_name/params/error_message directly;
+      -- drop them first so this pre-migration-brain simulation can proceed
+      -- (Phase 9C's own tables sit after the principals block and need no
+      -- bootstrap entry of their own, so they are not otherwise part of
+      -- this test's REQUIRED_BOOTSTRAP_COVERAGE simulation).
+      DROP VIEW IF EXISTS audit_events_attribution_gaps;
+      DROP VIEW IF EXISTS audit_events_compat;
       ALTER TABLE mcp_request_log DROP COLUMN IF EXISTS agent_name;
       ALTER TABLE mcp_request_log DROP COLUMN IF EXISTS params;
       ALTER TABLE mcp_request_log DROP COLUMN IF EXISTS error_message;
@@ -252,6 +260,16 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       DROP INDEX IF EXISTS idx_oauth_clients_federated_read;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS source_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS federated_read;
+
+      -- Phase 9C (v126): audit_events.principal_id FKs to principals, so it
+      -- must go first (its own views were already dropped above). Not part
+      -- of REQUIRED_BOOTSTRAP_COVERAGE itself (sits after the principals
+      -- block, needs no bootstrap entry) — stripped here only because it
+      -- would otherwise block the Phase 9B principals drop below.
+      DROP TABLE IF EXISTS audit_events;
+      DROP TABLE IF EXISTS audit_attribution_states;
+      DROP TABLE IF EXISTS audit_channels;
+      DROP TABLE IF EXISTS audit_event_kinds;
 
       -- Phase 9B (v125): strip principal_id + its index, then the two new
       -- tables (column/FK first, so the DROP TABLEs need no CASCADE).

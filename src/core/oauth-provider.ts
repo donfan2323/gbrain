@@ -28,6 +28,8 @@ import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } fr
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope } from './legacy-token-scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
+import { sqlQueryForEngine } from './sql-query.ts';
+import type { BrainEngine } from './engine.ts';
 export type { SqlQuery, SqlValue };
 // TEMPORARY DIAGNOSTIC (Unit E-1, 2026-07-24) — see oauth-diagnostic.ts. Remove with the rest of this Unit's instrumentation once root cause is confirmed.
 import { oauthDiagLog, maskClientId } from './oauth-diagnostic.ts';
@@ -213,8 +215,18 @@ interface GBrainOAuthProviderOptions {
 class GBrainClientsStore implements OAuthRegisteredClientsStore {
   constructor(private sql: SqlQuery, private allowClientCredentialsDcr = false) {}
 
-  async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
-    const rows = await this.sql`
+  /**
+   * `sqlOverride` (Phase 9C): lets a caller that has opened
+   * `engine.transaction()` route this read through that SAME transaction
+   * instead of the store's own top-level connection — see
+   * exchangeClientCredentials()'s comment for why this matters on PGLite.
+   * Optional and additive; the SDK's `OAuthRegisteredClientsStore`
+   * interface calls this with exactly one argument, which remains
+   * unaffected.
+   */
+  async getClient(clientId: string, sqlOverride?: SqlQuery): Promise<OAuthClientInformationFull | undefined> {
+    const sql = sqlOverride ?? this.sql;
+    const rows = await sql`
       SELECT client_id, client_secret_hash, client_name, redirect_uris,
              grant_types, scope, token_endpoint_auth_method,
              client_id_issued_at, client_secret_expires_at
@@ -509,7 +521,21 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     _codeVerifier?: string,
     redirectUri?: string,
     resource?: URL,
+    tx?: BrainEngine,
   ): Promise<OAuthTokens> {
+    // Phase 9C: when the caller has opened engine.transaction() around this
+    // call (serve-http.ts's /token handler, class1_issuance §2-1), EVERY
+    // query in this method must route through that SAME transaction's
+    // connection — not just the final issueTokens() INSERT. PGLite has a
+    // single underlying connection; issuing a query via `this.sql` (bound to
+    // the provider's own top-level engine handle) WHILE `tx` already holds
+    // that connection inside an open transaction deadlocks indefinitely
+    // (found via test/audit-event-generation.test.ts: every real /token
+    // authorization_code/refresh_token request hung under PGLite). Real
+    // Postgres wouldn't show this — separate connections don't block each
+    // other — which is exactly why it went undetected until an actual
+    // end-to-end HTTP test exercised the real call path.
+    const sql = tx ? sqlQueryForEngine(tx) : this.sql;
     const codeHash = hashToken(authorizationCode);
     const now = Math.floor(Date.now() / 1000);
 
@@ -527,7 +553,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // submitting `redirect_uri=""` (empty string) at /token would otherwise
     // hit the falsy branch and bypass the binding entirely.
     const rows = redirectUri !== undefined
-      ? await this.sql`
+      ? await sql`
           DELETE FROM oauth_codes
           WHERE code_hash = ${codeHash}
             AND client_id = ${client.client_id}
@@ -535,7 +561,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
             AND expires_at > ${now}
           RETURNING client_id, scopes, resource
         `
-      : await this.sql`
+      : await sql`
           DELETE FROM oauth_codes
           WHERE code_hash = ${codeHash}
             AND client_id = ${client.client_id}
@@ -566,7 +592,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       granted_scopes: scopes,
       access_token_issued: true,
     });
-    return this.issueTokens(client.client_id, scopes, resource, true);
+    return this.issueTokens(client.client_id, scopes, resource, true, undefined, tx);
   }
 
   // -------------------------------------------------------------------------
@@ -578,7 +604,14 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     refreshToken: string,
     scopes?: string[],
     resource?: URL,
+    tx?: BrainEngine,
   ): Promise<OAuthTokens> {
+    // Phase 9C: same posture as exchangeAuthorizationCode() above — every
+    // query in this method must route through `tx` when the caller has one
+    // open, not just the final issueTokens() INSERT (PGLite single-
+    // connection deadlock otherwise; see that method's comment for the
+    // full account).
+    const sql = tx ? sqlQueryForEngine(tx) : this.sql;
     const tokenHash = hashToken(refreshToken);
     const now = Math.floor(Date.now() / 1000);
 
@@ -590,7 +623,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // legitimate client. With the predicate in the DELETE, wrong-client
     // attempts get zero rows back; the legitimate client retains the row
     // for one valid rotation.
-    const rows = await this.sql`
+    const rows = await sql`
       DELETE FROM oauth_tokens
       WHERE token_hash = ${tokenHash}
         AND token_type = 'refresh'
@@ -624,7 +657,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       throw new Error('Requested scope exceeds refresh token grant');
     }
     const tokenScopes = scopes ?? grantedScopes;
-    return this.issueTokens(client.client_id, tokenScopes, resource, true);
+    return this.issueTokens(client.client_id, tokenScopes, resource, true, undefined, tx);
   }
 
   // -------------------------------------------------------------------------
@@ -773,6 +806,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // in that case, since the fallback query above never selects it).
         principalId: (row.principal_id as string | null | undefined) ?? undefined,
         principalKind: (row.principal_kind as string | null | undefined) ?? undefined,
+        credentialSource: 'oauth_client',
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
@@ -829,6 +863,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         // allowedSources for federated reads, matching legacy HTTP transport.
         sourceId,
         allowedSources,
+        credentialSource: 'legacy_access_token',
       } as CoreAuthInfo as SdkAuthInfo;
     }
 
@@ -906,8 +941,23 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     clientId: string,
     clientSecret: string,
     requestedScope?: string,
+    tx?: BrainEngine,
   ): Promise<OAuthTokens> {
-    const client = await this._clientsStore.getClient(clientId);
+    // Phase 9C: when the caller has opened engine.transaction() around this
+    // call (serve-http.ts's /token handler, class1_issuance §2-1), EVERY
+    // query below must route through that SAME transaction — not just the
+    // final issueTokens() INSERT. PGLite has a single underlying
+    // connection; a query issued via a DIFFERENT handle bound to the
+    // provider's own top-level engine (this.sql, or _clientsStore's own
+    // captured sql) WHILE `tx` already holds that connection inside an open
+    // transaction deadlocks indefinitely — found via
+    // test/audit-event-generation.test.ts (every real /token client_credentials
+    // request hung under PGLite before this fix). Real Postgres wouldn't
+    // show this (separate connections don't block each other), which is
+    // exactly why it went undetected until an actual end-to-end HTTP test
+    // exercised the real call path.
+    const sql = tx ? sqlQueryForEngine(tx) : this.sql;
+    const client = await this._clientsStore.getClient(clientId, sql);
     if (!client) throw new Error('Client not found');
 
     // Check if client has been revoked (soft-deleted). The deleted_at column
@@ -915,7 +965,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // tolerate that one specific failure mode without swallowing real errors
     // (lock timeouts, network blips, auth failures).
     try {
-      const [revoked] = await this.sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
+      const [revoked] = await sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
       if (revoked) throw new Error('Client has been revoked');
     } catch (e) {
       // F5 hardening: surface anything that ISN'T a missing-column error.
@@ -948,7 +998,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // Column may not exist on PGLite/older schemas — graceful fallback
     let clientTtl: number | undefined;
     try {
-      const ttlRows = await this.sql`SELECT token_ttl FROM oauth_clients WHERE client_id = ${clientId}`;
+      const ttlRows = await sql`SELECT token_ttl FROM oauth_clients WHERE client_id = ${clientId}`;
       if (ttlRows.length > 0 && ttlRows[0].token_ttl) clientTtl = Number(ttlRows[0].token_ttl);
     } catch (e) {
       // F5 hardening: same posture as the deleted_at probe above. Only the
@@ -957,7 +1007,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     }
 
     // Client credentials: access token only, NO refresh token (RFC 6749 4.4.3)
-    return this.issueTokens(clientId, grantedScopes, undefined, false, clientTtl);
+    return this.issueTokens(clientId, grantedScopes, undefined, false, clientTtl, tx);
   }
 
   // -------------------------------------------------------------------------
@@ -992,7 +1042,17 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     federatedRead?: string[],
     tokenEndpointAuthMethod?: string,
     agentBindings?: AgentClientBindings,
+    tx?: BrainEngine,
   ): Promise<{ clientId: string; clientSecret?: string }> {
+    // Phase 9C §2-1: same posture as issueTokens() — when the caller has
+    // opened engine.transaction() around this call (admin's
+    // POST /admin/api/register-client, class1_issuance), route the INSERT
+    // through that transaction so the audit-event row commits or rolls
+    // back atomically with client creation. CLI registration
+    // (auth.ts, no admin HTTP audit requirement) omits tx and keeps using
+    // the provider's own connection unchanged.
+    const sql = tx ? sqlQueryForEngine(tx) : this.sql;
+
     // v0.28: ALLOWED_SCOPES allowlist. Reject `--scopes "read flying-unicorn"`
     // at registration so meaningless scope strings can't pile up in the DB.
     // Pre-allowlist clients keep working (allowlist is registration-time;
@@ -1025,7 +1085,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     const federated = federatedRead && federatedRead.length > 0 ? federatedRead : [sourceId];
     try {
       if (agentBindings) {
-        await this.sql`
+        await sql`
           INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                       grant_types, scope, token_endpoint_auth_method,
                                       client_id_issued_at,
@@ -1041,7 +1101,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
                   ${agentBindings.boundMaxConcurrent ?? 1}, ${agentBindings.budgetUsdPerDay ?? null})
         `;
       } else {
-        await this.sql`
+        await sql`
           INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                       grant_types, scope, token_endpoint_auth_method,
                                       client_id_issued_at,
@@ -1067,7 +1127,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       if (isUndefinedColumnError(err, 'federated_read')) {
         // v60-only brain: source_id but no federated_read.
         try {
-          await this.sql`
+          await sql`
             INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                         grant_types, scope, token_endpoint_auth_method,
                                         client_id_issued_at, source_id)
@@ -1076,7 +1136,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           `;
         } catch (err2) {
           if (isUndefinedColumnError(err2, 'source_id')) {
-            await this.sql`
+            await sql`
               INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                           grant_types, scope, token_endpoint_auth_method,
                                           client_id_issued_at)
@@ -1088,7 +1148,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
           }
         }
       } else if (isUndefinedColumnError(err, 'source_id')) {
-        await this.sql`
+        await sql`
           INSERT INTO oauth_clients (client_id, client_secret_hash, client_name, redirect_uris,
                                       grant_types, scope, token_endpoint_auth_method,
                                       client_id_issued_at)
@@ -1107,20 +1167,32 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   // Internal: Issue access + optional refresh tokens
   // -------------------------------------------------------------------------
 
+  /**
+   * `tx`, when supplied, is a transaction-scoped `BrainEngine` the caller
+   * already opened around this same call (Phase 9C §2-1: the audit-event
+   * INSERT for credential issuance must commit or roll back atomically
+   * with the token INSERT itself). Swaps `this.sql` for a `SqlQuery` bound
+   * to that transaction's connection for just this method; every other
+   * read in the exchange flow (client lookup, TTL probe, etc.) stays on
+   * the provider's own top-level connection since only the actual state
+   * change needs transactional identity with the audit write.
+   */
   private async issueTokens(
     clientId: string,
     scopes: string[],
     resource: URL | undefined,
     includeRefresh: boolean,
     ttlOverride?: number,
+    tx?: BrainEngine,
   ): Promise<OAuthTokens> {
+    const sql = tx ? sqlQueryForEngine(tx) : this.sql;
     const accessToken = generateToken('gbrain_at_');
     const accessHash = hashToken(accessToken);
     const now = Math.floor(Date.now() / 1000);
     const effectiveTtl = ttlOverride || this.tokenTtl;
     const accessExpiry = now + effectiveTtl;
 
-    await this.sql`
+    await sql`
       INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
       VALUES (${accessHash}, ${'access'}, ${clientId},
               ${pgArray(scopes)}, ${accessExpiry}, ${resource?.toString() || null})
@@ -1138,7 +1210,7 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
       const refreshHash = hashToken(refreshToken);
       const refreshExpiry = now + this.refreshTtl;
 
-      await this.sql`
+      await sql`
         INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at, resource)
         VALUES (${refreshHash}, ${'refresh'}, ${clientId},
                 ${pgArray(scopes)}, ${refreshExpiry}, ${resource?.toString() || null})

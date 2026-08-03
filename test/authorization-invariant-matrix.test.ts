@@ -444,3 +444,237 @@ describe('REQUIRED-3 (internal review addendum): AUTHZ-INV-012 — the real DCR 
     expect(rows[0].principal_id).toBeNull();
   });
 });
+
+// ---- Phase 9C (PHASE9C-ACCEPTANCE-CRITERIA.md §2) ------------------------
+//
+// Phase 9C adds audit *recording* (attribution_state, channel_id,
+// audit_events) but must not add a single new authorization *decision*
+// input. §2's two required proofs:
+//   1. Same scopes, varying whatever produces a different attribution_state
+//      elsewhere in the system, still yields an identical authorizeOperation()
+//      result — because authorizeOperation(scopes, op) structurally never
+//      receives attribution_state/credentialSource/principal_id as an
+//      argument in the first place.
+//   2. A grep-level static guarantee that the authorization *decision* code
+//      in scope.ts/operations.ts, and requireAdmin()'s body in
+//      serve-http.ts, never branches on attribution_state/principal_id/
+//      channel_id/audit_events — including the Phase 9C audit
+//      instrumentation code added to those same files, which legitimately
+//      references those identifiers as OUTPUT (building the envelope
+//      passed to writeAuditEvent) but must never use them as INPUT to an
+//      `if` that gates a decision.
+
+describe('Phase 9C §2: attribution_state is audit metadata only — authorizeOperation() never sees it', () => {
+  // client_only / principal_attributed / legacy_credential are the 3
+  // attribution_state values that correspond to a distinct AuthInfo shape
+  // actually reaching authorizeOperation() (an OAuth-scope-bearing,
+  // successfully-authenticated call). The other 6 reachable states
+  // (unauthenticated, authentication_failed, message_authenticated,
+  // system_internal, local_process, attribution_unavailable) are decided by
+  // an entirely different gate before an operation-scope check is ever
+  // attempted (requireBearerAuth, webhook HMAC verification, or no
+  // operation-execution path at all) — they cannot reach authorizeOperation()
+  // with ANY AuthInfo shape, which is itself the strongest form of "the
+  // result cannot depend on this state": there is no call to compare.
+  // admin_session and unmigrated_legacy_record are excluded per §2's own
+  // footnote (structurally unreachable via authorizeOperation() / not tied
+  // to live execution, respectively).
+  test('client_only vs principal_attributed vs legacy_credential: identical scopes -> identical authorizeOperation() result, for both an allowed and a denied operation', async () => {
+    const [{ id: principalId }] = await sql`
+      INSERT INTO principals (kind_id, display_name) VALUES ('human', 'attribution-state-matrix') RETURNING id
+    `;
+
+    // client_only: real OAuth client, no Principal link.
+    fixtureCounter += 1;
+    const clientOnlyReg = await provider.registerClientManual(`attr-matrix-client-only-${fixtureCounter}`, ['client_credentials'], 'read');
+    const clientOnlyTokens = await provider.exchangeClientCredentials(clientOnlyReg.clientId, clientOnlyReg.clientSecret!, 'read');
+    const clientOnlyAuth = await provider.verifyAccessToken(clientOnlyTokens.access_token);
+    expect((clientOnlyAuth as any).credentialSource).toBe('oauth_client');
+    expect((clientOnlyAuth as any).principalId).toBeUndefined();
+
+    // principal_attributed: real OAuth client, linked to a real Principal.
+    fixtureCounter += 1;
+    const attributedReg = await provider.registerClientManual(`attr-matrix-attributed-${fixtureCounter}`, ['client_credentials'], 'read');
+    await sql`UPDATE oauth_clients SET principal_id = ${principalId} WHERE client_id = ${attributedReg.clientId}`;
+    const attributedTokens = await provider.exchangeClientCredentials(attributedReg.clientId, attributedReg.clientSecret!, 'read');
+    const attributedAuth = await provider.verifyAccessToken(attributedTokens.access_token);
+    expect((attributedAuth as any).credentialSource).toBe('oauth_client');
+    expect((attributedAuth as any).principalId).toBe(principalId);
+
+    // legacy_credential: the shape verifyAccessToken's legacy access_tokens
+    // fallback returns (oauth-provider.ts) — full admin-grade scopes,
+    // credentialSource='legacy_access_token', principalId always undefined
+    // (a different ID space entirely, per the domain model). Constructed
+    // directly with the SAME `read`-only scope as the other two fixtures so
+    // this is a controlled same-scope comparison, not a comparison against
+    // legacy's real (wider) default grant.
+    const legacyAuth: AuthInfo = {
+      token: 'attr-matrix-legacy-token',
+      clientId: 'attr-matrix-legacy-client',
+      scopes: ['read'],
+      credentialSource: 'legacy_access_token',
+    };
+
+    const fixtures = [
+      { label: 'client_only', auth: clientOnlyAuth },
+      { label: 'principal_attributed', auth: attributedAuth },
+      { label: 'legacy_credential', auth: legacyAuth },
+    ];
+
+    // Allowed operation (read scope satisfies get_health? no — get_health
+    // needs admin. Use get_page, which is satisfied by 'read'.)
+    const slug = `attr-matrix-shared-page-${Date.now()}`;
+    await seedPage(slug);
+    const allowedResults = await Promise.all(
+      fixtures.map(f => callThroughBoundary(f.auth, 'get_page', { slug })),
+    );
+    for (const r of allowedResults) {
+      expect(r.allowed).toBe(true);
+      expect(r.result?.isError).not.toBe(true);
+    }
+
+    // Denied operation (admin scope required; none of the 3 fixtures have it).
+    const deniedResults = await Promise.all(
+      fixtures.map(f => callThroughBoundary(f.auth, 'get_health', {})),
+    );
+    for (const r of deniedResults) {
+      expect(r.allowed).toBe(false);
+      expect(r.requiredScope).toBe('admin');
+    }
+  });
+});
+
+describe('Phase 9C §2: static proof — the authorization-decision code path never branches on Phase 9C audit vocabulary', () => {
+  const FORBIDDEN = ['attribution_state', 'principal_id', 'channel_id', 'audit_events'];
+
+  /** Extracts the condition string of every `if (...)` in `source`, tolerating
+   * one level of nested parens inside the condition (sufficient for this
+   * codebase's actual `if` shapes — verified by manual inspection of the
+   * matched conditions when this test was authored). */
+  function extractIfConditions(source: string): string[] {
+    const conditions: string[] = [];
+    const re = /if\s*\(((?:[^()]|\([^()]*\))*)\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(source))) conditions.push(m[1]);
+    return conditions;
+  }
+
+  function assertNoForbiddenInConditions(filePath: string, source: string) {
+    const conditions = extractIfConditions(source);
+    expect(conditions.length).toBeGreaterThan(0); // sanity: the extractor actually found `if`s, not a vacuous pass
+    for (const cond of conditions) {
+      for (const forbidden of FORBIDDEN) {
+        if (cond.includes(forbidden)) {
+          throw new Error(`${filePath}: an \`if\` condition references forbidden identifier "${forbidden}": if (${cond})`);
+        }
+      }
+    }
+  }
+
+  test('src/core/scope.ts: no `if` condition anywhere in the file references audit vocabulary', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/core/scope.ts', import.meta.url).pathname;
+    assertNoForbiddenInConditions('src/core/scope.ts', readFileSync(path, 'utf8'));
+  });
+
+  test('src/core/operations.ts: no `if` condition anywhere in the file references audit vocabulary (covers submit_agent\'s interleaved decision + audit-instrumentation code)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/core/operations.ts', import.meta.url).pathname;
+    assertNoForbiddenInConditions('src/core/operations.ts', readFileSync(path, 'utf8'));
+  });
+
+  test('src/commands/serve-http.ts: no `if` condition anywhere in the file references audit vocabulary (covers requireAdmin() and all Phase 9C audit instrumentation added to route handlers)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/commands/serve-http.ts', import.meta.url).pathname;
+    assertNoForbiddenInConditions('src/commands/serve-http.ts', readFileSync(path, 'utf8'));
+  });
+
+  test('requireAdmin()\'s body specifically contains none of the 4 forbidden identifiers anywhere (not just in `if` conditions) — it is a self-contained, separate authorization plane per §2\'s own footnote', async () => {
+    const { readFileSync } = await import('node:fs');
+    const path = new URL('../src/commands/serve-http.ts', import.meta.url).pathname;
+    const source = readFileSync(path, 'utf8');
+    const match = source.match(/function requireAdmin\([^)]*\)[^{]*\{([\s\S]*?)\n  \}/);
+    expect(match).not.toBeNull();
+    const body = match![1];
+    expect(body).toContain('adminSessions'); // sanity: we captured the real body, not an empty match
+    for (const forbidden of FORBIDDEN) {
+      expect(body.includes(forbidden)).toBe(false);
+    }
+  });
+});
+
+describe('Phase 9C §2: an audit-write failure never flips a denial into an allow', () => {
+  test('authorizeOperation() is a pure function of (scopes, op) — it structurally cannot observe writeAuditEvent\'s outcome, since it takes no engine/audit argument at all', async () => {
+    const op = operations.find(o => o.name === 'get_health')!;
+    const before = authorizeOperation(['read'], op);
+    // writeAuditEvent has no channel back to authorizeOperation() — there is
+    // no shared mutable state between them (authorizeOperation reads only
+    // its two parameters). Calling it again after "some audit write
+    // happened elsewhere" cannot change its result; this assertion is the
+    // structural proof, not a coincidence of test ordering.
+    const after = authorizeOperation(['read'], op);
+    expect(after).toEqual(before);
+    expect(before.allowed).toBe(false);
+    expect(before.requiredScope).toBe('admin');
+  });
+
+  describe('with a deliberately broken (never-connected) audit engine', () => {
+    // Construction lives in this nested beforeAll (not the file-level one
+    // at the top) to satisfy check-test-isolation.sh's PGLiteEngine/
+    // beforeAll proximity rule. This engine is intentionally never
+    // connected — engine.transaction()/executeRaw() will reject for any
+    // call against it, forcing writeAuditEvent's class2_denial path
+    // through its DB-fail -> spill fallback (or a swallowed double failure)
+    // rather than a live insert. It is never shared with the file-level
+    // `engine`/`provider` fixtures used by every other test in this file.
+    let brokenEngine: PGLiteEngine;
+
+    beforeAll(() => {
+      brokenEngine = new PGLiteEngine();
+    });
+
+    test('a denied HTTP-shaped call still resolves to allowed=false even when the underlying audit engine is disconnected (class2_denial fails open without touching the decision)', async () => {
+      const { writeAuditEvent } = await import('../src/core/audit/audit-events-writer.ts');
+
+      const op = operations.find(o => o.name === 'get_health')!;
+      const { allowed, requiredScope } = authorizeOperation(['read'], op);
+      expect(allowed).toBe(false);
+
+      // The write must not throw (class2_denial is fail-open by contract) —
+      // if it threw, that alone would prove a design violation (an audit
+      // failure must never surface as if it were an authorization failure).
+      await expect(writeAuditEvent(brokenEngine, {
+        envelope_version: 1,
+        occurred_at: new Date().toISOString(),
+        event_kind: 'operation.request',
+        channel_id: 'mcp_http',
+        attribution_state: 'client_only',
+        principal_id: null,
+        client_id: 'broken-engine-test-client',
+        actor_label: null,
+        credential_ref: null,
+        operation: 'get_health',
+        required_scope: requiredScope,
+        scopes_snapshot: ['read'],
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'insufficient_scope',
+        resource_kind: null,
+        resource_ref: null,
+        source_id: null,
+        job_id: null,
+        correlation_id: 'broken-engine-test',
+        parent_event_id: null,
+        latency_ms: 1,
+        errorMessageRaw: null,
+        params_summary: null,
+        adapter: {},
+      }, { class: 'class2_denial' })).resolves.toBeDefined();
+
+      // And the decision itself — computed entirely before and independently
+      // of that failed write — is still `denied`, exactly as before.
+      expect(allowed).toBe(false);
+      expect(requiredScope).toBe('admin');
+    });
+  });
+});

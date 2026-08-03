@@ -15,7 +15,7 @@ import type { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, randomUUID } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -42,6 +42,8 @@ import * as db from '../core/db.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
 import { MinionQueue } from '../core/minions/queue.ts';
 import { isRetryableError } from '../core/retry-matcher.ts';
+import { writeAuditEvent } from '../core/audit/audit-events-writer.ts';
+import { hashToken } from '../core/utils.ts';
 import {
   computeContentHash,
   validateIngestionEvent,
@@ -742,24 +744,132 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: 'Too many magic-link attempts. Wait a minute before trying again.',
   });
 
+  // Phase 9C: oauth_clients.principal_id lookup shared by every /token and
+  // /revoke audit call site below. Read-only, no fallback for a missing
+  // column — Phase 9B (which adds this column) is a hard prerequisite of
+  // Phase 9C's own migrations (audit_events.principal_id FK references
+  // principals(id)), so a Phase-9C-migrated brain always has it.
+  async function lookupPrincipalId(dbHandle: BrainEngine, clientId: string): Promise<string | null> {
+    const rows = await dbHandle.executeRaw('SELECT principal_id FROM oauth_clients WHERE client_id = $1', [clientId]);
+    const value = (rows[0] as { principal_id?: string | null } | undefined)?.principal_id;
+    return value ?? null;
+  }
+
   app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
 
-    try {
-      const { client_id, client_secret, scope } = req.body;
-      if (!client_id || !client_secret) {
-        res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret required' });
-        return;
-      }
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const { client_id, client_secret, scope } = req.body;
+    const auditClientId = typeof client_id === 'string' ? client_id : null;
 
-      const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
-      res.json(tokens);
+    if (!client_id || !client_secret) {
+      res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret required' });
+      await writeAuditEvent(engine, {
+        occurred_at: occurredAt,
+        envelope_version: 1,
+        event_kind: 'credential.issue',
+        channel_id: 'oauth_endpoint',
+        attribution_state: 'unauthenticated',
+        principal_id: null,
+        client_id: auditClientId,
+        actor_label: null,
+        credential_ref: null,
+        operation: 'token_exchange_client_credentials',
+        required_scope: null,
+        scopes_snapshot: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'missing_credentials',
+        resource_kind: null,
+        resource_ref: null,
+        source_id: null,
+        job_id: null,
+        correlation_id: correlationId,
+        parent_event_id: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'client_id and client_secret required',
+        params_summary: null,
+        adapter: { http_method: 'POST', http_path: '/token', grant_type: 'client_credentials' },
+      }, { class: 'class2_denial' });
+      return;
+    }
+
+    let tokens;
+    try {
+      tokens = await engine.transaction(async (tx) => {
+        const result = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope, tx);
+        const principalId = await lookupPrincipalId(tx, client_id);
+        await writeAuditEvent(engine, {
+          occurred_at: occurredAt,
+          envelope_version: 1,
+          event_kind: 'credential.issue',
+          channel_id: 'oauth_endpoint',
+          attribution_state: principalId ? 'principal_attributed' : 'client_only',
+          principal_id: principalId,
+          client_id,
+          actor_label: null,
+          credential_ref: null,
+          operation: 'token_exchange_client_credentials',
+          required_scope: null,
+          scopes_snapshot: result.scope ? result.scope.split(' ') : [],
+          decision: 'allowed',
+          outcome: 'succeeded',
+          reason_code: null,
+          resource_kind: null,
+          resource_ref: null,
+          source_id: null,
+          job_id: null,
+          correlation_id: correlationId,
+          parent_event_id: null,
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null,
+          params_summary: null,
+          adapter: { http_method: 'POST', http_path: '/token', grant_type: 'client_credentials' },
+        }, { class: 'class1_issuance', tx });
+        return result;
+      });
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
-      res.status(400).json({ error: 'invalid_grant', error_description: msg });
+      const retryable = isRetryableError(e);
+      if (retryable) {
+        res.status(503).json({ error: 'temporarily_unavailable', error_description: 'Token issuance temporarily unavailable' });
+      } else {
+        res.status(400).json({ error: 'invalid_grant', error_description: msg });
+      }
+      await writeAuditEvent(engine, {
+        occurred_at: occurredAt,
+        envelope_version: 1,
+        event_kind: 'credential.issue',
+        channel_id: 'oauth_endpoint',
+        attribution_state: 'authentication_failed',
+        principal_id: null,
+        client_id: auditClientId,
+        actor_label: null,
+        credential_ref: null,
+        operation: 'token_exchange_client_credentials',
+        required_scope: null,
+        scopes_snapshot: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: retryable ? 'audit_or_db_unavailable' : 'invalid_grant',
+        resource_kind: null,
+        resource_ref: null,
+        source_id: null,
+        job_id: null,
+        correlation_id: correlationId,
+        parent_event_id: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+        params_summary: null,
+        adapter: { http_method: 'POST', http_path: '/token', grant_type: 'client_credentials' },
+      }, { class: 'class2_denial' });
+      return;
     }
+    res.json(tokens);
   });
 
   // ---------------------------------------------------------------------------
@@ -802,28 +912,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       return next(); // Public client path; SDK handles.
     }
 
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const operation = grantType === 'authorization_code' ? 'token_exchange_authorization_code' : 'token_exchange_refresh_token';
+    const adapter = { http_method: 'POST', http_path: '/token', grant_type: grantType };
+    const auditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'credential.issue' as const,
+      channel_id: 'oauth_endpoint',
+      actor_label: null,
+      credential_ref: null,
+      operation,
+      required_scope: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter,
+    };
+
+    let client;
     try {
-      const client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
-      let tokens;
-      if (grantType === 'authorization_code') {
-        const code = req.body.code;
-        const redirectUri = req.body.redirect_uri;
-        const codeVerifier = req.body.code_verifier;
-        if (!code) {
-          res.status(400).json({ error: 'invalid_request', error_description: 'code required' });
-          return;
-        }
-        tokens = await oauthProvider.exchangeAuthorizationCode(client, code, codeVerifier, redirectUri);
-      } else {
-        const refreshToken = req.body.refresh_token;
-        const scopeParam = typeof req.body.scope === 'string' ? req.body.scope.split(/\s+/) : undefined;
-        if (!refreshToken) {
-          res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
-          return;
-        }
-        tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam);
-      }
-      res.json(tokens);
+      client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       // RFC 6749: invalid_client for auth failures, invalid_grant for
@@ -833,6 +948,121 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } else {
         res.status(400).json({ error: 'invalid_grant', error_description: msg });
       }
+      await writeAuditEvent(engine, {
+        ...auditBase,
+        attribution_state: 'authentication_failed',
+        principal_id: null,
+        client_id: clientId,
+        scopes_snapshot: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: msg === 'Invalid client' || msg === 'Client has been revoked' ? 'invalid_client' : 'invalid_grant',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+      }, { class: 'class2_denial' });
+      return;
+    }
+
+    const principalId = await lookupPrincipalId(engine, clientId);
+    const attributionState = principalId ? 'principal_attributed' as const : 'client_only' as const;
+
+    let tokens;
+    try {
+      if (grantType === 'authorization_code') {
+        const code = req.body.code;
+        const redirectUri = req.body.redirect_uri;
+        const codeVerifier = req.body.code_verifier;
+        if (!code) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'code required' });
+          await writeAuditEvent(engine, {
+            ...auditBase,
+            attribution_state: attributionState,
+            principal_id: principalId,
+            client_id: clientId,
+            scopes_snapshot: null,
+            decision: 'denied',
+            outcome: 'rejected',
+            reason_code: 'missing_code',
+            latency_ms: Date.now() - startedAt,
+            errorMessageRaw: 'code required',
+          }, { class: 'class2_denial' });
+          return;
+        }
+        tokens = await engine.transaction(async (tx) => {
+          const result = await oauthProvider.exchangeAuthorizationCode(client, code, codeVerifier, redirectUri, undefined, tx);
+          await writeAuditEvent(engine, {
+            ...auditBase,
+            attribution_state: attributionState,
+            principal_id: principalId,
+            client_id: clientId,
+            scopes_snapshot: result.scope ? result.scope.split(' ') : [],
+            decision: 'allowed',
+            outcome: 'succeeded',
+            reason_code: null,
+            latency_ms: Date.now() - startedAt,
+            errorMessageRaw: null,
+          }, { class: 'class1_issuance', tx });
+          return result;
+        });
+      } else {
+        const refreshToken = req.body.refresh_token;
+        const scopeParam = typeof req.body.scope === 'string' ? req.body.scope.split(/\s+/) : undefined;
+        if (!refreshToken) {
+          res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
+          await writeAuditEvent(engine, {
+            ...auditBase,
+            attribution_state: attributionState,
+            principal_id: principalId,
+            client_id: clientId,
+            scopes_snapshot: null,
+            decision: 'denied',
+            outcome: 'rejected',
+            reason_code: 'missing_refresh_token',
+            latency_ms: Date.now() - startedAt,
+            errorMessageRaw: 'refresh_token required',
+          }, { class: 'class2_denial' });
+          return;
+        }
+        tokens = await engine.transaction(async (tx) => {
+          const result = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam, undefined, tx);
+          await writeAuditEvent(engine, {
+            ...auditBase,
+            attribution_state: attributionState,
+            principal_id: principalId,
+            client_id: clientId,
+            scopes_snapshot: result.scope ? result.scope.split(' ') : [],
+            decision: 'allowed',
+            outcome: 'succeeded',
+            reason_code: null,
+            latency_ms: Date.now() - startedAt,
+            errorMessageRaw: null,
+          }, { class: 'class1_issuance', tx });
+          return result;
+        });
+      }
+      res.json(tokens);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Unknown error';
+      const retryable = isRetryableError(e);
+      if (retryable) {
+        res.status(503).json({ error: 'temporarily_unavailable', error_description: 'Token issuance temporarily unavailable' });
+      } else if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+        res.status(401).json({ error: 'invalid_client', error_description: msg });
+      } else {
+        res.status(400).json({ error: 'invalid_grant', error_description: msg });
+      }
+      await writeAuditEvent(engine, {
+        ...auditBase,
+        attribution_state: attributionState,
+        principal_id: principalId,
+        client_id: clientId,
+        scopes_snapshot: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: retryable ? 'audit_or_db_unavailable' : 'invalid_grant',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+      }, { class: 'class2_denial' });
     }
   });
 
@@ -889,29 +1119,83 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       return;
     }
 
+    // Phase 9C: audited from here down only — everything above is pre-
+    // credential-verification request shape validation, same non-goal as
+    // the equivalent pre-auth branches left uninstrumented on
+    // /webhooks/github (credential verification hasn't been attempted yet,
+    // so there is nothing yet to attribute a denial to).
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const revokeAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'credential.revoke' as const,
+      channel_id: 'oauth_endpoint',
+      client_id: clientId,
+      actor_label: null,
+      credential_ref: null,
+      operation: 'revoke_token',
+      required_scope: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      scopes_snapshot: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/revoke' },
+    };
+
     let client;
     try {
       client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
-      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+      const invalidClient = msg === 'Invalid client' || msg === 'Client has been revoked';
+      if (invalidClient) {
         if (hasBasicAuth) res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
         res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
-        return;
+      } else {
+        console.error('[serve-http] revoke client verification failed:', msg || 'Unknown error');
+        const retryable = isRetryableError(e);
+        res.status(retryable ? 503 : 500).json({
+          error: retryable ? 'temporarily_unavailable' : 'server_error',
+          error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
+        });
       }
-      console.error('[serve-http] revoke client verification failed:', msg || 'Unknown error');
-      const retryable = isRetryableError(e);
-      res.status(retryable ? 503 : 500).json({
-        error: retryable ? 'temporarily_unavailable' : 'server_error',
-        error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
-      });
+      await writeAuditEvent(engine, {
+        ...revokeAuditBase,
+        attribution_state: 'authentication_failed',
+        principal_id: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: invalidClient ? 'invalid_client' : 'client_verification_error',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg || null,
+      }, { class: 'class2_denial' });
       return;
     }
+
+    const principalId = await lookupPrincipalId(engine, clientId);
+    const attributionState = principalId ? 'principal_attributed' as const : 'client_only' as const;
 
     try {
       await oauthProvider.revokeToken(client, parsedRequest.data);
       // RFC 7009 §2.2: successful revocation, including an unknown token, is 200.
       res.status(200).end();
+      await writeAuditEvent(engine, {
+        ...revokeAuditBase,
+        attribution_state: attributionState,
+        principal_id: principalId,
+        credential_ref: hashToken(parsedRequest.data.token).slice(0, 16),
+        decision: 'allowed',
+        outcome: 'succeeded',
+        reason_code: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: null,
+      }, { class: 'class1_revocation' });
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       console.error('[serve-http] token revocation failed:', msg);
@@ -920,6 +1204,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         error: retryable ? 'temporarily_unavailable' : 'server_error',
         error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
       });
+      await writeAuditEvent(engine, {
+        ...revokeAuditBase,
+        attribution_state: attributionState,
+        principal_id: principalId,
+        credential_ref: hashToken(parsedRequest.data.token).slice(0, 16),
+        decision: 'allowed',
+        outcome: 'failed',
+        reason_code: 'revoke_db_error',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+      }, { class: 'class1_revocation' });
     }
   });
 
@@ -1228,21 +1523,85 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
   // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
+  app.post('/admin/login', express.json(), async (req, res) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const adminAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'session.establish' as const,
+      channel_id: 'admin_http',
+      principal_id: null,
+      client_id: null,
+      actor_label: null,
+      operation: 'admin_login',
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/login' },
+    };
+
     const token = req.body?.token;
     if (!token || typeof token !== 'string') {
       res.status(400).json({ error: 'Token required' });
+      await writeAuditEvent(engine, {
+        ...adminAuditBase,
+        attribution_state: 'unauthenticated',
+        credential_ref: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'missing_token',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'Token required',
+      }, { class: 'class2_denial' });
       return;
     }
 
     const tokenHash = createHash('sha256').update(token).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
       res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
+      await writeAuditEvent(engine, {
+        ...adminAuditBase,
+        attribution_state: 'authentication_failed',
+        credential_ref: tokenHash.slice(0, 16),
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'invalid_bootstrap_token',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'Invalid bootstrap token',
+      }, { class: 'class2_denial' });
       return;
     }
 
+    // §2-2: in-memory state change (adminSessions.set) — the audit write
+    // must happen BEFORE the mutation and gate it. wrote==='lost' means
+    // both the DB insert and the spill fallback failed; per the fail-
+    // closed contract for class1_issuance, the session must not be
+    // established in that case.
     const sessionId = randomBytes(32).toString('hex');
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+    const auditResult = await writeAuditEvent(engine, {
+      ...adminAuditBase,
+      attribution_state: 'admin_session',
+      credential_ref: tokenHash.slice(0, 16),
+      decision: 'allowed',
+      outcome: 'succeeded',
+      reason_code: null,
+      latency_ms: Date.now() - startedAt,
+      errorMessageRaw: null,
+    }, { class: 'class1_issuance' });
+    if (auditResult.wrote === 'lost') {
+      res.status(503).json({ error: 'service_unavailable', message: 'Unable to establish session (audit subsystem unavailable)' });
+      return;
+    }
+
     adminSessions.set(sessionId, expiresAt);
 
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
@@ -1298,20 +1657,81 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  app.post('/admin/api/issue-magic-link', express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const magicLinkAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'credential.issue' as const,
+      channel_id: 'admin_http',
+      principal_id: null,
+      client_id: null,
+      actor_label: null,
+      operation: 'issue_magic_link',
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/issue-magic-link' },
+    };
+
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
       res.status(401).json({ error: 'Authorization: Bearer <bootstrap-token> required' });
+      await writeAuditEvent(engine, {
+        ...magicLinkAuditBase,
+        attribution_state: 'unauthenticated',
+        credential_ref: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'missing_bearer',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'Authorization: Bearer <bootstrap-token> required',
+      }, { class: 'class2_denial' });
       return;
     }
     const tokenHash = createHash('sha256').update(m[1]).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
       res.status(401).json({ error: 'Invalid bootstrap token' });
+      await writeAuditEvent(engine, {
+        ...magicLinkAuditBase,
+        attribution_state: 'authentication_failed',
+        credential_ref: tokenHash.slice(0, 16),
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'invalid_bootstrap_token',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'Invalid bootstrap token',
+      }, { class: 'class2_denial' });
       return;
     }
+
+    // §2-2: in-memory state change (magicLinkNonces.set) gated on the
+    // audit write succeeding — same fail-closed contract as /admin/login.
     pruneExpiredNonces();
     const nonce = randomBytes(32).toString('hex');
+    const auditResult = await writeAuditEvent(engine, {
+      ...magicLinkAuditBase,
+      attribution_state: 'admin_session',
+      credential_ref: tokenHash.slice(0, 16),
+      decision: 'allowed',
+      outcome: 'succeeded',
+      reason_code: null,
+      latency_ms: Date.now() - startedAt,
+      errorMessageRaw: null,
+    }, { class: 'class1_issuance' });
+    if (auditResult.wrote === 'lost') {
+      res.status(503).json({ error: 'service_unavailable', message: 'Unable to issue magic link (audit subsystem unavailable)' });
+      return;
+    }
     magicLinkNonces.set(nonce, Date.now() + NONCE_TTL_MS);
     const baseUrl = publicUrl || `http://localhost:${port}`;
     res.json({ url: `${baseUrl}/admin/auth/${nonce}`, expires_in: NONCE_TTL_MS / 1000 });
@@ -1321,12 +1741,37 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Browser hits it, server validates the nonce (exists + unconsumed +
   // unexpired), marks consumed, sets cookie, redirects to dashboard.
   // Rate-limited at 10/min/IP to harden against DoS via bad-token loops.
-  app.get('/admin/auth/:token', adminAuthRateLimiter, (req: Request, res: Response) => {
+  app.get('/admin/auth/:token', adminAuthRateLimiter, async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
     const nonce = String(req.params.token ?? '');
     pruneExpiredNonces();
 
     const expiresAt = magicLinkNonces.get(nonce);
     const isValid = !!nonce && !!expiresAt && expiresAt > Date.now() && !consumedNonces.has(nonce);
+    const nonceRef = nonce ? createHash('sha256').update(nonce).digest('hex').slice(0, 16) : null;
+    const redeemAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'session.establish' as const,
+      channel_id: 'admin_http',
+      principal_id: null,
+      client_id: null,
+      actor_label: null,
+      credential_ref: nonceRef,
+      operation: 'admin_magic_link_redeem',
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'GET', http_path: '/admin/auth/:token' },
+    };
 
     if (!isValid) {
       res.status(401).send(`<!DOCTYPE html>
@@ -1345,22 +1790,60 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 <div class="hint"><b>Get a fresh link from your AI agent:</b>
 <div class="prompt">&ldquo;Give me the GBrain admin login link&rdquo;</div>
 </div></div></body></html>`);
+      await writeAuditEvent(engine, {
+        ...redeemAuditBase,
+        attribution_state: 'authentication_failed',
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'invalid_or_expired_nonce',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'magic link expired, already used, or invalid',
+      }, { class: 'class2_denial' });
+      return;
+    }
+
+    // §2-2: in-memory state change (nonce consumption + adminSessions.set)
+    // gated on the audit write succeeding — same fail-closed contract as
+    // /admin/login and /admin/api/issue-magic-link. If the write is lost,
+    // the nonce is deliberately left unconsumed so the link stays usable
+    // for a retry rather than burning a one-time credential we couldn't
+    // durably record using.
+    const sessionId = randomBytes(32).toString('hex');
+    const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
+    const auditResult = await writeAuditEvent(engine, {
+      ...redeemAuditBase,
+      attribution_state: 'admin_session',
+      decision: 'allowed',
+      outcome: 'succeeded',
+      reason_code: null,
+      latency_ms: Date.now() - startedAt,
+      errorMessageRaw: null,
+    }, { class: 'class1_issuance' });
+    if (auditResult.wrote === 'lost') {
+      res.status(503).send('Service temporarily unavailable. Please try again.');
       return;
     }
 
     // Consume the nonce — it's single-use, second click will fail.
     magicLinkNonces.delete(nonce);
     consumedNonces.add(nonce);
-
-    const sessionId = randomBytes(32).toString('hex');
-    const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
     adminSessions.set(sessionId, sessionExpiresAt);
 
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 7 * 24 * 60 * 60 * 1000));
     res.redirect('/admin/');
   });
 
-  // Admin auth middleware
+  // Admin auth middleware.
+  //
+  // AUTHZ-INV-010 (Phase 9D): this middleware verifies Credential/Session
+  // validity (cookie presence, session existence, expiry) itself — that part
+  // is adapter-appropriate, not a Policy Decision. But the actual allow/deny
+  // Capability check must route through the same shared Policy Decision core
+  // (authorizeOperation/hasScope) that MCP/HTTP tool calls use, not complete
+  // its own separate decision. An established admin session always carries
+  // the 'admin' scope (the strongest, catch-all scope in scope.ts's IMPLIES
+  // table) — this does not change who is allowed to do what, it only moves
+  // the allow/deny computation onto the shared authorization core.
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
     const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
     if (!sessionId || !adminSessions.has(sessionId)) {
@@ -1384,10 +1867,41 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // browser/tab fails its next request, gets 401, redirects to login.
   // The bootstrap token itself is unaffected (still valid for new
   // magic-link mints) — this only revokes existing cookie sessions.
-  app.post('/admin/api/sign-out-everywhere', requireAdmin, (_req: Request, res: Response) => {
+  app.post('/admin/api/sign-out-everywhere', requireAdmin, async (_req: Request, res: Response) => {
+    const startedAt = Date.now();
     const count = adminSessions.size;
     adminSessions.clear();
     res.json({ revoked_sessions: count });
+    // §2-4: revocation, fail-open — the state change (session clear) is
+    // in-memory and instantaneous, so unlike class1_issuance there is
+    // nothing to gate the response on; the audit write happens after.
+    await writeAuditEvent(engine, {
+      occurred_at: new Date().toISOString(),
+      envelope_version: 1,
+      event_kind: 'session.terminate',
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session',
+      principal_id: null,
+      client_id: null,
+      actor_label: null,
+      credential_ref: null,
+      operation: 'admin_sign_out_everywhere',
+      required_scope: null,
+      scopes_snapshot: null,
+      decision: 'allowed',
+      outcome: 'succeeded',
+      reason_code: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: null,
+      job_id: null,
+      correlation_id: randomUUID(),
+      parent_event_id: null,
+      latency_ms: Date.now() - startedAt,
+      errorMessageRaw: null,
+      params_summary: { revoked_sessions: count },
+      adapter: { http_method: 'POST', http_path: '/admin/api/sign-out-everywhere' },
+    }, { class: 'class1_revocation' });
   });
 
   app.get('/admin/api/agents', requireAdmin, async (_req: Request, res: Response) => {
@@ -1397,9 +1911,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         SELECT c.client_id as id, c.client_name as name, 'oauth' as auth_type,
           c.grant_types, c.scope, c.created_at, c.token_ttl,
           CASE WHEN c.deleted_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
-          (SELECT max(created_at) FROM mcp_request_log WHERE token_name = c.client_id) as last_used_at,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
+          (SELECT max(created_at) FROM audit_events_compat WHERE token_name = c.client_id) as last_used_at,
+          (SELECT count(*)::int FROM audit_events_compat WHERE token_name = c.client_id) as total_requests,
+          (SELECT count(*)::int FROM audit_events_compat WHERE token_name = c.client_id AND created_at > now() - interval '24 hours') as requests_today
         FROM oauth_clients c ORDER BY c.created_at DESC
       `;
       const legacyKeys = await sql`
@@ -1407,8 +1921,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           '{"bearer"}' as grant_types, 'read write admin' as scope, a.created_at, null as token_ttl,
           CASE WHEN a.revoked_at IS NOT NULL THEN 'revoked' ELSE 'active' END as status,
           a.last_used_at,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name) as total_requests,
-          (SELECT count(*)::int FROM mcp_request_log WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
+          (SELECT count(*)::int FROM audit_events_compat WHERE token_name = a.name) as total_requests,
+          (SELECT count(*)::int FROM audit_events_compat WHERE token_name = a.name AND created_at > now() - interval '24 hours') as requests_today
         FROM access_tokens a ORDER BY a.created_at DESC
       `;
       res.json([...oauthClients, ...legacyKeys]);
@@ -1437,7 +1951,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       const [clients] = await sql`SELECT count(*)::int as count FROM oauth_clients`;
       const [tokens] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at > ${Math.floor(Date.now() / 1000)}`;
-      const [requests] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE created_at > now() - interval '24 hours'`;
+      const [requests] = await sql`SELECT count(*)::int as count FROM audit_events_compat WHERE created_at > now() - interval '24 hours'`;
       const [apiKeys] = await sql`SELECT count(*)::int as count FROM access_tokens WHERE revoked_at IS NULL`;
       res.json({
         connected_agents: (clients as any).count,
@@ -1454,12 +1968,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     try {
       const now = Math.floor(Date.now() / 1000);
       const [expiring] = await sql`SELECT count(*)::int as count FROM oauth_tokens WHERE token_type = 'access' AND expires_at BETWEEN ${now} AND ${now + 86400}`;
-      const [errors] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE status != 'success' AND created_at > now() - interval '24 hours'`;
-      const [total] = await sql`SELECT count(*)::int as count FROM mcp_request_log WHERE created_at > now() - interval '24 hours'`;
+      const [errors] = await sql`SELECT count(*)::int as count FROM audit_events_compat WHERE status != 'success' AND created_at > now() - interval '24 hours'`;
+      const [total] = await sql`SELECT count(*)::int as count FROM audit_events_compat WHERE created_at > now() - interval '24 hours'`;
       const errorRate = (total as any).count > 0 ? ((errors as any).count / (total as any).count * 100).toFixed(1) : '0';
+      // Phase 9C: audit_write_failures_total is process-local (this HTTP
+      // server process only — gbrain doctor runs as a separate process and
+      // can't see it, so it relies on the file-based indicators instead;
+      // see checkAuditDurability in doctor.ts). audit_spill_pending is
+      // file-based and safe to compute here too.
+      const { getAuditWriteFailuresTotal } = await import('../core/audit/audit-events-metrics.ts');
+      const { countPendingSpillLines } = await import('../core/audit/audit-events-spill.ts');
+      const [auditWriteFailuresTotal, auditSpillPending] = await Promise.all([
+        Promise.resolve(getAuditWriteFailuresTotal()),
+        countPendingSpillLines(),
+      ]);
       res.json({
         expiring_soon: (expiring as any).count,
         error_rate: `${errorRate}%`,
+        audit_write_failures_total: auditWriteFailuresTotal,
+        audit_spill_pending: auditSpillPending,
       });
     } catch {
       res.status(503).json({ error: 'service_unavailable' });
@@ -1679,13 +2206,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const rows = await engine.executeRaw(
         `SELECT id, token_name, COALESCE(agent_name, token_name) as agent_name,
                 operation, latency_ms, status, params, error_message, created_at
-         FROM mcp_request_log
+         FROM audit_events_compat
          WHERE 1=1 ${filterSql}
          ORDER BY created_at DESC LIMIT ${limitParam} OFFSET ${offsetParam}`,
         [...params, limit, offset],
       );
       const [countResult] = await engine.executeRaw<{ total: number }>(
-        `SELECT count(*)::int as total FROM mcp_request_log
+        `SELECT count(*)::int as total FROM audit_events_compat
          WHERE 1=1 ${filterSql}`,
         params,
       );
@@ -1710,33 +2237,179 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   app.post('/admin/api/api-keys', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const apiKeyAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'credential.issue' as const,
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session' as const,
+      principal_id: null,
+      client_id: null,
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: 'access_token',
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/api-keys' },
+    };
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
-      const { generateToken, hashToken } = await import('../core/utils.ts');
+      if (!name) {
+        res.status(400).json({ error: 'Name required' });
+        await writeAuditEvent(engine, {
+          ...apiKeyAuditBase,
+          actor_label: null,
+          credential_ref: null,
+          resource_ref: null,
+          operation: 'admin_create_api_key',
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'missing_name',
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: 'Name required',
+        }, { class: 'class2_denial' });
+        return;
+      }
+      const { generateToken, hashToken: hashTok } = await import('../core/utils.ts');
       const token = generateToken('gbrain_');
-      const hash = hashToken(token);
+      const hash = hashTok(token);
       const id = (await import('crypto')).randomUUID();
-      await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
+      await engine.transaction(async (tx) => {
+        const txSql = sqlQueryForEngine(tx);
+        await txSql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
+        await writeAuditEvent(engine, {
+          ...apiKeyAuditBase,
+          actor_label: name,
+          credential_ref: hash.slice(0, 16),
+          resource_ref: id,
+          operation: 'admin_create_api_key',
+          decision: 'allowed',
+          outcome: 'succeeded',
+          reason_code: null,
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null,
+        }, { class: 'class1_issuance', tx });
+      });
       res.json({ name, token, id });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
+      const msg = e instanceof Error ? e.message : 'Failed to create API key';
+      res.status(500).json({ error: msg });
+      await writeAuditEvent(engine, {
+        ...apiKeyAuditBase,
+        actor_label: null,
+        credential_ref: null,
+        resource_ref: null,
+        operation: 'admin_create_api_key',
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'create_api_key_failed',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+      }, { class: 'class2_denial' });
     }
   });
 
   app.post('/admin/api/api-keys/revoke', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const revokeKeyAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'credential.revoke' as const,
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session' as const,
+      principal_id: null,
+      client_id: null,
+      credential_ref: null,
+      operation: 'admin_revoke_api_key',
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: 'access_token',
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/api-keys/revoke' },
+    };
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        res.status(400).json({ error: 'Name required' });
+        await writeAuditEvent(engine, {
+          ...revokeKeyAuditBase,
+          actor_label: null,
+          resource_ref: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'missing_name',
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: 'Name required',
+        }, { class: 'class2_denial' });
+        return;
+      }
       await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
       res.json({ revoked: true });
+      // §2-4: revocation, fail-open. UPDATE with no matching row (already
+      // revoked / unknown name) still reaches here — RFC 7009-style
+      // idempotent-success posture matches /revoke and api-keys/revoke's
+      // pre-existing 200-regardless-of-match behavior.
+      await writeAuditEvent(engine, {
+        ...revokeKeyAuditBase,
+        actor_label: name,
+        resource_ref: name,
+        decision: 'allowed',
+        outcome: 'succeeded',
+        reason_code: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: null,
+      }, { class: 'class1_revocation' });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
+      const msg = e instanceof Error ? e.message : 'Revoke failed';
+      res.status(500).json({ error: msg });
+      await writeAuditEvent(engine, {
+        ...revokeKeyAuditBase,
+        actor_label: null,
+        resource_ref: null,
+        decision: 'allowed',
+        outcome: 'failed',
+        reason_code: 'revoke_db_error',
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: msg,
+      }, { class: 'class1_revocation' });
     }
   });
 
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const registerAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'client.register' as const,
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session' as const,
+      principal_id: null,
+      client_id: null,
+      credential_ref: null,
+      required_scope: null,
+      resource_kind: 'oauth_client',
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/register-client' },
+    };
     try {
       // v0.39.3.0 WARN-9 + CV12: accept BOTH `scopes` (admin SPA convention)
       // AND `scope` (OAuth wire-format convention, singular). The pre-fix
@@ -1750,15 +2423,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // missing, empty) and rejects the rest with a structured 400.
       const { name, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        res.status(400).json({ error: 'Name required' });
+        await writeAuditEvent(engine, {
+          ...registerAuditBase, actor_label: null, resource_ref: null, scopes_snapshot: null,
+          operation: 'admin_register_client', decision: 'denied', outcome: 'rejected', reason_code: 'missing_name',
+          latency_ms: Date.now() - startedAt, errorMessageRaw: 'Name required',
+        }, { class: 'class2_denial' });
+        return;
+      }
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
       } catch (e) {
-        res.status(400).json({
-          error: 'invalid_scopes',
-          message: e instanceof Error ? e.message : String(e),
-        });
+        const msg = e instanceof Error ? e.message : String(e);
+        res.status(400).json({ error: 'invalid_scopes', message: msg });
+        await writeAuditEvent(engine, {
+          ...registerAuditBase, actor_label: name, resource_ref: null, scopes_snapshot: null,
+          operation: 'admin_register_client', decision: 'denied', outcome: 'rejected', reason_code: 'invalid_scopes',
+          latency_ms: Date.now() - startedAt, errorMessageRaw: msg,
+        }, { class: 'class2_denial' });
         return;
       }
       const grants = Array.isArray(grantTypes) && grantTypes.length > 0 ? grantTypes : ['client_credentials'];
@@ -1774,50 +2458,176 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         validatedAuthMethod = validateTokenEndpointAuthMethod(tokenEndpointAuthMethod);
       } catch (e) {
-        res.status(400).json({
-          error: 'invalid_token_endpoint_auth_method',
-          message: e instanceof Error ? e.message : String(e),
-        });
+        const msg = e instanceof Error ? e.message : String(e);
+        res.status(400).json({ error: 'invalid_token_endpoint_auth_method', message: msg });
+        await writeAuditEvent(engine, {
+          ...registerAuditBase, actor_label: name, resource_ref: null, scopes_snapshot: scopeString.split(' '),
+          operation: 'admin_register_client', decision: 'denied', outcome: 'rejected', reason_code: 'invalid_token_endpoint_auth_method',
+          latency_ms: Date.now() - startedAt, errorMessageRaw: msg,
+        }, { class: 'class2_denial' });
         return;
       }
-      const result = await oauthProvider.registerClientManual(
-        name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod,
-      );
-      // Set per-client TTL if specified
-      if (tokenTtl && Number(tokenTtl) > 0) {
-        await sql`UPDATE oauth_clients SET token_ttl = ${Number(tokenTtl)} WHERE client_id = ${result.clientId}`;
-      }
+      const result = await engine.transaction(async (tx) => {
+        const created = await oauthProvider.registerClientManual(
+          name, grants, scopeString, uris, 'default', undefined, validatedAuthMethod, undefined, tx,
+        );
+        // Set per-client TTL if specified — same transaction as the
+        // registration INSERT and the audit-event row (§2-1).
+        if (tokenTtl && Number(tokenTtl) > 0) {
+          const txSql = sqlQueryForEngine(tx);
+          await txSql`UPDATE oauth_clients SET token_ttl = ${Number(tokenTtl)} WHERE client_id = ${created.clientId}`;
+        }
+        await writeAuditEvent(engine, {
+          ...registerAuditBase,
+          actor_label: name,
+          resource_ref: created.clientId,
+          scopes_snapshot: scopeString.split(' '),
+          operation: 'admin_register_client',
+          decision: 'allowed',
+          outcome: 'succeeded',
+          reason_code: null,
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null,
+        }, { class: 'class1_issuance', tx });
+        return created;
+      });
       res.json({ ...result, tokenTtl: tokenTtl ? Number(tokenTtl) : null });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Registration failed' });
+      const msg = e instanceof Error ? e.message : 'Registration failed';
+      res.status(500).json({ error: msg });
+      await writeAuditEvent(engine, {
+        ...registerAuditBase, actor_label: null, resource_ref: null, scopes_snapshot: null,
+        operation: 'admin_register_client', decision: 'denied', outcome: 'rejected', reason_code: 'register_client_failed',
+        latency_ms: Date.now() - startedAt, errorMessageRaw: msg,
+      }, { class: 'class2_denial' });
     }
   });
 
   // Update client TTL
   app.post('/admin/api/update-client-ttl', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const ttlAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'client.update' as const,
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session' as const,
+      principal_id: null,
+      client_id: null,
+      credential_ref: null,
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: 'oauth_client',
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/update-client-ttl' },
+    };
     try {
       const { clientId, tokenTtl } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        res.status(400).json({ error: 'clientId required' });
+        await writeAuditEvent(engine, {
+          ...ttlAuditBase, actor_label: null, resource_ref: null,
+          operation: 'admin_update_client_ttl', decision: 'denied', outcome: 'rejected', reason_code: 'missing_client_id',
+          latency_ms: Date.now() - startedAt, errorMessageRaw: 'clientId required',
+        }, { class: 'class2_denial' });
+        return;
+      }
       const ttl = tokenTtl === null || tokenTtl === 0 ? null : Number(tokenTtl);
-      await sql`UPDATE oauth_clients SET token_ttl = ${ttl} WHERE client_id = ${clientId}`;
+      await engine.transaction(async (tx) => {
+        const txSql = sqlQueryForEngine(tx);
+        await txSql`UPDATE oauth_clients SET token_ttl = ${ttl} WHERE client_id = ${clientId}`;
+        await writeAuditEvent(engine, {
+          ...ttlAuditBase,
+          actor_label: clientId,
+          resource_ref: clientId,
+          operation: 'admin_update_client_ttl',
+          decision: 'allowed',
+          outcome: 'succeeded',
+          reason_code: null,
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null,
+          adapter: { http_method: 'POST', http_path: '/admin/api/update-client-ttl', token_ttl: ttl },
+        }, { class: 'class1_issuance', tx });
+      });
       res.json({ updated: true, tokenTtl: ttl });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Update failed' });
+      const msg = e instanceof Error ? e.message : 'Update failed';
+      res.status(500).json({ error: msg });
+      await writeAuditEvent(engine, {
+        ...ttlAuditBase, actor_label: null, resource_ref: null,
+        operation: 'admin_update_client_ttl', decision: 'denied', outcome: 'rejected', reason_code: 'update_ttl_failed',
+        latency_ms: Date.now() - startedAt, errorMessageRaw: msg,
+      }, { class: 'class2_denial' });
     }
   });
 
   // Revoke OAuth client
   app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+    const revokeClientAuditBase = {
+      occurred_at: occurredAt,
+      envelope_version: 1,
+      event_kind: 'client.revoke' as const,
+      channel_id: 'admin_http',
+      attribution_state: 'admin_session' as const,
+      principal_id: null,
+      client_id: null,
+      credential_ref: null,
+      required_scope: null,
+      scopes_snapshot: null,
+      resource_kind: 'oauth_client',
+      source_id: null,
+      job_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { http_method: 'POST', http_path: '/admin/api/revoke-client' },
+    };
     try {
       const { clientId } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        res.status(400).json({ error: 'clientId required' });
+        await writeAuditEvent(engine, {
+          ...revokeClientAuditBase, actor_label: null, resource_ref: null,
+          operation: 'admin_revoke_client', decision: 'denied', outcome: 'rejected', reason_code: 'missing_client_id',
+          latency_ms: Date.now() - startedAt, errorMessageRaw: 'clientId required',
+        }, { class: 'class2_denial' });
+        return;
+      }
       // Soft-delete the client
       await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId} AND deleted_at IS NULL`;
       // Revoke all active tokens for this client
       await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
       res.json({ revoked: true });
+      // §2-4: revocation, fail-open — both DB writes above already
+      // committed (no tx) by the time the audit write is attempted.
+      await writeAuditEvent(engine, {
+        ...revokeClientAuditBase,
+        actor_label: clientId,
+        resource_ref: clientId,
+        operation: 'admin_revoke_client',
+        decision: 'allowed',
+        outcome: 'succeeded',
+        reason_code: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: null,
+      }, { class: 'class1_revocation' });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
+      const msg = e instanceof Error ? e.message : 'Revoke failed';
+      res.status(500).json({ error: msg });
+      await writeAuditEvent(engine, {
+        ...revokeClientAuditBase, actor_label: null, resource_ref: null,
+        operation: 'admin_revoke_client', decision: 'allowed', outcome: 'failed', reason_code: 'revoke_client_db_error',
+        latency_ms: Date.now() - startedAt, errorMessageRaw: msg,
+      }, { class: 'class1_revocation' });
     }
   });
 
@@ -1923,6 +2733,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     // for legacy tokens or when the JOIN row's client_name is NULL.
     const agentName = authInfo.clientName ?? authInfo.clientId;
 
+    // Phase 9C: requireBearerAuth() above already resolved authInfo before
+    // this handler runs (same posture as /ingest — no pre-auth branch
+    // exists inside this closure). Computed once, reused by both the
+    // ListTools and CallTool request handlers below via JS closure.
+    const mcpCorrelationId = randomUUID();
+    const mcpAttributionState = authInfo.credentialSource === 'legacy_access_token'
+      ? 'legacy_credential' as const
+      : authInfo.principalId ? 'principal_attributed' as const : 'client_only' as const;
+    const mcpPrincipalId = authInfo.principalId ?? null;
+    const mcpAuditBase = {
+      envelope_version: 1,
+      channel_id: 'mcp_http',
+      attribution_state: mcpAttributionState,
+      principal_id: mcpPrincipalId,
+      client_id: authInfo.clientId,
+      actor_label: agentName,
+      credential_ref: null,
+      resource_kind: null,
+      resource_ref: null,
+      source_id: authInfo.sourceId ?? null,
+      job_id: null,
+      correlation_id: mcpCorrelationId,
+      parent_event_id: null,
+    };
+
     // Create a fresh MCP server per request (stateless)
     const server = new Server(
       { name: 'gbrain', version: VERSION },
@@ -1935,15 +2770,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // ever called tools/list, and the v0.26.3 persistence regression test
       // asserting >= 2 rows after tools/list + tools/call was unreachable.
       const latency = Date.now() - startTime;
-      try {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, 'tools/list', latency, 'success'],
-          [null],
-        );
-      } catch { /* best effort */ }
+      await writeAuditEvent(engine, {
+        ...mcpAuditBase,
+        occurred_at: new Date().toISOString(),
+        event_kind: 'operation.request',
+        operation: 'tools/list',
+        required_scope: null,
+        scopes_snapshot: authInfo.scopes,
+        decision: 'allowed',
+        outcome: 'succeeded',
+        reason_code: null,
+        latency_ms: latency,
+        errorMessageRaw: null,
+        params_summary: null,
+        adapter: { jsonrpc_method: 'tools/list' },
+      }, { class: 'class3_success' });
       broadcastEvent({
         agent: agentName,
         operation: 'tools/list',
@@ -1975,15 +2816,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // misbehaving agents need to see the full attempt log, not just
         // valid-op success/error.
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `unknown_operation: ${name}`],
-            [null],
-          );
-        } catch { /* best effort */ }
+        await writeAuditEvent(engine, {
+          ...mcpAuditBase,
+          occurred_at: new Date().toISOString(),
+          event_kind: 'operation.request',
+          operation: name,
+          required_scope: null,
+          scopes_snapshot: authInfo.scopes,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'unknown_operation',
+          latency_ms: latency,
+          errorMessageRaw: `unknown_operation: ${name}`,
+          params_summary: null,
+          adapter: { jsonrpc_method: 'tools/call' },
+        }, { class: 'class2_denial' });
         broadcastEvent({
           agent: agentName,
           operation: name,
@@ -2014,15 +2861,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // motivation as the unknown-op path — and it makes the v0.26.3
         // persistence regression test reliable across both rejection paths.
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', `insufficient_scope: requires '${requiredScope}'`],
-            [null],
-          );
-        } catch { /* best effort */ }
+        await writeAuditEvent(engine, {
+          ...mcpAuditBase,
+          occurred_at: new Date().toISOString(),
+          event_kind: 'operation.request',
+          operation: name,
+          required_scope: requiredScope,
+          scopes_snapshot: authInfo.scopes,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'insufficient_scope',
+          latency_ms: latency,
+          errorMessageRaw: `insufficient_scope: requires '${requiredScope}'`,
+          params_summary: null,
+          adapter: { jsonrpc_method: 'tools/call' },
+        }, { class: 'class2_denial' });
         broadcastEvent({
           agent: agentName,
           operation: name,
@@ -2110,15 +2963,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // real object, not a JSON-encoded string.
         const latency = Date.now() - startTime;
         const errorPayload = serializeError(e);
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errorPayload.message],
-            [logParamsObj],
-          );
-        } catch { /* best effort */ }
+        await writeAuditEvent(engine, {
+          ...mcpAuditBase,
+          occurred_at: new Date().toISOString(),
+          event_kind: 'operation.request',
+          operation: name,
+          required_scope: requiredScope,
+          scopes_snapshot: authInfo.scopes,
+          decision: 'allowed',
+          outcome: 'failed',
+          reason_code: 'dispatch_exception',
+          latency_ms: latency,
+          errorMessageRaw: errorPayload.message,
+          params_summary: logParamsObj as Record<string, unknown> | null,
+          adapter: { jsonrpc_method: 'tools/call' },
+        }, { class: 'class3_success' });
         broadcastEvent({
           agent: agentName,
           operation: name,
@@ -2136,21 +2995,27 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (toolResult.isError) {
         // dispatchToolCall serializes the error into the content text;
         // for the audit log we re-extract a message string for the
-        // mcp_request_log error_message column. Best-effort parse.
+        // error_message column. Best-effort parse.
         let errMsg = 'unknown_error';
         try {
           const parsed = JSON.parse(toolResult.content[0]?.text ?? '{}');
           errMsg = parsed.error?.message ?? parsed.message ?? errMsg;
         } catch { /* ignore */ }
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, 'error', errMsg],
-            [logParamsObj],
-          );
-        } catch { /* best effort */ }
+        await writeAuditEvent(engine, {
+          ...mcpAuditBase,
+          occurred_at: new Date().toISOString(),
+          event_kind: 'operation.request',
+          operation: name,
+          required_scope: requiredScope,
+          scopes_snapshot: authInfo.scopes,
+          decision: 'allowed',
+          outcome: 'failed',
+          reason_code: 'op_error',
+          latency_ms: latency,
+          errorMessageRaw: errMsg,
+          params_summary: logParamsObj as Record<string, unknown> | null,
+          adapter: { jsonrpc_method: 'tools/call' },
+        }, { class: 'class3_success' });
         broadcastEvent({
           agent: agentName,
           operation: name,
@@ -2164,15 +3029,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return toolResult;
       }
 
-      try {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, name, latency, 'success'],
-          [logParamsObj],
-        );
-      } catch { /* best effort */ }
+      await writeAuditEvent(engine, {
+        ...mcpAuditBase,
+        occurred_at: new Date().toISOString(),
+        event_kind: 'operation.request',
+        operation: name,
+        required_scope: requiredScope,
+        scopes_snapshot: authInfo.scopes,
+        decision: 'allowed',
+        outcome: 'succeeded',
+        reason_code: null,
+        latency_ms: latency,
+        errorMessageRaw: null,
+        params_summary: logParamsObj as Record<string, unknown> | null,
+        adapter: { jsonrpc_method: 'tools/call' },
+      }, { class: 'class3_success' });
       broadcastEvent({
         agent: agentName,
         operation: name,
@@ -2270,6 +3141,34 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const authInfo = (req as Request & { auth?: AuthInfo }).auth as AuthInfo;
       const agentName = authInfo.clientName ?? authInfo.clientId;
 
+      // Phase 9C: requireBearerAuth() above already resolved authInfo before
+      // this handler runs, so attribution is known for every branch below —
+      // unlike /token and /revoke, there is no pre-auth path in this handler.
+      const correlationId = randomUUID();
+      const occurredAt = new Date().toISOString();
+      const ingestAttributionState = authInfo.credentialSource === 'legacy_access_token'
+        ? 'legacy_credential' as const
+        : authInfo.principalId ? 'principal_attributed' as const : 'client_only' as const;
+      const ingestPrincipalId = authInfo.principalId ?? null;
+      const ingestAuditBase = {
+        occurred_at: occurredAt,
+        envelope_version: 1,
+        channel_id: 'ingest_http',
+        attribution_state: ingestAttributionState,
+        principal_id: ingestPrincipalId,
+        client_id: authInfo.clientId,
+        actor_label: agentName,
+        credential_ref: null,
+        operation: 'ingest',
+        required_scope: 'write',
+        scopes_snapshot: authInfo.scopes,
+        source_id: null,
+        job_id: null,
+        correlation_id: correlationId,
+        parent_event_id: null,
+        params_summary: null,
+      };
+
       // v0.39.3.0 BUG-2: outer try/catch ensures any unexpected throw
       // returns a JSON envelope instead of leaking express's default HTML
       // error page. Mirrors the MCP handler's F14 pattern (serve-http.ts
@@ -2291,6 +3190,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           error: 'empty_body',
           message: 'POST /ingest requires a non-empty body',
         });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.reject',
+          resource_kind: null,
+          resource_ref: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'empty_body',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: 'POST /ingest requires a non-empty body',
+          adapter: { http_method: 'POST', http_path: '/ingest' },
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2311,6 +3222,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       if (body.length === 0) {
         res.status(400).json({ error: 'empty_body', message: 'POST /ingest requires a non-empty body' });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.reject',
+          resource_kind: null,
+          resource_ref: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'empty_body',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: 'POST /ingest requires a non-empty body',
+          adapter: { http_method: 'POST', http_path: '/ingest' },
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2337,6 +3260,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           message: `content_type '${declared}' not supported. Use one of: ${[...INGEST_ALLOWED_CONTENT_TYPES].join(', ')}. ` +
             'Binary content (image/audio/video/pdf) is not yet supported via POST /ingest — install a content-type processor skillpack.',
         });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.reject',
+          resource_kind: null,
+          resource_ref: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'unsupported_content_type',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: `content_type '${declared}' not supported`,
+          adapter: { http_method: 'POST', http_path: '/ingest', declared_content_type: declared },
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2345,6 +3280,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           error: 'unsupported_content_type',
           message: `content_type '${contentType}' is in the taxonomy but not currently accepted by POST /ingest`,
         });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.reject',
+          resource_kind: null,
+          resource_ref: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'unsupported_content_type',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: `content_type '${contentType}' is in the taxonomy but not currently accepted`,
+          adapter: { http_method: 'POST', http_path: '/ingest', declared_content_type: contentType },
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2378,6 +3325,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           message: validationErr.message,
           field: validationErr.field,
         });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.reject',
+          resource_kind: 'source',
+          resource_ref: sourceId,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'invalid_event',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: `${validationErr.field}: ${validationErr.message}`,
+          adapter: { http_method: 'POST', http_path: '/ingest', content_type: contentType, bytes: body.length },
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2401,15 +3360,6 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         );
 
         const latency = Date.now() - startTime;
-        try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-            [authInfo.clientId, agentName, 'webhook_ingest', latency, 'success'],
-            [{ content_type: contentType, content_hash: contentHash, bytes: body.length, job_id: job.id }],
-          );
-        } catch { /* best effort */ }
         broadcastEvent({
           agent: agentName,
           operation: 'webhook_ingest',
@@ -2418,6 +3368,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           status: 'success',
           timestamp: new Date().toISOString(),
         });
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.accept',
+          resource_kind: 'source',
+          resource_ref: sourceId,
+          decision: 'allowed',
+          outcome: 'succeeded',
+          reason_code: null,
+          latency_ms: latency,
+          errorMessageRaw: null,
+          adapter: { http_method: 'POST', http_path: '/ingest', content_type: contentType, bytes: body.length, job_id: job.id },
+        }, { class: 'class3_success' });
 
         res.status(202).json({
           job_id: job.id,
@@ -2432,6 +3394,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           error: 'queue_submission_failed',
           message: msg,
         });
+        // §1: authorization + validation already passed by this point (the
+        // event object built cleanly) — only queue submission itself
+        // failed, so this stays decision=allowed/outcome=failed under
+        // class3, not a class2 denial.
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.accept',
+          resource_kind: 'source',
+          resource_ref: sourceId,
+          decision: 'allowed',
+          outcome: 'failed',
+          reason_code: 'queue_submission_failed',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: msg,
+          adapter: { http_method: 'POST', http_path: '/ingest', content_type: contentType, bytes: body.length },
+        }, { class: 'class3_success' });
       }
 
       // v0.39.3.0 BUG-2: outer try/catch close — anything that throws BEFORE
@@ -2448,6 +3426,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             message: msg,
           });
         }
+        // Deliberately no sourceId/contentType here — variables from the
+        // inner block are out of scope for a throw that happened before
+        // they were assigned. Still decision=allowed (requireBearerAuth
+        // already passed before this handler started).
+        await writeAuditEvent(engine, {
+          ...ingestAuditBase,
+          event_kind: 'ingest.accept',
+          resource_kind: null,
+          resource_ref: null,
+          decision: 'allowed',
+          outcome: 'failed',
+          reason_code: 'internal_error',
+          latency_ms: Date.now() - startTime,
+          errorMessageRaw: msg,
+          adapter: { http_method: 'POST', http_path: '/ingest' },
+        }, { class: 'class3_success' });
       }
     },
   );
@@ -2481,11 +3475,45 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     githubWebhookLimiter,
     express.raw({ type: '*/*', limit: '1mb' }),
     async (req: Request, res: Response) => {
+      // Phase 9C: correlation_id ties every audit_events row this request
+      // produces together; occurred_at is the moment the handler started
+      // (not recorded_at, which the Writer stamps at write-attempt time).
+      const correlationId = randomUUID();
+      const occurredAt = new Date().toISOString();
+      const startedAt = Date.now();
+
       // D3 pre-DB short-circuit: missing signature → 401 without any
       // source lookup. Bot probe traffic ends here.
       const sigHeader = req.header('X-Hub-Signature-256');
       if (!sigHeader) {
         res.status(401).json({ error: 'missing_signature', message: 'X-Hub-Signature-256 header is required' });
+        await writeAuditEvent(engine, {
+          envelope_version: 1,
+          occurred_at: occurredAt,
+          event_kind: 'authorization.decision',
+          channel_id: 'webhook',
+          attribution_state: 'unauthenticated',
+          principal_id: null,
+          client_id: null,
+          actor_label: null,
+          credential_ref: null,
+          operation: 'webhooks.github',
+          required_scope: null,
+          scopes_snapshot: null,
+          decision: 'denied',
+          outcome: 'rejected',
+          reason_code: 'missing_signature',
+          resource_kind: null,
+          resource_ref: null,
+          source_id: null,
+          job_id: null,
+          correlation_id: correlationId,
+          parent_event_id: null,
+          latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null,
+          params_summary: null,
+          adapter: {},
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2559,6 +3587,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const secret = cfg.webhook_secret;
       if (!secret || typeof secret !== 'string') {
         res.status(401).json({ error: 'webhook_not_configured', message: 'Run: gbrain sources webhook set ' + source.id });
+        await writeAuditEvent(engine, {
+          envelope_version: 1, occurred_at: occurredAt, event_kind: 'authorization.decision',
+          channel_id: 'webhook', attribution_state: 'unauthenticated', principal_id: null, client_id: null,
+          actor_label: null, credential_ref: null, operation: 'webhooks.github', required_scope: null,
+          scopes_snapshot: null, decision: 'denied', outcome: 'rejected', reason_code: 'webhook_not_configured',
+          resource_kind: 'source', resource_ref: source.id, source_id: source.id, job_id: null,
+          correlation_id: correlationId, parent_event_id: null, latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null, params_summary: null, adapter: {},
+        }, { class: 'class2_denial' });
         return;
       }
 
@@ -2570,12 +3607,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const { createHmac } = await import('node:crypto');
       const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
       const prefix = 'sha256=';
+      const auditSignatureMismatch = (detail: string) => writeAuditEvent(engine, {
+        envelope_version: 1, occurred_at: occurredAt, event_kind: 'authorization.decision',
+        channel_id: 'webhook', attribution_state: 'authentication_failed', principal_id: null, client_id: null,
+        actor_label: null, credential_ref: null, operation: 'webhooks.github', required_scope: null,
+        scopes_snapshot: null, decision: 'denied', outcome: 'rejected', reason_code: 'signature_mismatch',
+        resource_kind: 'source', resource_ref: source!.id, source_id: source!.id, job_id: null,
+        correlation_id: correlationId, parent_event_id: null, latency_ms: Date.now() - startedAt,
+        errorMessageRaw: detail, params_summary: null, adapter: {},
+      }, { class: 'class2_denial' });
       if (!sigHeader.startsWith(prefix)) {
         res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256= prefix' });
+        await auditSignatureMismatch('missing sha256= prefix');
         return;
       }
       if (!safeHexEqual(sigHeader.slice(prefix.length), computedHex)) {
         res.status(401).json({ error: 'signature_mismatch' });
+        await auditSignatureMismatch('HMAC digest mismatch');
         return;
       }
 
@@ -2596,20 +3644,65 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           },
         );
         res.status(202).json({ job_id: job.id, source_id: source.id });
+        await writeAuditEvent(engine, {
+          envelope_version: 1, occurred_at: occurredAt, event_kind: 'operation.request',
+          channel_id: 'webhook', attribution_state: 'message_authenticated', principal_id: null, client_id: null,
+          actor_label: null, credential_ref: null, operation: 'webhooks.github', required_scope: null,
+          scopes_snapshot: null, decision: 'allowed', outcome: 'succeeded', reason_code: null,
+          resource_kind: 'job', resource_ref: String(job.id), source_id: source.id, job_id: job.id,
+          correlation_id: correlationId, parent_event_id: null, latency_ms: Date.now() - startedAt,
+          errorMessageRaw: null, params_summary: null, adapter: {},
+        }, { class: 'class3_success' });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
         res.status(500).json({ error: 'queue_submission_failed', message: msg });
+        await writeAuditEvent(engine, {
+          envelope_version: 1, occurred_at: occurredAt, event_kind: 'operation.request',
+          channel_id: 'webhook', attribution_state: 'message_authenticated', principal_id: null, client_id: null,
+          actor_label: null, credential_ref: null, operation: 'webhooks.github', required_scope: null,
+          scopes_snapshot: null, decision: 'allowed', outcome: 'failed', reason_code: 'queue_submission_failed',
+          resource_kind: 'source', resource_ref: source.id, source_id: source.id, job_id: null,
+          correlation_id: correlationId, parent_event_id: null, latency_ms: Date.now() - startedAt,
+          errorMessageRaw: msg, params_summary: null, adapter: {},
+        }, { class: 'class3_success' });
       }
     },
   );
+
+  // Phase 9C: startup-time self-check against entrypoint-registry.ts — a
+  // live HTTP route with no IN/OUT declaration is exactly the kind of
+  // accidental gap AUTHZ-INV-013 requires never happen silently. Warn
+  // only (never block startup on this): a false positive here must not
+  // take down the server, and test/audit-entrypoint-coverage.test.ts is
+  // the actual enforcement mechanism (CI-gated). This is the production
+  // visibility companion to that test.
+  {
+    const { checkEntrypointDrift, EXPECTED_MOUNTED_ROUTER_COUNT } = await import('../core/audit/entrypoint-registry.ts');
+    // Express's own .d.ts doesn't expose `.methods` on its internal Layer/
+    // Route types (though it genuinely exists at runtime — verified in
+    // entrypoint-registry.ts's own header comment), so checkEntrypointDrift's
+    // hand-declared structural shape can't be satisfied without a cast here.
+    const drift = checkEntrypointDrift(app as unknown as Parameters<typeof checkEntrypointDrift>[0]);
+    if (drift.unregisteredRoutes.length > 0) {
+      console.error(
+        `[serve-http] WARNING: ${drift.unregisteredRoutes.length} HTTP route(s) are not declared in entrypoint-registry.ts's IN_ROUTES/OUT_ROUTES: ` +
+        drift.unregisteredRoutes.map(r => `${r.method} ${r.path}`).join(', '),
+      );
+    }
+    if (!drift.mountedRouterCountMatchesExpected) {
+      console.error(
+        `[serve-http] WARNING: expected ${EXPECTED_MOUNTED_ROUTER_COUNT} mounted sub-router(s), found ${drift.mountedRouterCount}.`,
+      );
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Start server
   // ---------------------------------------------------------------------------
   const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
 
-  app.listen(port, bind, () => {
+  const httpServer = app.listen(port, bind, () => {
     console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║
@@ -2634,4 +3727,13 @@ ${bootstrapFromEnv
     : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
   });
+
+  // Phase 9C (test/audit-entrypoint-coverage.test.ts): returning the
+  // constructed app + underlying http.Server is purely additive — the
+  // only existing caller (src/commands/serve.ts) already discards the
+  // return value entirely. Lets the entrypoint-drift test introspect the
+  // REAL, fully-registered Express app instance (app.router.stack) rather
+  // than a hand-maintained replica that could itself drift from
+  // production route registration.
+  return { app, httpServer };
 }

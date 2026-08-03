@@ -46,6 +46,7 @@ CHECKS=(
   "check:wasm"
   "check:admin-build"
   "check:admin-scope-drift"
+  "check:audit-registry-drift"
   "check:cli-exec"
   "check:system-of-record"
   "check:eval-glossary"

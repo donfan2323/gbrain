@@ -122,11 +122,16 @@ $ tsc --noEmit
   ```
 - 本番データベースに対して直接適用しない。ステージング環境またはバックアップからのリストア先で先に検証する。
 - **(v4で追加、Migration Reviewer指摘)** `oauth_clients.principal_id`のFKは`ON DELETE RESTRICT`のため、上記ロールバックSQL(4-2)とは別に`principals`の個々の行を直接`DELETE`で整理したい場合は、先に`UPDATE oauth_clients SET principal_id = NULL WHERE principal_id = '<対象principal_id>'`で参照を外してからでないと削除は拒否される(4-2のロールバックSQL自体は列ごとDROPするため、この制約の影響を受けない)。
+- **(v5で追加、Phase 9C導入に伴う訂正)** Phase 9C(`audit_events`、migrate.ts v126〜v128)は`audit_events.principal_id → principals(id) ON DELETE RESTRICT`というFKを新設した。`config.version >= 126`の場合(=Phase 9Cが適用済みの場合)、`principals`は`audit_events`から参照されているため、下記4-2のSQLをそのまま実行すると`DROP TABLE principals`が`2BP01`(dependent objects exist)で失敗する。この場合は、4-2の前に**Phase 9Cのロールバック(`PHASE9C-MIGRATION-AND-COMPATIBILITY-PLAN.md` §6、`audit_events_attribution_gaps`/`audit_events_compat`ビュー→`audit_events`→登録表3つ→`config.version`を125へ)を先に完了させてから**4-2を実行すること(新しいレイヤーから順に戻す、という一般原則。Phase 9C自身のロールバック手順も同じ原則でv127→v126の順に書かれている)。`config.version`が125のままの環境(Phase 9C未適用)では、この節は無関係であり4-2は従来どおりそのまま実行できる。
 
 ### 4-2. ロールバックSQL(実行順序厳守)
 
 ```sql
 BEGIN;
+
+-- 0. (v5で追加) config.version >= 126 の場合、Phase 9Cのロールバックを
+--    先に完了させてから本SQLを実行すること(上記4-1の追記・警告参照)。
+--    未完了のままでは次のDROP TABLE principalsが2BP01で失敗する。
 
 -- 1. oauth_clientsからFK列を削除(principalsテーブルへの依存を先に断つ)
 ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;

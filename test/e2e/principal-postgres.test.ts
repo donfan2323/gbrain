@@ -210,6 +210,13 @@ describeE2E('Phase 9B REQUIRED-6: Principal Identity Foundation against real Pos
 
   test('v124 -> v125 migration re-evaluation: rolling config.version back to 124 and re-running initSchema() is a clean, idempotent upgrade', async () => {
     await sql.unsafe(`
+      -- Phase 9C addition (bd dashboard-k26fo, PHASE9B-MIGRATION-AND-ROLLBACK.md
+      -- §4-1 v5 addendum): audit_events.principal_id FKs to principals without
+      -- CASCADE, so it (and the 2 compat views over it) must be stripped first
+      -- or the DROP TABLE principals below fails with 2BP01.
+      DROP VIEW IF EXISTS audit_events_attribution_gaps;
+      DROP VIEW IF EXISTS audit_events_compat;
+      DROP TABLE IF EXISTS audit_events;
       DROP INDEX IF EXISTS idx_oauth_clients_principal_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;
       DROP TABLE IF EXISTS principals;
@@ -241,6 +248,23 @@ describeE2E('Phase 9B REQUIRED-6: Principal Identity Foundation against real Pos
 
     const preVersion = await sql`SELECT value FROM config WHERE key = 'version'`;
     expect(Number(preVersion[0].value)).toBeGreaterThanOrEqual(125);
+
+    // Phase 9C rollback first (bd dashboard-k26fo, PHASE9B-MIGRATION-AND-
+    // ROLLBACK.md §4-1 v5 addendum): config.version is >= 126 here (this
+    // suite's beforeAll runs initSchema() through v128), so 4-2's verbatim
+    // DROP TABLE principals below would fail with 2BP01 unless the newer
+    // layer that FKs to it (audit_events, PHASE9C-MIGRATION-AND-
+    // COMPATIBILITY-PLAN.md §6-2) is rolled back first — exactly the
+    // documented precondition, not a change to what 4-2 itself does.
+    await sql.begin(async (tx: typeof sql) => {
+      await tx.unsafe('DROP VIEW IF EXISTS audit_events_attribution_gaps');
+      await tx.unsafe('DROP VIEW IF EXISTS audit_events_compat');
+      await tx.unsafe('DROP TABLE IF EXISTS audit_events');
+      await tx.unsafe('DROP TABLE IF EXISTS audit_attribution_states');
+      await tx.unsafe('DROP TABLE IF EXISTS audit_channels');
+      await tx.unsafe('DROP TABLE IF EXISTS audit_event_kinds');
+      await tx.unsafe("UPDATE config SET value = '125' WHERE key = 'version'");
+    });
 
     // Verbatim rollback SQL from PHASE9B-MIGRATION-AND-ROLLBACK.md section 4-2.
     // postgres.js refuses a raw multi-statement BEGIN/COMMIT string over a
@@ -348,6 +372,12 @@ describeE2E('Phase 9B REQUIRED-6/REQUIRED-2: fresh vs. migrated schema parity on
     // roll config.version back to 124), then re-run initSchema() — the real
     // upgrade path (bootstrap + schema replay + migrations together). ---
     await sql.unsafe(`
+      -- Phase 9C addition (bd dashboard-k26fo, PHASE9B-MIGRATION-AND-ROLLBACK.md
+      -- §4-1 v5 addendum): strip the audit_events layer (FKs to principals,
+      -- no CASCADE) before dropping principals, same as the other test above.
+      DROP VIEW IF EXISTS audit_events_attribution_gaps;
+      DROP VIEW IF EXISTS audit_events_compat;
+      DROP TABLE IF EXISTS audit_events;
       DROP INDEX IF EXISTS idx_oauth_clients_principal_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;
       DROP TABLE IF EXISTS principals;

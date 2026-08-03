@@ -5728,6 +5728,392 @@ export const MIGRATIONS: Migration[] = [
       process.stderr.write(`  v125: principal_kinds + principals tables added; oauth_clients.principal_id (nullable) added — foundation only, not used in authorization\n`);
     },
   },
+  {
+    version: 126,
+    name: 'audit_event_foundation',
+    // Phase 9C (Universal Audit Event Integration). Design reference
+    // (priority order): PHASE9C-AUDIT-EVENT-DOMAIN-MODEL.md,
+    // PHASE9C-MIGRATION-AND-COMPATIBILITY-PLAN.md, PHASE9C-IMPLEMENTATION-SCOPE.md.
+    //
+    // Fully additive: three open-world registry tables (Phase 9B's
+    // principal_kinds pattern) + one new table (audit_events). mcp_request_log
+    // is not touched (frozen legacy table, PHASE9C-MIGRATION-AND-COMPATIBILITY-
+    // PLAN.md §1-2). All new objects sit after the principals block in
+    // schema.sql, so no new applyForwardReferenceBootstrap entry is needed
+    // (same reasoning as v125's own bootstrap, which this migration does not
+    // repeat because it introduces no forward reference of its own).
+    //
+    // RLS: v37 (takes_and_synthesis_evidence) pattern, not v24's — `sql`
+    // carries the full DDL + Postgres RLS DO-block, `sqlFor.pglite` repeats
+    // the same DDL minus the DO-block (no `sqlFor.postgres` key, so Postgres
+    // falls through to `sql`). Mixing the two patterns wedges PGLite brains
+    // on `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` (issue #395).
+    sql: `
+      CREATE TABLE IF NOT EXISTS audit_event_kinds (
+        id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+      );
+      INSERT INTO audit_event_kinds (id, label, description) VALUES
+        ('operation.request','Operation Request','An actor requested an operation.'),
+        ('authorization.decision','Authorization Decision','An authorization verdict was reached.'),
+        ('credential.issue','Credential Issued','A credential was minted.'),
+        ('credential.revoke','Credential Revoked','A credential was invalidated.'),
+        ('credential.verify','Credential Verified','A presented credential was verified or rejected. Seeded for future use; not emitted by Phase 9C (verifyAccessToken() is not instrumented, non-goal #20).'),
+        ('client.register','Client Registered','A client record was created.'),
+        ('client.update','Client Updated','A client record was modified.'),
+        ('client.revoke','Client Revoked','A client record was revoked.'),
+        ('session.establish','Session Established','An administrative session was established.'),
+        ('session.terminate','Session Terminated','Sessions were terminated.'),
+        ('delegation.grant','Delegation Granted','Authority was delegated to an execution instance.'),
+        ('delegation.deny','Delegation Denied','A delegation attempt was refused.'),
+        ('message.verify','Message Verified','Message authenticity was verified without subject authentication.'),
+        ('ingest.accept','Ingest Accepted','Content was accepted for ingestion.'),
+        ('ingest.reject','Ingest Rejected','Content was refused at ingestion.')
+        ON CONFLICT (id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS audit_channels (
+        id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+      );
+      INSERT INTO audit_channels (id, label, description) VALUES
+        ('mcp_http','MCP over HTTP','Remote MCP JSON-RPC endpoint.'),
+        ('oauth_endpoint','OAuth Endpoint','Authorization/token/revocation endpoints.'),
+        ('admin_http','Admin Console HTTP','Administrative console API.'),
+        ('webhook','Inbound Webhook','Signature-verified inbound webhook.'),
+        ('ingest_http','Ingest HTTP','Direct content ingestion endpoint.'),
+        ('local_process','Local Process','In-process or local CLI invocation.'),
+        ('internal','Internal','Emitted by gbrain itself with no external actor.'),
+        ('mcp_stdio','MCP over stdio','MCP over stdio; a local pipe, in-process call that is nonetheless treated as remote:true. No per-token authentication concept exists for this channel.')
+        ON CONFLICT (id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS audit_attribution_states (
+        id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+      );
+      INSERT INTO audit_attribution_states (id, label, description) VALUES
+        ('principal_attributed','Principal Attributed','Client verified and oauth_clients.principal_id is set. The only state where principal_id is non-null.'),
+        ('client_only','Client Only','Client verified but oauth_clients.principal_id is null, a valid and permanent state (AUTHZ-INV-003/004), not degraded.'),
+        ('legacy_credential','Legacy Credential','Legacy access_tokens path, a different ID space from oauth_clients; structurally unattributable.'),
+        ('admin_session','Admin Session','Bootstrap-token or magic-link admin console session. No client_id/principal_id concept exists on this plane.'),
+        ('message_authenticated','Message Authenticated','Message authenticity verified without subject authentication (e.g. GitHub webhook HMAC). Attribution is to source_id.'),
+        ('unauthenticated','Unauthenticated','No credential was presented before reaching the handler (pre-auth rejection).'),
+        ('authentication_failed','Authentication Failed','A credential was presented but rejected (signature mismatch, revoked, expired). Deliberately distinct from unauthenticated.'),
+        ('system_internal','System Internal','Emitted by gbrain itself with no external actor (scheduled worker, self-fix, retention job).'),
+        ('local_process','Local Process','ctx.remote === false local invocation. Not instrumented in Phase 9C; seeded so future instrumentation needs no schema change.'),
+        ('unmigrated_legacy_record','Unmigrated Legacy Record','Pre-Phase-9C record whose attribution is structurally unrecoverable. Never written to audit_events; used only by audit_events_compat''s projection of legacy mcp_request_log rows.'),
+        ('attribution_unavailable','Attribution Unavailable','An event kind that should carry attribution was missing it at write time. A defect signal, not a normal state; doctor warns on non-zero occurrences.')
+        ON CONFLICT (id) DO NOTHING;
+
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        envelope_version  SMALLINT     NOT NULL DEFAULT 1,
+        occurred_at       TIMESTAMPTZ  NOT NULL,
+        recorded_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        event_kind        TEXT         NOT NULL REFERENCES audit_event_kinds(id),
+        channel_id        TEXT         NOT NULL REFERENCES audit_channels(id),
+        attribution_state TEXT         NOT NULL REFERENCES audit_attribution_states(id),
+        principal_id      UUID         REFERENCES principals(id) ON DELETE RESTRICT,
+        client_id         TEXT,
+        actor_label       TEXT,
+        credential_ref    TEXT,
+        operation         TEXT         NOT NULL,
+        required_scope    TEXT,
+        scopes_snapshot   TEXT[],
+        decision          TEXT         NOT NULL DEFAULT 'not_applicable'
+                            CHECK (decision IN ('allowed','denied','not_applicable')),
+        outcome           TEXT         NOT NULL
+                            CHECK (outcome IN ('succeeded','failed','rejected','pending')),
+        reason_code       TEXT,
+        resource_kind     TEXT,
+        resource_ref      TEXT,
+        source_id         TEXT,
+        job_id            INTEGER,
+        correlation_id    TEXT         NOT NULL,
+        parent_event_id   UUID,
+        latency_ms        INTEGER,
+        error_message     TEXT,
+        params_summary    JSONB,
+        adapter           JSONB        NOT NULL DEFAULT '{}',
+        CONSTRAINT chk_audit_attribution
+          CHECK ((attribution_state = 'principal_attributed') = (principal_id IS NOT NULL))
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audit_events_occurred
+        ON audit_events (occurred_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_principal
+        ON audit_events (principal_id, occurred_at DESC) WHERE principal_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_audit_events_client
+        ON audit_events (client_id, occurred_at DESC) WHERE client_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_audit_events_correlation
+        ON audit_events (correlation_id);
+      CREATE INDEX IF NOT EXISTS idx_audit_events_job
+        ON audit_events (job_id) WHERE job_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_audit_events_denied
+        ON audit_events (occurred_at DESC) WHERE decision = 'denied';
+      CREATE INDEX IF NOT EXISTS idx_audit_events_channel
+        ON audit_events (channel_id, occurred_at DESC);
+
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
+        IF has_bypass THEN
+          ALTER TABLE audit_event_kinds        ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE audit_channels            ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE audit_attribution_states  ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE audit_events              ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+    sqlFor: {
+      pglite: `
+        CREATE TABLE IF NOT EXISTS audit_event_kinds (
+          id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+        );
+        INSERT INTO audit_event_kinds (id, label, description) VALUES
+          ('operation.request','Operation Request','An actor requested an operation.'),
+          ('authorization.decision','Authorization Decision','An authorization verdict was reached.'),
+          ('credential.issue','Credential Issued','A credential was minted.'),
+          ('credential.revoke','Credential Revoked','A credential was invalidated.'),
+          ('credential.verify','Credential Verified','A presented credential was verified or rejected. Seeded for future use; not emitted by Phase 9C (verifyAccessToken() is not instrumented, non-goal #20).'),
+          ('client.register','Client Registered','A client record was created.'),
+          ('client.update','Client Updated','A client record was modified.'),
+          ('client.revoke','Client Revoked','A client record was revoked.'),
+          ('session.establish','Session Established','An administrative session was established.'),
+          ('session.terminate','Session Terminated','Sessions were terminated.'),
+          ('delegation.grant','Delegation Granted','Authority was delegated to an execution instance.'),
+          ('delegation.deny','Delegation Denied','A delegation attempt was refused.'),
+          ('message.verify','Message Verified','Message authenticity was verified without subject authentication.'),
+          ('ingest.accept','Ingest Accepted','Content was accepted for ingestion.'),
+          ('ingest.reject','Ingest Rejected','Content was refused at ingestion.')
+          ON CONFLICT (id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS audit_channels (
+          id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+        );
+        INSERT INTO audit_channels (id, label, description) VALUES
+          ('mcp_http','MCP over HTTP','Remote MCP JSON-RPC endpoint.'),
+          ('oauth_endpoint','OAuth Endpoint','Authorization/token/revocation endpoints.'),
+          ('admin_http','Admin Console HTTP','Administrative console API.'),
+          ('webhook','Inbound Webhook','Signature-verified inbound webhook.'),
+          ('ingest_http','Ingest HTTP','Direct content ingestion endpoint.'),
+          ('local_process','Local Process','In-process or local CLI invocation.'),
+          ('internal','Internal','Emitted by gbrain itself with no external actor.'),
+          ('mcp_stdio','MCP over stdio','MCP over stdio; a local pipe, in-process call that is nonetheless treated as remote:true. No per-token authentication concept exists for this channel.')
+          ON CONFLICT (id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS audit_attribution_states (
+          id TEXT PRIMARY KEY, label TEXT NOT NULL, description TEXT
+        );
+        INSERT INTO audit_attribution_states (id, label, description) VALUES
+          ('principal_attributed','Principal Attributed','Client verified and oauth_clients.principal_id is set. The only state where principal_id is non-null.'),
+          ('client_only','Client Only','Client verified but oauth_clients.principal_id is null, a valid and permanent state (AUTHZ-INV-003/004), not degraded.'),
+          ('legacy_credential','Legacy Credential','Legacy access_tokens path, a different ID space from oauth_clients; structurally unattributable.'),
+          ('admin_session','Admin Session','Bootstrap-token or magic-link admin console session. No client_id/principal_id concept exists on this plane.'),
+          ('message_authenticated','Message Authenticated','Message authenticity verified without subject authentication (e.g. GitHub webhook HMAC). Attribution is to source_id.'),
+          ('unauthenticated','Unauthenticated','No credential was presented before reaching the handler (pre-auth rejection).'),
+          ('authentication_failed','Authentication Failed','A credential was presented but rejected (signature mismatch, revoked, expired). Deliberately distinct from unauthenticated.'),
+          ('system_internal','System Internal','Emitted by gbrain itself with no external actor (scheduled worker, self-fix, retention job).'),
+          ('local_process','Local Process','ctx.remote === false local invocation. Not instrumented in Phase 9C; seeded so future instrumentation needs no schema change.'),
+          ('unmigrated_legacy_record','Unmigrated Legacy Record','Pre-Phase-9C record whose attribution is structurally unrecoverable. Never written to audit_events; used only by audit_events_compat''s projection of legacy mcp_request_log rows.'),
+          ('attribution_unavailable','Attribution Unavailable','An event kind that should carry attribution was missing it at write time. A defect signal, not a normal state; doctor warns on non-zero occurrences.')
+          ON CONFLICT (id) DO NOTHING;
+
+        CREATE TABLE IF NOT EXISTS audit_events (
+          id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          envelope_version  SMALLINT     NOT NULL DEFAULT 1,
+          occurred_at       TIMESTAMPTZ  NOT NULL,
+          recorded_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+          event_kind        TEXT         NOT NULL REFERENCES audit_event_kinds(id),
+          channel_id        TEXT         NOT NULL REFERENCES audit_channels(id),
+          attribution_state TEXT         NOT NULL REFERENCES audit_attribution_states(id),
+          principal_id      UUID         REFERENCES principals(id) ON DELETE RESTRICT,
+          client_id         TEXT,
+          actor_label       TEXT,
+          credential_ref    TEXT,
+          operation         TEXT         NOT NULL,
+          required_scope    TEXT,
+          scopes_snapshot   TEXT[],
+          decision          TEXT         NOT NULL DEFAULT 'not_applicable'
+                              CHECK (decision IN ('allowed','denied','not_applicable')),
+          outcome           TEXT         NOT NULL
+                              CHECK (outcome IN ('succeeded','failed','rejected','pending')),
+          reason_code       TEXT,
+          resource_kind     TEXT,
+          resource_ref      TEXT,
+          source_id         TEXT,
+          job_id            INTEGER,
+          correlation_id    TEXT         NOT NULL,
+          parent_event_id   UUID,
+          latency_ms        INTEGER,
+          error_message     TEXT,
+          params_summary    JSONB,
+          adapter           JSONB        NOT NULL DEFAULT '{}',
+          CONSTRAINT chk_audit_attribution
+            CHECK ((attribution_state = 'principal_attributed') = (principal_id IS NOT NULL))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_audit_events_occurred
+          ON audit_events (occurred_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_principal
+          ON audit_events (principal_id, occurred_at DESC) WHERE principal_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_audit_events_client
+          ON audit_events (client_id, occurred_at DESC) WHERE client_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_audit_events_correlation
+          ON audit_events (correlation_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_events_job
+          ON audit_events (job_id) WHERE job_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_audit_events_denied
+          ON audit_events (occurred_at DESC) WHERE decision = 'denied';
+        CREATE INDEX IF NOT EXISTS idx_audit_events_channel
+          ON audit_events (channel_id, occurred_at DESC);
+      `,
+    },
+    idempotent: true,
+    handler: async () => {
+      process.stderr.write(`  v126: audit_event_kinds/audit_channels/audit_attribution_states registries + audit_events table (27 cols, 7 indexes) added — foundation only, no writer wired up yet\n`);
+    },
+  },
+  {
+    version: 127,
+    name: 'audit_events_compat_view',
+    // Phase 9C. audit_events_compat unifies the read side (legacy
+    // mcp_request_log rows + new audit_events rows) so existing readers
+    // (/admin/api/requests, agents, stats, health-indicators) can be
+    // repointed without a shape change. audit_events_attribution_gaps is a
+    // read-only diagnostic aid for operators deciding which client_only /
+    // legacy_credential rows to manually attribute to a principal — it never
+    // writes back (PHASE9C-MIGRATION-AND-COMPATIBILITY-PLAN.md §5-3).
+    //
+    // security_invoker=on on both views: same fix v120
+    // (schema_lint_hardening_search_path_security_invoker) applied to
+    // page_links. Without it, a view over RLS-protected tables is evaluated
+    // with the view owner's privileges (which have BYPASSRLS per
+    // schema.sql:1452), silently handing RLS-restricted roles a read path
+    // around RLS through the view.
+    sql: `
+      CREATE OR REPLACE VIEW audit_events_compat AS
+        SELECT id::text AS id, token_name, agent_name, operation, latency_ms,
+               status, params, error_message, created_at,
+               'unmigrated_legacy_record'::text AS attribution_state
+          FROM mcp_request_log
+        UNION ALL
+        SELECT id::text, COALESCE(client_id, actor_label), actor_label, operation,
+               latency_ms,
+               CASE WHEN outcome = 'succeeded' THEN 'success' ELSE 'error' END,
+               params_summary, error_message, occurred_at, attribution_state
+          FROM audit_events
+         WHERE channel_id IN ('mcp_http', 'ingest_http');
+
+      CREATE OR REPLACE VIEW audit_events_attribution_gaps AS
+        SELECT
+          ae.channel_id                AS channel_id,
+          ae.attribution_state         AS attribution_state,
+          ae.actor_label               AS actor_label,
+          count(*)                     AS event_count,
+          min(ae.occurred_at)          AS oldest_occurred_at,
+          max(ae.occurred_at)          AS newest_occurred_at,
+          oc.client_id                 AS inferred_client_id,
+          oc.client_name               AS inferred_client_name
+        FROM audit_events ae
+        LEFT JOIN oauth_clients oc ON oc.client_id = ae.client_id
+        WHERE ae.attribution_state != 'principal_attributed'
+        GROUP BY ae.channel_id, ae.attribution_state, ae.actor_label, oc.client_id, oc.client_name
+
+        UNION ALL
+
+        SELECT
+          'legacy'::text                AS channel_id,
+          'unmigrated_legacy_record'::text AS attribution_state,
+          COALESCE(token_name, agent_name) AS actor_label,
+          count(*)                      AS event_count,
+          min(created_at)               AS oldest_occurred_at,
+          max(created_at)               AS newest_occurred_at,
+          NULL::text                    AS inferred_client_id,
+          NULL::text                    AS inferred_client_name
+        FROM mcp_request_log
+        GROUP BY COALESCE(token_name, agent_name);
+
+      ALTER VIEW IF EXISTS audit_events_compat SET (security_invoker = on);
+      ALTER VIEW IF EXISTS audit_events_attribution_gaps SET (security_invoker = on);
+    `,
+    sqlFor: {
+      pglite: `
+        CREATE OR REPLACE VIEW audit_events_compat AS
+          SELECT id::text AS id, token_name, agent_name, operation, latency_ms,
+                 status, params, error_message, created_at,
+                 'unmigrated_legacy_record'::text AS attribution_state
+            FROM mcp_request_log
+          UNION ALL
+          SELECT id::text, COALESCE(client_id, actor_label), actor_label, operation,
+                 latency_ms,
+                 CASE WHEN outcome = 'succeeded' THEN 'success' ELSE 'error' END,
+                 params_summary, error_message, occurred_at, attribution_state
+            FROM audit_events
+           WHERE channel_id IN ('mcp_http', 'ingest_http');
+
+        CREATE OR REPLACE VIEW audit_events_attribution_gaps AS
+          SELECT
+            ae.channel_id                AS channel_id,
+            ae.attribution_state         AS attribution_state,
+            ae.actor_label               AS actor_label,
+            count(*)                     AS event_count,
+            min(ae.occurred_at)          AS oldest_occurred_at,
+            max(ae.occurred_at)          AS newest_occurred_at,
+            oc.client_id                 AS inferred_client_id,
+            oc.client_name               AS inferred_client_name
+          FROM audit_events ae
+          LEFT JOIN oauth_clients oc ON oc.client_id = ae.client_id
+          WHERE ae.attribution_state != 'principal_attributed'
+          GROUP BY ae.channel_id, ae.attribution_state, ae.actor_label, oc.client_id, oc.client_name
+
+          UNION ALL
+
+          SELECT
+            'legacy'::text                AS channel_id,
+            'unmigrated_legacy_record'::text AS attribution_state,
+            COALESCE(token_name, agent_name) AS actor_label,
+            count(*)                      AS event_count,
+            min(created_at)               AS oldest_occurred_at,
+            max(created_at)               AS newest_occurred_at,
+            NULL::text                    AS inferred_client_id,
+            NULL::text                    AS inferred_client_name
+          FROM mcp_request_log
+          GROUP BY COALESCE(token_name, agent_name);
+      `,
+    },
+    idempotent: true,
+    handler: async () => {
+      process.stderr.write(`  v127: audit_events_compat + audit_events_attribution_gaps views added (security_invoker=on, Postgres only)\n`);
+    },
+  },
+  {
+    version: 128,
+    name: 'rls_principal_tables',
+    // Phase 9C. Resolves dashboard-m1ja3: principals/principal_kinds were
+    // added in v125 but never enrolled in the fresh-install RLS DO-block
+    // (schema.sql's static ALTER TABLE list, v24-era). audit_events (v126)
+    // JOINs to principals, so leaving this open exposes an RLS-unprotected
+    // table through the new audit path. v37 pattern, not v24's (see v126's
+    // header comment for why the two differ and why it matters).
+    sql: `
+      DO $$
+      DECLARE
+        has_bypass BOOLEAN;
+      BEGIN
+        SELECT EXISTS (SELECT 1 FROM pg_roles pr WHERE pg_has_role(current_user, pr.oid, 'USAGE') AND (pr.rolbypassrls OR pr.rolsuper)) INTO has_bypass;
+        IF has_bypass THEN
+          ALTER TABLE principals       ENABLE ROW LEVEL SECURITY;
+          ALTER TABLE principal_kinds  ENABLE ROW LEVEL SECURITY;
+        END IF;
+      END $$;
+    `,
+    sqlFor: {
+      pglite: '',
+    },
+    idempotent: true,
+    handler: async () => {
+      process.stderr.write(`  v128: RLS enabled on principals/principal_kinds (dashboard-m1ja3 resolved, Postgres only)\n`);
+    },
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

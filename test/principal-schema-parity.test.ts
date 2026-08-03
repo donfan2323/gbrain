@@ -127,7 +127,18 @@ describe('Phase 9B: fresh vs. migrated schema parity (Principal objects)', () =>
     // .query() is single-statement, like pg.query(); .exec() is the
     // documented multi-statement runner used elsewhere in this codebase
     // for schema replay).
+    //
+    // Phase 9C (v126) added audit_events.principal_id, an FK to principals,
+    // so principals can no longer be dropped while audit_events (and the
+    // v127 views selecting from it) still exist — a genuine pre-v125 brain
+    // wouldn't have v126-v128's objects either, so strip those first too.
     await (migrated as any).db.exec(`
+      DROP VIEW IF EXISTS audit_events_attribution_gaps;
+      DROP VIEW IF EXISTS audit_events_compat;
+      DROP TABLE IF EXISTS audit_events;
+      DROP TABLE IF EXISTS audit_attribution_states;
+      DROP TABLE IF EXISTS audit_channels;
+      DROP TABLE IF EXISTS audit_event_kinds;
       DROP INDEX IF EXISTS idx_oauth_clients_principal_id;
       ALTER TABLE oauth_clients DROP COLUMN IF EXISTS principal_id;
       DROP TABLE IF EXISTS principals;

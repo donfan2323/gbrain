@@ -61,6 +61,30 @@ UPDATE config SET value = '124' WHERE key = 'version';
 COMMIT;
 `;
 
+/**
+ * Phase 9C (migrate.ts v126-v128) added audit_events.principal_id, an FK
+ * to principals — this test's engine runs initSchema() to LATEST_VERSION
+ * (currently 128), so DOCUMENTED_ROLLBACK_SQL's `DROP TABLE principals`
+ * now fails with 2BP01 unless Phase 9C's own objects are rolled back
+ * first (PHASE9B-MIGRATION-AND-ROLLBACK.md §4-1 v5 addendum;
+ * PHASE9C-MIGRATION-AND-COMPATIBILITY-PLAN.md §6-2 for the source SQL).
+ * This mirrors what a real operator must do: newest layer first.
+ */
+const PHASE9C_ROLLBACK_SQL = `
+BEGIN;
+
+DROP VIEW IF EXISTS audit_events_attribution_gaps;
+DROP VIEW IF EXISTS audit_events_compat;
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS audit_attribution_states;
+DROP TABLE IF EXISTS audit_channels;
+DROP TABLE IF EXISTS audit_event_kinds;
+
+UPDATE config SET value = '125' WHERE key = 'version';
+
+COMMIT;
+`;
+
 describe('REQUIRED-7: the documented manual rollback procedure, executed for real on PGLite', () => {
   let engine: PGLiteEngine;
   let sql: ReturnType<typeof makeSqlTag>;
@@ -152,7 +176,14 @@ describe('REQUIRED-7: the documented manual rollback procedure, executed for rea
   });
 
   test('executing the documented 4-2 rollback SQL verbatim reverts config.version to 124 and removes every Phase 9B object', async () => {
-    expect(await schemaVersion()).toBeGreaterThanOrEqual(125);
+    expect(await schemaVersion()).toBeGreaterThanOrEqual(126);
+    expect(await tableExists('audit_events')).toBe(true);
+
+    // Phase 9C first (newest layer), per the v5 addendum — then Phase 9B's
+    // documented SQL verbatim, unmodified from what operators are told to run.
+    await engine.db.exec(PHASE9C_ROLLBACK_SQL);
+    expect(await tableExists('audit_events')).toBe(false);
+    expect(await tableExists('audit_event_kinds')).toBe(false);
 
     // Multi-statement block (BEGIN/…/COMMIT) — needs .exec(), which is
     // PGLite's documented multi-statement runner (.query() is single-statement).

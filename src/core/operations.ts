@@ -334,6 +334,19 @@ export interface AuthInfo {
    * (AUTHZ-INV-001) — see `principalId` above.
    */
   principalKind?: string;
+  /**
+   * Phase 9C (Universal Audit Event Integration): which storage/verification
+   * path this AuthInfo was resolved from. Attribution/audit metadata only —
+   * NOT used in any authorization decision (same posture as principalId/
+   * principalKind above). Needed because the legacy `access_tokens` path and
+   * the `oauth_clients` path with no Principal attribution both leave
+   * `principalId` undefined and are otherwise indistinguishable on this
+   * interface, yet the audit domain model requires callers to tell
+   * `attribution_state='legacy_credential'` apart from `'client_only'`
+   * (PHASE9C-AUDIT-EVENT-DOMAIN-MODEL.md §3, states 2 and 3 — "2と絶対に
+   * 畳み込まない").
+   */
+  credentialSource?: 'oauth_client' | 'legacy_access_token';
 }
 
 export interface OperationContext {
@@ -3081,15 +3094,95 @@ const submit_agent: Operation = {
     // Remote-callable but only when the OAuth client has scope=agent AND
     // a binding row. Local CLI callers (ctx.remote === false) skip the
     // binding check — `gbrain agent run` already runs through subagent.ts
-    // directly without going through this op.
+    // directly without going through this op. Not audited (Phase 9C non-
+    // goal: local CLI general operations) — this is CLI usage guidance,
+    // not a delegation attempt.
     if (ctx.remote === false) {
       throw new OperationError('invalid_request', 'submit_agent over the local CLI: use `gbrain agent run` instead.');
     }
 
+    // Phase 9C (delegation-chain audit, AUTHZ-INV-009): the only two ways
+    // to reach this handler with ctx.remote === true are HTTP MCP (where
+    // requireBearerAuth already populated ctx.auth.clientId before
+    // dispatch) and MCP over stdio (which has no per-token credential
+    // concept at all — ctx.auth.clientId is structurally always absent
+    // there). So !clientId reliably means stdio, never an
+    // authenticated-but-somehow-clientId-less HTTP call.
+    const { randomUUID } = await import('node:crypto');
+    const { writeAuditEvent } = await import('./audit/audit-events-writer.ts');
+    const correlationId = randomUUID();
+    const occurredAt = new Date().toISOString();
+    const startedAt = Date.now();
+
     const clientId = (ctx as { auth?: { clientId?: string } }).auth?.clientId;
+    const channelId = clientId ? 'mcp_http' : 'mcp_stdio';
     if (!clientId || typeof clientId !== 'string') {
+      await writeAuditEvent(ctx.engine, {
+        occurred_at: occurredAt,
+        envelope_version: 1,
+        event_kind: 'delegation.deny',
+        channel_id: channelId,
+        attribution_state: 'unauthenticated',
+        principal_id: null,
+        client_id: null,
+        actor_label: null,
+        credential_ref: null,
+        operation: 'submit_agent',
+        required_scope: 'agent',
+        scopes_snapshot: null,
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: 'no_credential',
+        resource_kind: null,
+        resource_ref: null,
+        source_id: null,
+        job_id: null,
+        correlation_id: correlationId,
+        parent_event_id: null,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: 'submit_agent requires an OAuth client with the `agent` scope.',
+        params_summary: null,
+        adapter: { jsonrpc_method: 'tools/call', tool: 'submit_agent' },
+      }, { class: 'class2_denial' });
       throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
     }
+
+    const auth = ctx.auth as { principalId?: string; credentialSource?: string; scopes?: string[] } | undefined;
+    const delegationAttributionState = auth?.credentialSource === 'legacy_access_token'
+      ? 'legacy_credential' as const
+      : auth?.principalId ? 'principal_attributed' as const : 'client_only' as const;
+    const delegationPrincipalId = auth?.principalId ?? null;
+    const delegationAuditBase = {
+      envelope_version: 1,
+      channel_id: channelId,
+      attribution_state: delegationAttributionState,
+      principal_id: delegationPrincipalId,
+      client_id: clientId,
+      actor_label: clientId,
+      credential_ref: null,
+      operation: 'submit_agent',
+      required_scope: 'agent',
+      scopes_snapshot: auth?.scopes ?? null,
+      resource_kind: 'oauth_client',
+      resource_ref: clientId,
+      source_id: null,
+      correlation_id: correlationId,
+      parent_event_id: null,
+      params_summary: null,
+      adapter: { jsonrpc_method: 'tools/call', tool: 'submit_agent' },
+    };
+    const auditDeny = (reasonCode: string, errorMessage: string, jobId: number | null = null) =>
+      writeAuditEvent(ctx.engine, {
+        ...delegationAuditBase,
+        occurred_at: occurredAt,
+        event_kind: 'delegation.deny',
+        decision: 'denied',
+        outcome: 'rejected',
+        reason_code: reasonCode,
+        job_id: jobId,
+        latency_ms: Date.now() - startedAt,
+        errorMessageRaw: errorMessage,
+      }, { class: 'class2_denial' });
 
     // Load the binding row.
     const { sqlQueryForEngine } = await import('./sql-query.ts');
@@ -3103,13 +3196,14 @@ const submit_agent: Operation = {
          WHERE client_id = ${clientId}
       `;
     } catch (err) {
-      throw new OperationError(
-        'internal',
-        `submit_agent: could not load OAuth client binding: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const msg = `submit_agent: could not load OAuth client binding: ${err instanceof Error ? err.message : String(err)}`;
+      await auditDeny('binding_lookup_failed', msg);
+      throw new OperationError('internal', msg);
     }
     if (bindingRows.length === 0) {
-      throw new OperationError('permission_denied', `submit_agent: client_id ${clientId} not found.`);
+      const msg = `submit_agent: client_id ${clientId} not found.`;
+      await auditDeny('client_not_found', msg);
+      throw new OperationError('permission_denied', msg);
     }
     const binding = bindingRows[0];
     const boundTools = (binding.bound_tools as string[] | null) ?? null;

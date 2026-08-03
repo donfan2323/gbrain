@@ -2,6 +2,12 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [Unreleased]
+
+### Testing
+
+- **`test/authorization-invariant-matrix.test.ts`: fixed a `check-test-isolation.sh` R3 violation introduced by the Phase 9C audit-instrumentation tests above (dashboard-etlg2).** A `PGLiteEngine` instance deliberately left unconnected (used only to force `writeAuditEvent`'s fail-open path) was constructed more than 50 lines past the file's `beforeAll`, tripping the lint's proximity heuristic. Moved construction into a small `describe`-scoped `beforeAll`; the engine is still never connected and never shared with the file's other fixtures. No test assertion, expected value, or AUTHZ invariant changed — verified via a Red/Green pair against the lint script plus 5 repeated full-file runs (58/58 passing each time) and typecheck.
+
 ## [0.42.64.0] - 2026-07-20
 
 ### Fixed
