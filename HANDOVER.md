@@ -177,7 +177,15 @@ PHASE9x-DELIVERABLES-vN/
 2. 上記確認後、Beads `dashboard-vyyod`を`CLOSED`へ更新すること(承認前にCLOSEDにしてはならない — v6ラウンドで一度誤ってCLOSEDにし外部監査から指摘された前例あり) → **達成(本更新でCLOSED)**
 3. `PHASE9C-PREREQUISITES.md`の内容(Principal状態が認可に影響しない不変条件の維持・FK方針・レガシー認証経路の帰属不能性の扱い)を再読し、Phase 9C設計の出発点とすること → **Stage 1調査着手時点で参照済み**
 
-> Phase 9D以降へ進む前の開始条件は、Phase 9C完了時点でこのパターンに倣い本セクションを上書きすること。
+## 5-2. 次Phase開始条件(Phase 9C→9D、達成済み・記録として保持)
+
+**Phase 9Dへ進む前に、以下が全て満たされている必要があった**:
+
+1. Review Bundle(v2、REQUIRED-A/B修正版)の外部監査結果が承認済みであること(ユーザーの明示宣言によってのみ更新される値) → **達成(2026-08-03、ユーザーからPhase 9D進行指示を受領。外部監査の生トランスクリプトは本リポジトリに含まれない)**
+2. 上記確認後、Beads `dashboard-zz21x`を`CLOSED`へ更新すること → **達成(本更新でCLOSED)**
+3. Phase 9Dの内容(`PHASE9A-GAP-AND-ROADMAP.md`§7の「adminSessionsをCredential/Session概念に統合する設計、または明示的な別レーンとして正式に位置づけるかの判断」)を、より詳細な`PHASE9A-TARGET-DOMAIN-MODEL.md`§4・`PHASE9A-AUTHORIZATION-INVARIANTS.md`のAUTHZ-INV-010定義に照らして再確認すること → **達成(Phase 9D着手時に確認。ストレージ統合は不要と既に確定済み、実施すべきは`AUTHZ-INV-010`是正のみと判明)**
+
+> Phase 9E以降へ進む前の開始条件は、Phase 9D完了時点でこのパターンに倣い本セクションを上書きすること。
 
 ---
 
@@ -185,7 +193,9 @@ PHASE9x-DELIVERABLES-vN/
 
 **Phase 9B親タスク**: `dashboard-vyyod`(Phase 9B: Universal Identity Foundation - Principal基盤実装) — **CLOSED**(2026-08-02、外部レビュー承認取得により正式クローズ)。
 
-**Phase 9C親タスク**: `dashboard-zz21x`(Phase 9C: Universal Audit Event Integration (gbrain)) — **IN_PROGRESS**(2026-08-02作成・claim済み、Stage 1調査着手)。外部レビュー承認取得までCLOSEDにしない。
+**Phase 9C親タスク**: `dashboard-zz21x`(Phase 9C: Universal Audit Event Integration (gbrain)) — **CLOSED**(2026-08-03、外部レビュー承認取得により正式クローズ。Review Bundle v1→v2→v2再修正(REQUIRED-A/B)の3ラウンドを経て承認)。
+
+**Phase 9D親タスク**: `dashboard-rn8t2`(Phase 9D: Policy Decision層の一本化(管理画面requireAdmin/adminSessionsの統合設計)) — **完了・報告済み**(2026-08-03作成・claim済み。`AUTHZ-INV-010`是正を実施、詳細は`PHASE9A-GAP-AND-ROADMAP.md`§7のPhase 9D欄参照)。
 
 **非ブロッキング申し送り事項(11件、全てOPEN)**:
 
@@ -209,9 +219,10 @@ PHASE9x-DELIVERABLES-vN/
 
 ## 7. git情報
 
-- **HEAD**: `6906ab9982017133244a18cb72f4a9098d76108d`(branch: `master`)
-- **Working Tree状態**: 未コミット変更34件(`M`14 + `??`20、うち`HANDOVER.md`自身も`??`の1件に含まれる)。**実リポジトリへは一切コミットしていない**(ユーザーの明示承認・外部レビュー正式承認まで意図的に見送っている方針)
-- 変更ファイルの完全な内訳は`git status --short`で確認、または`PHASE9B-IMPLEMENTATION-REPORT.md`§5(変更ファイル一覧)を参照
+- **HEAD**: `fcdb7c47d34696a1cb23fb79e878978dc0c23186`(branch: `master`)。Phase 9B実装34ファイルを単一コミット`feat(identity): Phase 9B Universal Identity Foundation - Principal基盤実装`として2026-08-02にコミット済み(外部レビュー承認後、Phase 9C Stage2完了時点でユーザー承認により実施)
+- **Working Tree状態**: Phase 9C(Universal Audit Event Integration)実装により未コミット変更41件(`M`19 + `??`22)。Stage1〜7完了・REQUIRED=0達成済み(`PHASE9C-REVIEW-MANIFEST.md`参照)。**実リポジトリへは一切コミットしていない**(ユーザーの明示承認・外部レビュー正式承認まで意図的に見送っている、Phase 9Bと同じ運用方針)
+- 直前HEAD(Phase 9B確定時点): `fcdb7c47d34696a1cb23fb79e878978dc0c23186`
+- 変更ファイルの完全な内訳は`git status --short`で確認、または`PHASE9C-IMPLEMENTATION-REPORT.md`§5(変更ファイル一覧)を参照
 - 検証専用コミット(`e7236677fd7747fca8dafb6289a450078dc061e2`)は完全に別の一時worktreeにのみ存在し、実masterには一切影響しない
 
 ---
