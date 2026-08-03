@@ -1,7 +1,9 @@
-# Phase 9A — 認可不変条件(AUTHZ-INV-001〜015)
+# Phase 9A — 認可不変条件(AUTHZ-INV-001〜017)
 
-**日付**: 2026-08-01
+**日付**: 2026-08-01(初版) / 2026-08-03(AUTHZ-INV-005改訂・016・017追加 — Phase 9E着手前設計決議、Opus単独レビュー→ユーザー承認)
 **位置づけ**: Phase 9B以降の実装が守るべき不変条件を、テスト可能な形で明文化する。各条件は`PHASE9A-CURRENT-STATE-AUDIT.md`・`PHASE9A-SUPPLEMENTAL-AUDIT.md`で確認した実コードの事実、および`PHASE9A-IDENTITY-MODEL-DECISION.md`で確定した概念モデルを根拠とする。本書自体は実装ではなく、実装が満たすべき条件の定義である。
+
+> **2026-08-03改訂の要点**: Beads `dashboard-5krlu`(narrowing fail-open修正)の調査過程で、AUTHZ-INV-005が「Capability」の外延を定義していないこと、および委任開始権(`agent` scope)と委任対象能力の保有が現状分離されていないことが判明した。Opus単独レビュー2回(設計・優先度判定→正式決議案)を経て、AUTHZ-INV-005を改訂し、AUTHZ-INV-016・017を新設した。詳細な決議根拠は`PHASE9E-DELEGATION-DOMAIN-MODEL.md`を参照。
 
 ---
 
@@ -40,11 +42,15 @@
 
 ## AUTHZ-INV-005: 委任先の権限は委任元の有効権限の部分集合を超えない
 
-- **規則**: DelegationによってExecution Instanceへ渡されるCapabilityは、委任元Principal/Clientが現に保持する有効権限の部分集合でなければならない。
-- **理由**: `submit_agent`の既存実装(`operations.ts:3100-3119`)が既にこれを実践している(`bound_tools`/`bound_slug_prefixes`のサブセット検証)。この健全な性質を今後の委任汎用化(Phase 9E)でも失わないための固定。
-- **違反例**: 委任先ジョブが、委任元Clientの`bound_tools`に含まれないツールを呼び出せる実装。
-- **検証方法**: 委任リクエストで委任元の権限集合を超える`allowed_tools`/`allowed_slug_prefixes`を要求した場合に`permission_denied`で拒否されることを確認する(既存の`submit_agent`挙動)。
-- **対応テスト候補**: 既存テスト(`submit_agent`のサブセット検証テスト)を維持し、Phase 9E以降の汎用化実装でも同一のテストケースが通ることを回帰確認する。
+- **Capabilityの定義(本条件の適用対象、2026-08-03確定)**: 本書におけるCapabilityとは**(操作集合 × 名前空間)**の組とする。名前空間は`(direction, source_id, slug_prefix_set)`の3つ組であり、`direction ∈ {read, write}`。書き込み名前空間は`bound_source_id`と`bound_slug_prefixes`により、読み取り名前空間は`source_id`/`federated_read`により決まる(読み取り側のslug prefix制限は現状存在せず、`docs/designs/COMMUNITY_IDEAS.md`§6「Read-side prefix/federation enforcement」で既知の上流課題として追跡中)。予算(`budget_usd_per_day`)・並列度(`bound_max_concurrent`)・資格情報有効期限・委任深さは**Capabilityではなく Delegation Constraint** として分離し、本条件(部分集合)ではなくAUTHZ-INV-006/007の**単調性**(親の値より緩くならない)の対象とする。集合の包含と数値の順序を同じ「部分集合」の語で括らない。
+- **規則**: DelegationによってExecution Instanceへ渡されるCapabilityは、委任元Principal/Clientが現に保持する有効なCapabilityの部分集合でなければならない。判定は、操作集合については包含、名前空間についてはdirectionごとの包含(`source_id`の一致またはfederation集合への包含、かつslug prefixのスラッシュ境界を考慮した包含)で行う。Delegation Constraintは部分集合ではなく「親の値より緩くならない」単調性で判定する。
+- **理由**: `submit_agent`の既存実装(`src/core/operations.ts`の`submit_agent`ハンドラ、slug prefix検証は同ファイル`isRequestedSlugPrefixWithinBound`呼び出し箇所)が操作集合(`bound_tools`)と書き込みslug prefix(`bound_slug_prefixes`)についてこれを実践している。この健全な性質を委任汎用化(Phase 9E)でも失わないための固定。
+- **違反例**: 委任先ジョブが、委任元Clientの`bound_tools`に含まれないツールを呼び出せる実装。委任先ジョブが委任元Clientの書き込みsourceと異なるsourceへ書き込める実装。
+- **検証方法**: 委任リクエストで委任元のCapabilityを超える`allowed_tools`/`allowed_slug_prefixes`を要求した場合に`permission_denied`で拒否されることを確認する。加えて、委任先が実際にツールを行使する経路(subagentのツールレジストリ)でも同じ包含判定が効いていることをコードパス追跡で確認する。
+- **対応テスト候補**: 既存テスト(`test/operations-allow-list.test.ts`・`test/submit-agent.test.ts`の`submit_agent`サブセット検証テスト)を維持し、Phase 9E以降の汎用化実装でも同一のテストケースが通ることを回帰確認する。加えて、grant時とexercise時の判定が同一述語を共有していること(`isRequestedSlugPrefixWithinBound`と`matchesSlugAllowList`の整合、`dashboard-5krlu`由来)をproperty-basedで確認する。
+- **既知の未充足(Phase 9E-2で是正予定)**:
+  1. `bound_source_id`が未設定の場合、委任ジョブの実行時sourceは委任元Clientの`source_id`ではなく`'default'`になる(`src/core/minions/tools/brain-allowlist.ts`の`buildOpContext`)。名前空間軸の部分集合性がsourceについて現在成立していない(Beads `dashboard-z7a1o`で追跡)。
+  2. 委任先のツール実行は`authorizeOperation()`/`hasScope()`を経由しない(`src/core/minions/tools/brain-allowlist.ts`の`execute`、`buildOpContext`は`auth`を設定しない)。包含はgrant時のみ検証され、exercise時は`enforceSubagentSlugFence`と`bound_tools`フィルタで代替されている。
 
 ## AUTHZ-INV-006: 各階層で委任は再評価され、委任元の失効は委任先へ伝播する
 
@@ -125,6 +131,36 @@
 - **違反例**: 新しいクライアント「Gemini CLI」対応のために、`operations.ts`に`if (clientName === 'gemini-cli') { ... }`を追加すること(`connect.ts`のような利便ヘルパーへの追記は対象外、認可コア本体への追記が違反)。
 - **検証方法**: 新規クライアント・新規プロトコル対応のPRにおいて、`scope.ts`/`operations.ts`の認可判定部分に差分がないことを確認する。
 - **対応テスト候補**: 新規クライアント登録(既存の登録手順のみ使用)後、追加の認可コア変更なしにそのクライアントが期待通り動作することを確認する統合テスト(Phase 8で既に実施済みの3クライアント登録テストの手法を踏襲)。
+
+## AUTHZ-INV-016: 委任境界の未grantは、暗黙の広い既定へフォールバックしない(2026-08-03新設)
+
+- **規則**: 委任元に特定の名前空間のgrantが存在しない場合(`bound_slug_prefixes`がNULLまたは空、`bound_source_id`が未設定)、委任先はその軸について「制限なし」にも「実装依存の既定名前空間」にもならない。未grantの帰結は、明示的に文書化された単一の値でなければならない。
+- **`allowed_slug_prefixes`の3状態の正式な意味(2026-08-03ユーザー承認・案4)**: `bound_slug_prefixes`について、
+  1. NULLまたは未指定 = 書き込み名前空間が**未grant**
+  2. 明示空配列`[]` = NULLと**意味的に同一**(未grant)。新規登録・新規書き込み時はNULLへ正規化する。既存行の`[]`は読み取り時にNULLとして扱う(`token_endpoint_auth_method`が既に確立している「読み取り寛容・書き込み厳格」パターンと同型)
+  3. 1件以上の配列 = 委任可能な書き込み名前空間の集合(唯一の明示的grant表現)
+
+  **NULLは「制限なし」を意味しない**(`dashboard-5krlu`修正の中核)。既存データに対するmigration/backfillは行わない — 上記の意味は読み取り側の解釈規則であり、既存行の値そのものは変更しない。
+- **理由**: 現状NULLと`[]`は`submit_agent`の拒否`reason_code`のみが異なり(`no_slug_prefix_binding` vs `slug_prefix_not_bound`)、意味論として区別されていない。区別されていない2値を将来別々の意味に割り当てると、既存行の意味が遡って変わる。加えて、OAuthクライアント登録経路のうちDCR・管理画面・`gbrain connect --register`は`bound_*`列を構造的に設定できずNULL固定であるため、NULLを「制限なし」と解釈すると、それらの経路で登録されたクライアントに無制限の委任書き込みを与えることになる。
+- **違反例**: 未grantを「制限なし」と解釈する実装(`dashboard-5krlu`修正前の挙動)。
+- **検証方法**: `bound_slug_prefixes`がNULL・`[]`・非空の3パターン × `allowed_slug_prefixes`を要求した/しなかったの計6通りの結果が、本条件が定める意味と一致することを確認する。
+- **既知の未充足(Phase 9E-2で是正予定)**: 未grant時の委任ジョブは現在`wiki/agents/<jobId>/`というレガシーsandboxへ書き込める(`src/core/operations.ts`の`enforceSubagentSlugFence`)。これは「実装依存の既定名前空間」であり本条件の趣旨に反するが、`submit_agent`以外のsubagent経路(cycle等)と共有された既存挙動であるため、**Phase 9E-1では変更せず**、Phase 9E-2でopt-inのfail-closedモードとして是正する。
+
+## AUTHZ-INV-017: 委任開始の権限と、委任される能力の保有は別々に検証される(2026-08-03新設)
+
+- **規則**: あるClientが委任(`submit_agent`相当)を開始してよいかどうかと、その委任で子へ渡す各能力を委任元自身が保持しているかどうかは、独立に検証する。`agent`スコープは前者(委任開始権)のみを表し、後者(対象能力の保有)を含意しない。子へ渡す操作Xがrequired scope Sを持つなら、委任元は`hasScope(委任元のscopes, S)`を満たさなければならない(2026-08-03ユーザー承認・案B)。
+- **理由**: `src/core/scope.ts`の`IMPLIES`テーブルにより`agent`は他のどのスコープも含意せず、`admin`も`agent`を含意しない。したがって現状`--scopes agent`のみのClientは自分では`put_page`(write)も`query`(read)も呼べないが、`bound_tools`に含まれていれば子ジョブにそれらを実行させられる(`src/core/minions/tools/brain-allowlist.ts`の`execute`、子のツール実行は`authorizeOperation()`を経由しない)。これは委任元が保持しない権限が委任経由で行使されるconfused deputy構造であり、AUTHZ-INV-005の趣旨に反する。
+- **違反例**: `scope='agent'`のみのClientが`allowed_tools: ['put_page']`で委任し、子が書き込みに成功する。
+- **検証方法**: `scope='agent'`のみのClientがwrite系ツールを含む委任を要求した場合の挙動が、下記の段階移行表と一致することを確認する。
+- **段階移行(既存クライアントを即座に壊さないため)**:
+
+  | フェーズ | 挙動 |
+  |---|---|
+  | Phase 9E-1 | **warn-only**。`scope='agent'`のみのClientがrequired scope不足のツールを委任しても許可はされるが、`audit_events`に`decision='allowed'`かつ`reason_code='delegation_scope_shortfall'`を記録する |
+  | Phase 9E-2 | **enforce**。同条件で`permission_denied`により拒否する |
+
+  OAuthのワイヤ表現(`scopes_supported`)は変更しない — 新しいスコープ値を追加せず、既存の`read`/`write`を追加で要求するのみである。
+- **対応テスト候補**: Phase 9E-1では、`scope='agent'`のみ+`bound_tools`にwrite系ツールを含むClientが委任した際、監査に`delegation_scope_shortfall`が記録されることを確認するテスト。Phase 9E-2では、同条件が`permission_denied`になることを確認する回帰テスト。
 
 ---
 
