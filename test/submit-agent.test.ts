@@ -229,6 +229,199 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         }),
       ).rejects.toThrow(/slug_prefix "private\/" is not under any.*bound_slug_prefixes/);
     });
+
+    // --- dashboard-5krlu: narrowing fail-open fix ---------------------------
+
+    it('[dashboard-5krlu] refuses a slash-boundary-crossing sibling prefix that a raw startsWith would wrongly allow', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        // Bare bound (no trailing slash) — the exact shape that let a raw
+        // `sp.startsWith(bp)` be fooled by a sibling namespace sharing the
+        // same literal string prefix.
+        bound_slug_prefixes: ['agent-notes'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: ['agent-notes-secret/*'],
+        }),
+      ).rejects.toThrow(/slug_prefix "agent-notes-secret\/\*" is not under any.*bound_slug_prefixes/);
+    });
+
+    it('[dashboard-5krlu] refuses when bound_slug_prefixes is NULL but slug prefixes were explicitly requested (fail-open closed)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: ['wiki/*'],
+        }),
+      ).rejects.toThrow(/no bound_slug_prefixes binding/);
+    });
+
+    it('[dashboard-5krlu] does NOT change existing behavior when allowed_slug_prefixes is an explicit empty array and bound_slug_prefixes is NULL', async () => {
+      // This must stay unchanged: an explicit [] falls through to the
+      // legacy wiki/agents/<subagentId>/ sandbox at exercise time, and the
+      // grant-time check must not start rejecting it.
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_slug_prefixes: [],
+      });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Phase 9E-1, AUTHZ-INV-016] an explicit empty array in allowed_slug_prefixes is normalized to NULL in the persisted job data (not stored as [])', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_slug_prefixes: [],
+      });
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT data FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      const data = typeof rows[0].data === 'string'
+        ? JSON.parse(rows[0].data as string)
+        : (rows[0].data as Record<string, unknown>);
+      expect(data.allowed_slug_prefixes).toBeNull();
+    });
+
+    it('[Phase 9E-1, AUTHZ-INV-016] omitting allowed_slug_prefixes entirely still normalizes to NULL when bound_slug_prefixes is also NULL', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      const result = await callSubmitAgent(ctx, { prompt: 'go' });
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT data FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      const data = typeof rows[0].data === 'string'
+        ? JSON.parse(rows[0].data as string)
+        : (rows[0].data as Record<string, unknown>);
+      expect(data.allowed_slug_prefixes).toBeNull();
+    });
+
+    it('[dashboard-5krlu] refuses an empty-string entry in the requested prefixes', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: [''],
+        }),
+      ).rejects.toThrow(/must be a non-empty string/);
+    });
+
+    it('[dashboard-5krlu] refuses a non-string entry in the requested prefixes (dispatch.ts only checks Array.isArray, not element types)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: [123 as unknown as string],
+        }),
+      ).rejects.toThrow(/must be a non-empty string/);
+    });
+
+    it('[dashboard-5krlu] refuses an empty-string entry in bound_slug_prefixes itself (defensive — direct-SQL data corruption case)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/', ''],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: ['wiki/'],
+        }),
+      ).rejects.toThrow(/bound_slug_prefixes contains an invalid entry/);
+    });
+
+    it('[dashboard-5krlu] refuses the WHOLE request when only one of several requested prefixes is out of bound', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/', 'people/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, {
+          prompt: 'go',
+          allowed_slug_prefixes: ['wiki/', 'private/'],
+        }),
+      ).rejects.toThrow(/slug_prefix "private\/" is not under any.*bound_slug_prefixes/);
+    });
+
+    it('[dashboard-5krlu] allows a genuine child glob of a glob-shaped bound (fixes prior over-strict fail-closed)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/*'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_slug_prefixes: ['wiki/agents/*'],
+      });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[dashboard-5krlu] grant-time approval is consistent with exercise-time enforcement (grant→exercise one-shot)', async () => {
+      const { matchesSlugAllowList } = await import('../src/core/operations.ts');
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_slug_prefixes: ['wiki/originals/*'],
+      });
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT data FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      const data = typeof rows[0].data === 'string'
+        ? JSON.parse(rows[0].data as string)
+        : (rows[0].data as Record<string, unknown>);
+      const grantedPrefixes = data.allowed_slug_prefixes as string[];
+      expect(grantedPrefixes).toEqual(['wiki/originals/*']);
+
+      // What grant-time approved must behave identically at exercise time
+      // via matchesSlugAllowList (the function put_page actually calls).
+      expect(matchesSlugAllowList('wiki/originals/idea-1', grantedPrefixes)).toBe(true);
+      expect(matchesSlugAllowList('wiki/secret/leak', grantedPrefixes)).toBe(false);
+    });
   });
 
   describe('concurrency cap enforcement', () => {

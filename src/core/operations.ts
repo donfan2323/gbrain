@@ -45,6 +45,14 @@ import {
   LIST_SKILLS_DESCRIPTION,
   GET_SKILL_DESCRIPTION,
 } from './operations-descriptions.ts';
+import {
+  capabilityFromBinding,
+  requestedCapability,
+  capabilitySubset,
+  normalizeRequestedSlugPrefixes,
+  delegationScopeShortfalls,
+  delegationConstraintFromBinding,
+} from './delegation-capability.ts';
 
 // --- Types ---
 
@@ -3258,31 +3266,87 @@ const submit_agent: Operation = {
     const budgetCapText = (binding.budget_cap as string | null) ?? null;
 
     if (boundTools === null) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
-      );
+      const msg = `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`;
+      await auditDeny('no_bindings', msg);
+      throw new OperationError('permission_denied', msg);
     }
+
+    // Phase 9E-1 (dashboard-f5jd5, AUTHZ-INV-005 2026-08-03 revision):
+    // Capability = (operation set x namespace). `boundCapability` expresses
+    // this client's bound_tools/bound_source_id/bound_slug_prefixes exactly
+    // as stored — see capabilityFromBinding's doc comment for why NULL and
+    // [] are NOT folded together on the bound side (that distinction is
+    // what selects between the no_slug_prefix_binding and
+    // slug_prefix_not_bound reason_codes below, unchanged from
+    // dashboard-5krlu). budgetConstraint/maxConcurrent are represented as a
+    // DelegationConstraint (a distinct type from Capability, per the
+    // AUTHZ-INV-005 revision's split between set-inclusion and monotonicity
+    // judgments) even though only maxConcurrent is actually enforced today.
+    const boundCapability = capabilityFromBinding({ tools: boundTools, sourceId: boundSource, slugPrefixes: boundSlugPrefixes });
+    const delegationConstraint = delegationConstraintFromBinding({
+      maxConcurrent: boundMaxConcurrent,
+      budgetUsdPerDay: budgetCapText ? parseFloat(budgetCapText) : null,
+    });
 
     // Validate each param against the binding.
     const requestedTools = (p.allowed_tools as string[] | undefined) ?? boundTools;
-    for (const t of requestedTools) {
-      if (!boundTools.includes(t)) {
-        throw new OperationError(
-          'permission_denied',
-          `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`,
-        );
-      }
+    const requestedToolsCapability = requestedCapability(requestedTools, boundSource, null);
+    const toolCheck = capabilitySubset(requestedToolsCapability, boundCapability);
+    if (!toolCheck.ok) {
+      const t = toolCheck.excessTools[0];
+      const msg = `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`;
+      await auditDeny('tool_not_bound', msg);
+      throw new OperationError('permission_denied', msg);
     }
+    // dashboard-5krlu: narrowing fail-open fix, now expressed via
+    // capabilitySubset() (Phase 9E-1 refactor, dashboard-f5jd5) but
+    // otherwise unchanged. Three failure modes closed here (see
+    // isRequestedSlugPrefixWithinBound's doc comment for the slash-boundary
+    // semantics): (1) a raw sp.startsWith(bp) let a bound like 'agent-notes'
+    // grant the sibling namespace 'agent-notes-secret/*' — replaced by the
+    // shared slash-boundary-aware predicate also used to reason about
+    // exercise-time behavior; (2) boundSlugPrefixes===null used to skip
+    // this whole check, silently granting ANY requested prefix — now
+    // fail-closed whenever a caller actually requests prefixes against an
+    // unbound client; (3) malformed (non-string/empty) entries on either
+    // side used to either throw an unaudited internal TypeError or (for
+    // empty-string bound) match everything via ''.startsWith('') — now
+    // explicitly fail-closed with a distinguishing reason_code. An explicit
+    // `allowed_slug_prefixes: []` is deliberately untouched at the
+    // validation-gate level: requestedSlugPrefixes stays [], this whole
+    // block is skipped (nothing to validate), and exercise time keeps
+    // falling back to the legacy wiki/agents/<subagentId>/ sandbox exactly
+    // as before. (Phase 9E-1, AUTHZ-INV-016: what changes is only how the
+    // resulting [] gets PERSISTED into jobData below — see
+    // normalizeRequestedSlugPrefixes.)
     const requestedSlugPrefixes = (p.allowed_slug_prefixes as string[] | undefined) ?? boundSlugPrefixes ?? [];
-    if (boundSlugPrefixes !== null) {
-      for (const sp of requestedSlugPrefixes) {
-        if (!boundSlugPrefixes.some(bp => sp.startsWith(bp) || bp === sp)) {
-          throw new OperationError(
-            'permission_denied',
-            `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
-          );
+    if (requestedSlugPrefixes.length > 0) {
+      if (boundSlugPrefixes === null) {
+        const msg = `submit_agent: client ${clientId} requested slug prefixes but has no bound_slug_prefixes binding. Re-register with --bound-slug-prefixes.`;
+        await auditDeny('no_slug_prefix_binding', msg);
+        throw new OperationError('permission_denied', msg);
+      }
+      for (const bp of boundSlugPrefixes) {
+        if (typeof bp !== 'string' || bp.length === 0) {
+          const msg = `submit_agent: client ${clientId}'s bound_slug_prefixes contains an invalid entry.`;
+          await auditDeny('invalid_slug_prefix_binding', msg);
+          throw new OperationError('permission_denied', msg);
         }
+      }
+      for (const sp of requestedSlugPrefixes) {
+        if (typeof sp !== 'string' || sp.length === 0) {
+          const msg = `submit_agent: requested slug_prefix must be a non-empty string.`;
+          await auditDeny('invalid_slug_prefix_requested', msg);
+          throw new OperationError('invalid_params', msg);
+        }
+      }
+      const requestedSlugCapability = requestedCapability([], boundSource, requestedSlugPrefixes);
+      const slugCheck = capabilitySubset(requestedSlugCapability, boundCapability);
+      if (!slugCheck.ok) {
+        const sp = slugCheck.excessSlugPrefixes[0];
+        const msg = `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`;
+        await auditDeny('slug_prefix_not_bound', msg);
+        throw new OperationError('permission_denied', msg);
       }
     }
 
@@ -3295,12 +3359,28 @@ const submit_agent: Operation = {
          AND j.data->>'__owner_client_id' = ${clientId}
     `;
     const inflightCount = Number((inflight[0]?.n as number | string | undefined) ?? 0);
-    if (inflightCount >= boundMaxConcurrent) {
-      throw new OperationError(
-        'rate_limited',
-        `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`,
-      );
+    if (inflightCount >= (delegationConstraint.maxConcurrent ?? 1)) {
+      const msg = `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`;
+      await auditDeny('concurrency_cap_exceeded', msg);
+      throw new OperationError('rate_limited', msg);
     }
+
+    // Phase 9E-1 (dashboard-f5jd5), AUTHZ-INV-017 (2026-08-03, WARN-ONLY):
+    // does this client's own OAuth scope cover the required_scope of every
+    // tool it is about to hand to the child job? `agent` is a committal-
+    // only scope (does not imply read/write/admin, scope.ts's IMPLIES
+    // table) — a client can be bound to tools its own scopes don't cover,
+    // the confused-deputy shape AUTHZ-INV-017 names. Phase 9E-1 records
+    // this but does NOT deny — enforcement is Phase 9E-2. Computed here
+    // (before dry-run/queue.add) so the dry-run echo and the real
+    // submission see the same shortfall computation; only the real
+    // submission path actually persists it (below, on the delegation.grant
+    // write).
+    const scopeShortfalls = delegationScopeShortfalls(
+      requestedTools,
+      auth?.scopes ?? [],
+      tool => (operationsByName[tool]?.scope as string | undefined) ?? 'read',
+    );
 
     // Dry-run echo.
     if (ctx.dryRun) {
@@ -3324,7 +3404,12 @@ const submit_agent: Operation = {
       prompt: p.prompt as string,
       max_turns: Math.min((p.max_turns as number) ?? 20, 100),
       allowed_tools: requestedTools,
-      allowed_slug_prefixes: requestedSlugPrefixes,
+      // Phase 9E-1 (dashboard-f5jd5), AUTHZ-INV-016: normalize an explicit
+      // [] to null for the persisted representation. Behaviorally inert
+      // (both the grant-time check above and enforceSubagentSlugFence at
+      // exercise time already treat [] and null/absent identically) —
+      // this only changes what gets stored, not what's allowed.
+      allowed_slug_prefixes: normalizeRequestedSlugPrefixes(requestedSlugPrefixes),
       __owner_client_id: clientId,
     };
     if (typeof p.model === 'string') jobData.model = p.model;
@@ -3335,6 +3420,45 @@ const submit_agent: Operation = {
       { queue: (p.queue as string) || 'default' },
       { allowProtectedSubmit: true },
     );
+
+    // Phase 9E-1 (dashboard-f5jd5), AUTHZ-INV-017 (warn-only): if the
+    // delegator's own scopes don't cover every tool it just handed to the
+    // child, record it on the SAME delegation.grant row — no new event_kind,
+    // no schema change. The shortfall detail (tool name + required scope,
+    // both public API vocabulary) goes in params_summary; it never contains
+    // prompt content or credentials because delegationScopeShortfalls()'s
+    // return shape structurally cannot carry them (see its doc comment).
+    const scopeShortfallSummary = scopeShortfalls.length > 0
+      ? {
+          missing_scopes: [...new Set(scopeShortfalls.map(s => s.requiredScope))],
+          shortfall_tools: scopeShortfalls.map(s => s.tool),
+        }
+      : null;
+
+    // Phase 9C: class1_issuance without tx. §2-1's same-transaction
+    // requirement doesn't apply here — MinionQueue.add() already commits
+    // the job INSERT inside its own internal engine.transaction() before
+    // returning, and does not expose that transaction to callers (it is
+    // shared, heavily-used core infrastructure; threading an external tx
+    // through it is a separate, larger change out of scope for this
+    // route). This is a deliberate, documented gap from the strict §2-1
+    // ideal: in the rare double-failure case (DB insert AND spill both
+    // fail) the job has already been durably created and will run: the
+    // grant itself is not blocked, only its audit trail is degraded to
+    // best-effort. AUTHZ-INV-001 still holds — this can never change the
+    // grant decision itself, only whether it gets recorded.
+    await writeAuditEvent(ctx.engine, {
+      ...delegationAuditBase,
+      occurred_at: occurredAt,
+      event_kind: 'delegation.grant',
+      decision: 'allowed',
+      outcome: 'succeeded',
+      reason_code: scopeShortfalls.length > 0 ? 'delegation_scope_shortfall' : null,
+      params_summary: scopeShortfallSummary,
+      job_id: job.id,
+      latency_ms: Date.now() - startedAt,
+      errorMessageRaw: null,
+    }, { class: 'class1_issuance' });
 
     // Audit trail (D4) — best-effort JSONL.
     try {
