@@ -194,6 +194,51 @@ export function matchesSlugAllowList(slug: string, prefixes: readonly string[]):
 }
 
 /**
+ * dashboard-5krlu: is `requestedPrefix` (an entry a submit_agent caller
+ * passes in `allowed_slug_prefixes`) entirely contained within the
+ * namespace granted by `boundPrefix` (an entry of the OAuth client's
+ * `bound_slug_prefixes`)?
+ *
+ * This is the single source of truth for the grant-time (submit_agent)
+ * narrowing check, kept deliberately adjacent to matchesSlugAllowList
+ * (the exercise-time check) so both slash-boundary-sensitive semantics are
+ * visible together and can't silently drift apart again. Prior to this fix,
+ * grant-time used a raw `sp.startsWith(bp)`, which let
+ * `bound=['agent-notes']` grant `requested=['agent-notes-secret/*']`
+ * because the two strings share a literal prefix with no `/` boundary
+ * between them — the caller could then write anywhere under
+ * `agent-notes-secret/`, a namespace it was never bound to.
+ *
+ * `boundPrefix` is always treated as a namespace root: a trailing `/*` OR
+ * a bare trailing `/` both mean "this prefix and everything beneath it".
+ * `requestedPrefix` keeps matchesSlugAllowList's own asymmetric rule —
+ * only a trailing `/*` (not a bare trailing `/`) marks it as a subtree
+ * glob. Consequently, once `boundPrefix` is subtree-shaped, a *bare*
+ * (non-glob) `requestedPrefix` that happens to equal the bound's stripped
+ * base is still denied: e.g. `bound=['wiki/']` does NOT let a caller
+ * request the bare `'wiki'` (only `'wiki/*'` or anything under `'wiki/'`),
+ * because a bare request only ever claims the single exact-match slug
+ * `matchesSlugAllowList` would grant for it, and that admin never
+ * registered `'wiki'` itself as a boundable node.
+ *
+ * Both arguments must already be validated as non-empty strings by the
+ * caller — this function assumes clean input and performs no fail-closed
+ * validation of its own (see submit_agent's handler for that gate).
+ */
+export function isRequestedSlugPrefixWithinBound(requestedPrefix: string, boundPrefix: string): boolean {
+  const boundIsSubtreeRoot = boundPrefix.endsWith('/*') || boundPrefix.endsWith('/');
+  const boundBase = boundIsSubtreeRoot
+    ? boundPrefix.slice(0, boundPrefix.endsWith('/*') ? -2 : -1)
+    : boundPrefix;
+  const requestedIsGlob = requestedPrefix.endsWith('/*');
+  const requestedBase = requestedIsGlob ? requestedPrefix.slice(0, -2) : requestedPrefix;
+  return (
+    requestedBase.startsWith(boundBase + '/') ||
+    (requestedBase === boundBase && (!boundIsSubtreeRoot || requestedIsGlob))
+  );
+}
+
+/**
  * Subagent slug-fence enforcement, shared by every mutating op a subagent
  * can reach (put_page, add_timeline_entry). FAIL-CLOSED: `viaSubagent=true`
  * enforces the check even if the dispatcher forgot to populate `subagentId`.
