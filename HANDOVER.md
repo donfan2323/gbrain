@@ -219,10 +219,9 @@ PHASE9x-DELIVERABLES-vN/
 
 ## 7. git情報
 
-- **HEAD**: `fcdb7c47d34696a1cb23fb79e878978dc0c23186`(branch: `master`)。Phase 9B実装34ファイルを単一コミット`feat(identity): Phase 9B Universal Identity Foundation - Principal基盤実装`として2026-08-02にコミット済み(外部レビュー承認後、Phase 9C Stage2完了時点でユーザー承認により実施)
-- **Working Tree状態**: Phase 9C(Universal Audit Event Integration)実装により未コミット変更41件(`M`19 + `??`22)。Stage1〜7完了・REQUIRED=0達成済み(`PHASE9C-REVIEW-MANIFEST.md`参照)。**実リポジトリへは一切コミットしていない**(ユーザーの明示承認・外部レビュー正式承認まで意図的に見送っている、Phase 9Bと同じ運用方針)
-- 直前HEAD(Phase 9B確定時点): `fcdb7c47d34696a1cb23fb79e878978dc0c23186`
-- 変更ファイルの完全な内訳は`git status --short`で確認、または`PHASE9C-IMPLEMENTATION-REPORT.md`§5(変更ファイル一覧)を参照
+- **HEAD**: `666c7d39`(branch: `master`)。Phase 9C〜9E-1(Universal Audit Event Integration〜Delegation Capability/Constraint実装)は以下8コミットとしてローカルコミット済み: `4a33a63e`(Phase 9C監査統合)→`7fa7cc7f`(Phase 9D Policy Decision統一)→`6c7e47f5`(P0 slug narrowing修正)→`1c1940bd`(Phase 9E設計正本)→`1f5243e9`(Phase 9E-1 Capability/Constraint中核)→`6648677b`(Phase 9E-1 CLI/doctor)→`f35518ac`(AUTHZ-INV-017集計CLI)→`666c7d39`(リリース準備文書、現HEAD)。base commitは引き続き`fcdb7c47d34696a1cb23fb79e878978dc0c23186`(Phase 9B確定時点)。
+- **Working Tree状態**: クリーン(未コミット変更なし)。**git pushは未実施**。本番デプロイ・本番DB migrationも未実施(ユーザーの明示承認・外部レビュー正式承認まで意図的に見送っている、Phase 9Bと同じ運用方針)。本番環境はPhase 9B以降が未反映。
+- 各コミットの変更ファイル内訳は`git show --stat <SHA>`で確認、または`PHASE9E1-RELEASE-READINESS.md`を参照。`check:all`は21/23 pass(全体結果FAIL)。既知debt: `check-test-real-names`・`check-test-isolation`(いずれもbase commit由来)、`dashboard-kx905`(serve-http OAuth E2E、`oauth_tokens.scopes`型不一致、base commit由来と確認済み)。本番migration誤発火(commit分割作業中の事故)についてはDB無変更を事後監査で確認済み。
 - 検証専用コミット(`e7236677fd7747fca8dafb6289a450078dc061e2`)は完全に別の一時worktreeにのみ存在し、実masterには一切影響しない
 
 ---
