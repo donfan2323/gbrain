@@ -544,6 +544,14 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     const postgres = (await import('postgres')).default;
     const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
     try {
+      // postgres.js resolves sql.array()'s element type OID from a
+      // typeArrayMap populated by an async pg_catalog.pg_type
+      // introspection query the driver fires on first use. That map isn't
+      // populated yet when sql.array() is the very first query on a brand
+      // new connection, so the array Bind falls back to the scalar `text`
+      // OID and Postgres rejects it against the text[] column (dashboard-kx905).
+      // A cheap query first lets that introspection round-trip complete.
+      await sql`SELECT 1`;
       await sql`
         INSERT INTO oauth_tokens (token_hash, token_type, client_id, scopes, expires_at)
         VALUES (${tokenHash}, ${'access'}, ${publicClientId!}, ${sql.array(['read'])}, ${Math.floor(Date.now() / 1000) + 3600})
