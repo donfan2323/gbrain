@@ -57,6 +57,12 @@ Capabilityとは別カテゴリとして扱う理由: 集合の包含(⊆)と数
 
 **例外**: `submitSelfFixChild`(`src/core/minions/self-fix.ts`)は既にdepth=1相当の子ジョブを生成しており、親の`data`をスプレッドして権限をそのまま継承する。これは「エージェント起点の再委任」ではなく「システム起点の再委任」であり、Phase 9Aが「孫委任は不可能」と結論づけた対象(エージェントが自発的に行う再委任)とは異なる、既に本番稼働している経路である。Phase 9Eはこれを新機能ではなく**既存経路の正規化**として扱う。
 
+**最大委任深度の正式決定(Phase 9E-2e-1, 2026-08-05)**: 最大委任深度は固定値**5**(`MAX_DELEGATION_DEPTH`、`src/core/delegation-capability.ts`)とする。root delegatorから直接生成されたchildをdelegation depth 1とし、depth 1→2→3→4→5まで許可、depth 5のジョブからの再委任は`delegation_depth_exceeded`で拒否する。外部設定化しない(`GBrainConfig`・環境変数・CLIオプション・OAuthクライアント設定のいずれにも追加しない)。**この委任深度(delegation depth)は、self-fixの`SelfFixOpts.max_depth`(既定2、self-fixリトライ連鎖専用のカウンタ)およびMinionQueueの汎用`maxSpawnDepth`(既定5、`parent_job_id`を持つ全ジョブに適用される汎用spawn深度)のいずれとも意味論的に別物であり、数値が5で一致するのは偶然である**。委任深度は将来のadapter実装がjob data内の専用マーカーで独自に管理する(self-fixの`data.is_self_fix_child`と同型のパターン)。
+
+**再委任許可の正式決定(Phase 9E-2e-1)**: 再委任許可はAUTHZ-INV-008の要求通り明示的なgrantとし、現在ジョブの実効`allowed_tools`(root clientの生の`bound_tools`ではない)に、子ジョブ専用の委任adapterツール名(候補: `submit_agent_delegated`。通常の`submit_agent`とは明確に区別する)が完全一致で含まれる場合のみ許可する。専用のOAuth scope・専用のboolean属性は追加しない。
+
+**Phase 9E-2e-1時点の実装状態**: `src/core/delegation-capability.ts`に`MAX_DELEGATION_DEPTH`定数、および`canRedelegate`/`nextDelegationDepth`/`validateRedelegatedCapability`/`validateRedelegatedConstraint`/`evaluateRedelegation`の5つの純関数(queue・DB・audit・OperationContextに一切依存しない)を追加した。**これらは判定ロジックの基盤のみであり、`submit_agent`または委任adapターはまだ`BRAIN_TOOL_ALLOWLIST`に追加されておらず、多段委任(孫委任)自体はまだ有効化されていない**。AUTHZ-INV-007(委任期限の継承)は本コミットでも未充足のまま残る — CapabilityおよびDelegationConstraintに期限フィールドは追加していない。
+
 ---
 
 ## 4. 権限継承・縮小(narrowing)

@@ -35,7 +35,7 @@ Phase 9E-1は**挙動保存を原則とする**。「挙動保存」とは、既
 
 ### 2-3. Phase 9E-1に含めない内容(9E-2以降・意図的な設計判断)
 
-- 孫委任の実際の有効化(multi-hop delegation) — **既定OFF**。有効化する仕組み自体を導入しない。
+- 孫委任の実際の有効化(multi-hop delegation) — **既定OFF**。有効化する仕組み自体を導入しない。**Phase 9E-2e-1(2026-08-05)で判定用の純関数基盤(`MAX_DELEGATION_DEPTH=5`固定・`canRedelegate`/`nextDelegationDepth`/`validateRedelegatedCapability`/`validateRedelegatedConstraint`/`evaluateRedelegation`、`src/core/delegation-capability.ts`)のみ追加。`submit_agent`または委任adapterは`BRAIN_TOOL_ALLOWLIST`未追加のため、多段委任は依然として無効のまま。AUTHZ-INV-007(委任期限継承)はこのフェーズでも未充足。詳細は`PHASE9E-DELEGATION-DOMAIN-MODEL.md`§3を参照。**
 - AUTHZ-INV-017のenforce切替(拒否化)。
 - AUTHZ-INV-016のレガシーsandbox opt-out(fail-closed)モード。
 - `bound_source_id`未設定時の`'default'`フォールバック是正(`dashboard-z7a1o`) — 挙動変更を伴うため9E-2。

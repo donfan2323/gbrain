@@ -219,3 +219,187 @@ export function delegationConstraintFromBinding(binding: {
     budgetUsdPerDay: binding.budgetUsdPerDay,
   };
 }
+
+/**
+ * Phase 9E-2e-1 (AUTHZ-INV-005/006/008): multi-level delegation constraint
+ * primitives. Pure, engine-free, queue-free, audit-free — a future adapter
+ * (not built by this module) is responsible for wiring these into
+ * `queue.add()`/`parent_job_id`/`writeAuditEvent`. Multi-hop delegation
+ * itself remains disabled until that adapter exists and is wired into
+ * `BRAIN_TOOL_ALLOWLIST`.
+ *
+ * AUTHZ-INV-007 (delegation expiry inheritance) is INTENTIONALLY not
+ * addressed here — no expiry field exists on Capability or
+ * DelegationConstraint, and none is added by this module. AUTHZ-INV-007
+ * remains an unmet invariant (already flagged as such in Phase 9E-1);
+ * `minion_jobs.timeout_ms`/`timeout_at` are per-job EXECUTION timeouts,
+ * not a delegation lifetime, and are not repurposed as one here.
+ */
+
+/**
+ * Fixed maximum delegation chain depth: root→child is depth 1, up through
+ * depth 5 (grandchild-of-grandchild-of-grandchild). NOT configurable — no
+ * GBrainConfig field, env var, CLI flag, or oauth_clients column reads
+ * this value. Deliberately distinct from two other, unrelated depth
+ * counters already in the codebase:
+ *   - self-fix's `SelfFixOpts.max_depth` (default 2, `self-fix.ts`) counts
+ *     self-fix RETRY hops (marked via `data.is_self_fix_child`), not
+ *     delegation hops. Reusing that constant here would conflate two
+ *     independent chain-depth concepts that happen to share a name.
+ *   - `MinionQueue`'s generic `maxSpawnDepth` (default 5, `queue.ts`)
+ *     counts EVERY `parent_job_id` hop regardless of cause (delegation,
+ *     self-fix, or aggregator fan-out). This module's delegation depth is
+ *     a semantically distinct counter a future adapter will track via its
+ *     own job-data marker (the same pattern self-fix already uses for its
+ *     own depth), NOT `minion_jobs.depth` itself.
+ */
+export const MAX_DELEGATION_DEPTH = 5;
+
+/**
+ * AUTHZ-INV-008: re-delegation is permitted ONLY when the CURRENT job's own
+ * effective `allowed_tools` (already narrowed at its own grant time — never
+ * the root OAuth client's raw `bound_tools`) contains the dedicated
+ * delegated-submit adapter tool name. Exact string match only: no case
+ * folding, no prefix/substring matching, no fuzzy comparison. An
+ * empty-string adapter name never matches (defensive — prevents a
+ * mis-called `''` argument from vacuously granting redelegation to every
+ * job, since `[''].includes('')` would otherwise be `true`).
+ */
+export function canRedelegate(
+  effectiveAllowedTools: readonly string[] | null | undefined,
+  delegatedSubmitToolName: string,
+): boolean {
+  if (delegatedSubmitToolName.length === 0) return false;
+  if (effectiveAllowedTools == null) return false;
+  return effectiveAllowedTools.includes(delegatedSubmitToolName);
+}
+
+export type RedelegationDepthDecision =
+  | { readonly allowed: true; readonly childDelegationDepth: number }
+  | { readonly allowed: false; readonly reason: 'delegation_depth_exceeded' | 'invalid_delegation_depth' };
+
+/**
+ * AUTHZ-INV-005: the child's delegation depth is always `parent + 1`,
+ * fail-closed at `MAX_DELEGATION_DEPTH`. Invalid inputs (non-integer,
+ * negative, NaN, ±Infinity) are rejected as `invalid_delegation_depth`
+ * BEFORE the range check — a depth value can never simultaneously be
+ * `invalid_delegation_depth` and `delegation_depth_exceeded` (mutually
+ * exclusive by construction, see the corresponding test).
+ */
+export function nextDelegationDepth(parentDelegationDepth: number): RedelegationDepthDecision {
+  if (
+    typeof parentDelegationDepth !== 'number' ||
+    !Number.isFinite(parentDelegationDepth) ||
+    !Number.isInteger(parentDelegationDepth) ||
+    parentDelegationDepth < 0
+  ) {
+    return { allowed: false, reason: 'invalid_delegation_depth' };
+  }
+  if (parentDelegationDepth >= MAX_DELEGATION_DEPTH) {
+    return { allowed: false, reason: 'delegation_depth_exceeded' };
+  }
+  return { allowed: true, childDelegationDepth: parentDelegationDepth + 1 };
+}
+
+/**
+ * AUTHZ-INV-005: is the requested child Capability entirely contained
+ * within the CURRENT job's own effective Capability (not the root OAuth
+ * client's raw binding)? Reuses `capabilitySubset()` verbatim as the
+ * single source of truth for the tools/slug-prefix containment logic — no
+ * reimplementation. A single excess entry on either dimension denies the
+ * WHOLE request (no partial grant, no automatic narrowing).
+ */
+export function validateRedelegatedCapability(
+  parentEffectiveCapability: Capability,
+  requestedChildCapability: Capability,
+): CapabilitySubsetResult {
+  return capabilitySubset(requestedChildCapability, parentEffectiveCapability);
+}
+
+export interface RedelegationConstraintDecision {
+  readonly ok: boolean;
+  readonly budgetExceeded: boolean;
+}
+
+/**
+ * DelegationConstraint monotonicity (budget only — `maxConcurrent` is not
+ * evaluated here, it is a live concurrency check the future adapter must
+ * perform against current queue state, not a static narrowing check).
+ * Deliberately kept structurally separate from `validateRedelegatedCapability`
+ * (Capability vs. DelegationConstraint must never merge into one object —
+ * see the existing "structurally disjoint types" test). `null` on either
+ * side means "no ceiling on that side": a null parent budget imposes no
+ * limit on the child; a null requested budget means the child inherits the
+ * parent's ceiling rather than requesting a new one, so it never exceeds it.
+ */
+export function validateRedelegatedConstraint(
+  parentEffectiveConstraint: DelegationConstraint,
+  requestedChildConstraint: DelegationConstraint,
+): RedelegationConstraintDecision {
+  const parentBudget = parentEffectiveConstraint.budgetUsdPerDay;
+  const requestedBudget = requestedChildConstraint.budgetUsdPerDay;
+  const budgetExceeded = parentBudget != null && requestedBudget != null && requestedBudget > parentBudget;
+  return { ok: !budgetExceeded, budgetExceeded };
+}
+
+export type RedelegationDecision =
+  | { readonly allowed: true; readonly childDelegationDepth: number }
+  | {
+      readonly allowed: false;
+      readonly reason:
+        | 'redelegation_not_granted'
+        | 'delegation_depth_exceeded'
+        | 'delegated_capability_exceeds_parent'
+        | 'invalid_delegation_depth';
+      readonly details?: unknown;
+    };
+
+/**
+ * Composite decision a future delegated-submit adapter can call directly
+ * and use its result as a stable deny reason_code with no further
+ * translation. Depends on nothing but its inputs — no queue, no DB, no
+ * audit, no OperationContext (§13 of this module's design principles).
+ *
+ * Stable check order (also the reason-code priority when multiple
+ * conditions fail simultaneously):
+ *   1. redelegation_not_granted        (canRedelegate)
+ *   2/3. invalid_delegation_depth /
+ *        delegation_depth_exceeded     (nextDelegationDepth — mutually
+ *                                        exclusive by construction, so
+ *                                        these two never compete with
+ *                                        each other for priority)
+ *   4. delegated_capability_exceeds_parent (validateRedelegatedCapability)
+ *
+ * On allow, returns ONLY `{allowed, childDelegationDepth}` — it does not
+ * echo back a (possibly narrowed) Capability, so there is no field here
+ * that could silently rewrite what the caller requested. Budget
+ * (`validateRedelegatedConstraint`) and OAuth-scope (Phase 9E-2d's
+ * exercise-time re-resolution) are deliberately NOT folded into this
+ * function — they are separate axes with separate call sites in the
+ * future adapter, exactly as Capability and DelegationConstraint are kept
+ * structurally separate everywhere else in this module.
+ */
+export function evaluateRedelegation(input: {
+  readonly parentAllowedTools: readonly string[] | null | undefined;
+  readonly delegatedSubmitToolName: string;
+  readonly parentDelegationDepth: number;
+  readonly parentEffectiveCapability: Capability;
+  readonly requestedChildCapability: Capability;
+}): RedelegationDecision {
+  if (!canRedelegate(input.parentAllowedTools, input.delegatedSubmitToolName)) {
+    return { allowed: false, reason: 'redelegation_not_granted' };
+  }
+  const depthDecision = nextDelegationDepth(input.parentDelegationDepth);
+  if (!depthDecision.allowed) {
+    return { allowed: false, reason: depthDecision.reason };
+  }
+  const capDecision = validateRedelegatedCapability(input.parentEffectiveCapability, input.requestedChildCapability);
+  if (!capDecision.ok) {
+    return {
+      allowed: false,
+      reason: 'delegated_capability_exceeds_parent',
+      details: { excessTools: capDecision.excessTools, excessSlugPrefixes: capDecision.excessSlugPrefixes },
+    };
+  }
+  return { allowed: true, childDelegationDepth: depthDecision.childDelegationDepth };
+}

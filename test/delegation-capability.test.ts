@@ -17,6 +17,12 @@ import {
   normalizeRequestedSlugPrefixes,
   delegationScopeShortfalls,
   delegationConstraintFromBinding,
+  MAX_DELEGATION_DEPTH,
+  canRedelegate,
+  nextDelegationDepth,
+  validateRedelegatedCapability,
+  validateRedelegatedConstraint,
+  evaluateRedelegation,
   type Capability,
   type DelegationConstraint,
 } from '../src/core/delegation-capability.ts';
@@ -226,6 +232,402 @@ describe('AUTHZ-INV-005 (2026-08-03): Capability and DelegationConstraint are st
       const hasCapabilityField = /\b(tools|write|read)\s*:/.test(block);
       const hasConstraintField = /\b(maxConcurrent|budgetUsdPerDay)\s*:/.test(block);
       expect(hasCapabilityField && hasConstraintField).toBe(false);
+    }
+  });
+});
+
+// -----------------------------------------------------------------------
+// Phase 9E-2e-1 (AUTHZ-INV-005/006/008): multi-level delegation constraint
+// primitives. Pure functions only — no queue, no DB, no audit, no
+// OperationContext. Multi-hop delegation itself is NOT enabled by this
+// module; these are the building blocks a future adapter will call.
+// MAX_DELEGATION_DEPTH=5 is fixed, not configurable, and deliberately
+// distinct from both self-fix's chain-depth (which counts a DIFFERENT
+// thing — self-fix retries, marked via data.is_self_fix_child — not
+// delegation hops) and MinionQueue's generic maxSpawnDepth (which counts
+// ALL parent_job_id hops regardless of whether they are delegation,
+// self-fix, or aggregator fan-out).
+// -----------------------------------------------------------------------
+
+const DELEGATED_SUBMIT_TOOL_NAME = 'submit_agent_delegated';
+
+describe('MAX_DELEGATION_DEPTH — fixed constant, not configurable', () => {
+  test('[Case 25] is exactly 5', () => {
+    expect(MAX_DELEGATION_DEPTH).toBe(5);
+  });
+});
+
+describe('canRedelegate — AUTHZ-INV-008 explicit redelegation grant', () => {
+  test('[Case 1] adapter name present in allowed tools -> true', () => {
+    expect(canRedelegate(['search', DELEGATED_SUBMIT_TOOL_NAME], DELEGATED_SUBMIT_TOOL_NAME)).toBe(true);
+  });
+
+  test('[Case 2] adapter name absent -> false', () => {
+    expect(canRedelegate(['search', 'put_page'], DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 3] null -> false', () => {
+    expect(canRedelegate(null, DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 4] undefined -> false', () => {
+    expect(canRedelegate(undefined, DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 5] empty array -> false', () => {
+    expect(canRedelegate([], DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 6] only the plain "submit_agent" (not the delegated adapter) -> false', () => {
+    expect(canRedelegate(['submit_agent'], DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 7] a prefix/partial match of the adapter name -> false (no substring matching)', () => {
+    expect(canRedelegate(['submit_agent_delegated_v2', 'xsubmit_agent_delegated'], DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 8] a case-different name -> false (no case folding)', () => {
+    expect(canRedelegate(['SUBMIT_AGENT_DELEGATED', 'Submit_Agent_Delegated'], DELEGATED_SUBMIT_TOOL_NAME)).toBe(false);
+  });
+
+  test('[Case 9] duplicate entries of the adapter name -> true (result unaffected by duplication)', () => {
+    expect(canRedelegate([DELEGATED_SUBMIT_TOOL_NAME, DELEGATED_SUBMIT_TOOL_NAME, 'search'], DELEGATED_SUBMIT_TOOL_NAME)).toBe(true);
+  });
+
+  test('[Case 10] an empty-string adapter name never matches (defensive — no vacuous grant)', () => {
+    expect(canRedelegate(['', 'search'], '')).toBe(false);
+  });
+});
+
+describe('nextDelegationDepth — AUTHZ-INV-005 monotonic depth, MAX_DELEGATION_DEPTH=5 fail-closed', () => {
+  test('[Case 11] parent depth 0 -> child depth 1', () => {
+    const d = nextDelegationDepth(0);
+    expect(d).toEqual({ allowed: true, childDelegationDepth: 1 });
+  });
+
+  test('[Case 12] parent depth 1 -> child depth 2', () => {
+    expect(nextDelegationDepth(1)).toEqual({ allowed: true, childDelegationDepth: 2 });
+  });
+
+  test('[Case 13] parent depth 2 -> child depth 3', () => {
+    expect(nextDelegationDepth(2)).toEqual({ allowed: true, childDelegationDepth: 3 });
+  });
+
+  test('[Case 14] parent depth 3 -> child depth 4', () => {
+    expect(nextDelegationDepth(3)).toEqual({ allowed: true, childDelegationDepth: 4 });
+  });
+
+  test('[Case 15] parent depth 4 -> child depth 5', () => {
+    expect(nextDelegationDepth(4)).toEqual({ allowed: true, childDelegationDepth: 5 });
+  });
+
+  test('[Case 16] parent depth 5 (already at max) -> delegation_depth_exceeded', () => {
+    const d = nextDelegationDepth(5);
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('delegation_depth_exceeded');
+  });
+
+  test('[Case 17] parent depth 6 -> delegation_depth_exceeded', () => {
+    const d = nextDelegationDepth(6);
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('delegation_depth_exceeded');
+  });
+
+  test('[Case 18] parent depth 100 -> delegation_depth_exceeded', () => {
+    const d = nextDelegationDepth(100);
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('delegation_depth_exceeded');
+  });
+
+  test('[Case 19] depth -1 -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(-1);
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 20] depth -100 -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(-100);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 21] depth 0.5 (non-integer) -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(0.5);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 22] depth NaN -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(NaN);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 23] depth Infinity -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(Infinity);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 24] depth -Infinity -> invalid_delegation_depth', () => {
+    const d = nextDelegationDepth(-Infinity);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+});
+
+describe('validateRedelegatedCapability — reuses capabilitySubset() as the single source of truth', () => {
+  test('[Case 26] identical parent/requested Capability -> allow', () => {
+    const cap = capabilityFromBinding({ tools: ['search', 'put_page'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const d = validateRedelegatedCapability(cap, cap);
+    expect(d.ok).toBe(true);
+  });
+
+  test('[Case 27] requested tools a subset of parent -> allow', () => {
+    const parent = capabilityFromBinding({ tools: ['search', 'put_page'], sourceId: 'default', slugPrefixes: null });
+    const requested = requestedCapability(['search'], 'default', null);
+    expect(validateRedelegatedCapability(parent, requested).ok).toBe(true);
+  });
+
+  test('[Case 28] requested tools exceed parent -> deny', () => {
+    const parent = capabilityFromBinding({ tools: ['search'], sourceId: 'default', slugPrefixes: null });
+    const requested = requestedCapability(['search', 'put_page'], 'default', null);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(false);
+    expect(d.excessTools).toEqual(['put_page']);
+  });
+
+  test('[Case 29] requested slug prefixes a subset of parent -> allow', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const requested = requestedCapability([], 'default', ['wiki/originals/*']);
+    expect(validateRedelegatedCapability(parent, requested).ok).toBe(true);
+  });
+
+  test('[Case 30] requested slug prefixes exceed parent -> deny', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const requested = requestedCapability([], 'default', ['private/']);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(false);
+    expect(d.excessSlugPrefixes).toEqual(['private/']);
+  });
+
+  test('[Case 31] a slash-boundary-crossing sibling prefix -> deny (isRequestedSlugPrefixWithinBound semantics preserved)', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: 'default', slugPrefixes: ['agent-notes'] });
+    const requested = requestedCapability([], 'default', ['agent-notes-secret/*']);
+    expect(validateRedelegatedCapability(parent, requested).ok).toBe(false);
+  });
+
+  test('[Case 32] parent prefix NULL (ungranted) + child requests a prefix -> deny', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: 'default', slugPrefixes: null });
+    const requested = requestedCapability([], 'default', ['wiki/']);
+    expect(validateRedelegatedCapability(parent, requested).ok).toBe(false);
+  });
+
+  test('[Case 33] parent prefix [] (also ungranted per AUTHZ-INV-016) + child requests a prefix -> deny', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: 'default', slugPrefixes: [] });
+    const requested = requestedCapability([], 'default', ['wiki/']);
+    expect(validateRedelegatedCapability(parent, requested).ok).toBe(false);
+  });
+
+  test('[Case 34] parent unset + child unset (both empty defaults) -> follows existing capabilitySubset norm (ok, no excess)', () => {
+    const parent = capabilityFromBinding({ tools: [], sourceId: null, slugPrefixes: null });
+    const requested = requestedCapability([], null, null);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(true);
+    expect(d.excessTools).toEqual([]);
+    expect(d.excessSlugPrefixes).toEqual([]);
+  });
+
+  test('[Case 35] child tools left unspecified ([]) while checking only slug prefixes -> follows existing single-dimension norm', () => {
+    const parent = capabilityFromBinding({ tools: ['search'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const requested = requestedCapability([], 'default', ['wiki/x/*']);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(true);
+  });
+
+  test('[Case 38] several requested tools where only one is out of bound -> deny for the WHOLE request, not partial', () => {
+    const parent = capabilityFromBinding({ tools: ['search', 'get_page'], sourceId: 'default', slugPrefixes: null });
+    const requested = requestedCapability(['search', 'get_page', 'put_page'], 'default', null);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(false);
+    expect(d.excessTools).toEqual(['put_page']);
+  });
+
+  test('[Case 39] both tools AND slug prefixes exceed parent simultaneously -> deny, both excesses reported', () => {
+    const parent = capabilityFromBinding({ tools: ['search'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const requested = requestedCapability(['search', 'put_page'], 'default', ['private/']);
+    const d = validateRedelegatedCapability(parent, requested);
+    expect(d.ok).toBe(false);
+    expect(d.excessTools).toEqual(['put_page']);
+    expect(d.excessSlugPrefixes).toEqual(['private/']);
+  });
+
+  test('[Case 40] the parent Capability object is not mutated by validation', () => {
+    const parent = capabilityFromBinding({ tools: ['search'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const parentToolsBefore = [...parent.tools];
+    const parentPrefixesBefore = parent.write.slugPrefixes ? [...parent.write.slugPrefixes] : null;
+    const requested = requestedCapability(['search', 'put_page'], 'default', ['private/']);
+    validateRedelegatedCapability(parent, requested);
+    expect([...parent.tools]).toEqual(parentToolsBefore);
+    expect(parent.write.slugPrefixes ? [...parent.write.slugPrefixes] : null).toEqual(parentPrefixesBefore);
+  });
+
+  test('[Case 41] the requested Capability object is not mutated by validation', () => {
+    const parent = capabilityFromBinding({ tools: ['search'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+    const requested = requestedCapability(['search', 'put_page'], 'default', ['private/']);
+    const requestedToolsBefore = [...requested.tools];
+    const requestedPrefixesBefore = requested.write.slugPrefixes ? [...requested.write.slugPrefixes] : null;
+    validateRedelegatedCapability(parent, requested);
+    expect([...requested.tools]).toEqual(requestedToolsBefore);
+    expect(requested.write.slugPrefixes ? [...requested.write.slugPrefixes] : null).toEqual(requestedPrefixesBefore);
+  });
+});
+
+describe('validateRedelegatedConstraint — DelegationConstraint monotonicity (budget), kept structurally separate from Capability', () => {
+  test('[Case 36] requested budget <= parent budget -> allow', () => {
+    const parent = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 10 });
+    const requested = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 5 });
+    expect(validateRedelegatedConstraint(parent, requested).ok).toBe(true);
+  });
+
+  test('[Case 37] requested budget > parent budget -> deny', () => {
+    const parent = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 5 });
+    const requested = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 10 });
+    const d = validateRedelegatedConstraint(parent, requested);
+    expect(d.ok).toBe(false);
+    expect(d.budgetExceeded).toBe(true);
+  });
+
+  test('parent budget null (unconstrained) + requested budget set -> allow (parent has no ceiling to violate)', () => {
+    const parent = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: null });
+    const requested = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 5 });
+    expect(validateRedelegatedConstraint(parent, requested).ok).toBe(true);
+  });
+
+  test('parent budget set + requested budget null (inherits parent) -> allow', () => {
+    const parent = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: 5 });
+    const requested = delegationConstraintFromBinding({ maxConcurrent: null, budgetUsdPerDay: null });
+    expect(validateRedelegatedConstraint(parent, requested).ok).toBe(true);
+  });
+});
+
+describe('evaluateRedelegation — composite decision, stable reason-code priority', () => {
+  const boundCap = capabilityFromBinding({ tools: ['search', 'put_page'], sourceId: 'default', slugPrefixes: ['wiki/'] });
+  const okRequested = requestedCapability(['search'], 'default', ['wiki/x/*']);
+  const excessRequested = requestedCapability(['search', 'delete_page'], 'default', ['wiki/x/*']);
+
+  test('[Case 42] granted + depth 0 + subset ok -> allow, childDelegationDepth=1', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 0,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d).toEqual({ allowed: true, childDelegationDepth: 1 });
+  });
+
+  test('[Case 43] granted + depth 4 + subset ok -> allow, childDelegationDepth=5 (at the max)', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 4,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d).toEqual({ allowed: true, childDelegationDepth: 5 });
+  });
+
+  test('[Case 44] redelegation not granted -> "redelegation_not_granted"', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: ['search'], // no adapter name
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 0,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('redelegation_not_granted');
+  });
+
+  test('[Case 45] depth already at 5 -> "delegation_depth_exceeded"', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 5,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('delegation_depth_exceeded');
+  });
+
+  test('[Case 46] invalid depth (negative) -> "invalid_delegation_depth"', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: -1,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 47] redelegation granted + depth ok + requested Capability exceeds parent -> "delegated_capability_exceeds_parent"', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 0,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: excessRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('delegated_capability_exceeds_parent');
+  });
+
+  test('[Case 48] redelegation NOT granted AND depth exceeded simultaneously -> "redelegation_not_granted" wins (stable priority: redelegation check runs first)', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: ['search'], // no adapter name
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 5, // also exceeded
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('redelegation_not_granted');
+  });
+
+  test('[Case 49] invalid depth AND Capability excess simultaneously -> "invalid_delegation_depth" wins (depth check runs before Capability check)', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: NaN,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: excessRequested,
+    });
+    expect(d.allowed).toBe(false);
+    expect((d as { reason: string }).reason).toBe('invalid_delegation_depth');
+  });
+
+  test('[Case 50] on allow, the returned decision does not silently narrow or rewrite the requested Capability (grant-time Capability is the adapter\'s responsibility, not this function\'s)', () => {
+    const d = evaluateRedelegation({
+      parentAllowedTools: [DELEGATED_SUBMIT_TOOL_NAME],
+      delegatedSubmitToolName: DELEGATED_SUBMIT_TOOL_NAME,
+      parentDelegationDepth: 0,
+      parentEffectiveCapability: boundCap,
+      requestedChildCapability: okRequested,
+    });
+    // The decision on allow carries ONLY {allowed, childDelegationDepth} —
+    // no capability field to silently mutate/narrow at all.
+    expect(Object.keys(d).sort()).toEqual(['allowed', 'childDelegationDepth']);
+  });
+
+  test('depth-exceeded vs invalid-depth reasons are mutually exclusive by construction (no depth value can trigger both)', () => {
+    // Documents the priority-list ordering claim structurally: exceeding
+    // the max only ever happens for a valid (integer, non-negative) depth.
+    for (const depth of [5, 6, 100]) {
+      const d = nextDelegationDepth(depth);
+      expect((d as { reason?: string }).reason).toBe('delegation_depth_exceeded');
+    }
+    for (const depth of [-1, 0.5, NaN, Infinity, -Infinity]) {
+      const d = nextDelegationDepth(depth);
+      expect((d as { reason?: string }).reason).toBe('invalid_delegation_depth');
     }
   });
 });
