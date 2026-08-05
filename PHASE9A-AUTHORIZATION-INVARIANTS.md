@@ -48,9 +48,9 @@
 - **違反例**: 委任先ジョブが、委任元Clientの`bound_tools`に含まれないツールを呼び出せる実装。委任先ジョブが委任元Clientの書き込みsourceと異なるsourceへ書き込める実装。
 - **検証方法**: 委任リクエストで委任元のCapabilityを超える`allowed_tools`/`allowed_slug_prefixes`を要求した場合に`permission_denied`で拒否されることを確認する。加えて、委任先が実際にツールを行使する経路(subagentのツールレジストリ)でも同じ包含判定が効いていることをコードパス追跡で確認する。
 - **対応テスト候補**: 既存テスト(`test/operations-allow-list.test.ts`・`test/submit-agent.test.ts`の`submit_agent`サブセット検証テスト)を維持し、Phase 9E以降の汎用化実装でも同一のテストケースが通ることを回帰確認する。加えて、grant時とexercise時の判定が同一述語を共有していること(`isRequestedSlugPrefixWithinBound`と`matchesSlugAllowList`の整合、`dashboard-5krlu`由来)をproperty-basedで確認する。
-- **既知の未充足(Phase 9E-2で是正予定)**:
-  1. `bound_source_id`が未設定の場合、委任ジョブの実行時sourceは委任元Clientの`source_id`ではなく`'default'`になる(`src/core/minions/tools/brain-allowlist.ts`の`buildOpContext`)。名前空間軸の部分集合性がsourceについて現在成立していない(Beads `dashboard-z7a1o`で追跡)。
-  2. 委任先のツール実行は`authorizeOperation()`/`hasScope()`を経由しない(`src/core/minions/tools/brain-allowlist.ts`の`execute`、`buildOpContext`は`auth`を設定しない)。包含はgrant時のみ検証され、exercise時は`enforceSubagentSlugFence`と`bound_tools`フィルタで代替されている。
+- **既知の未充足**:
+  1. `bound_source_id`が未設定の場合、委任ジョブの実行時sourceは委任元Clientの`source_id`ではなく`'default'`になる(`src/core/minions/tools/brain-allowlist.ts`の`buildOpContext`)。名前空間軸の部分集合性がsourceについて現在成立していない(Beads `dashboard-z7a1o`で追跡。**Phase 9E-2aで是正済み**: `submit_agent`のgrant-timeに`no_source_binding`チェックを追加、`bound_source_id`未設定の委任元は`allowed_tools`が1件以上ある限り拒否されるようになった。`buildOpContext`自体の`sourceId ?? 'default'`はcycle.tsの正当な既存利用と共有されるため意図的に未変更のまま)。
+  2. ~~委任先のツール実行は`authorizeOperation()`/`hasScope()`を経由しない~~ **Phase 9E-2dで是正済み(dashboard-2i56j, 2026-08-05)**: `src/core/minions/tools/brain-allowlist.ts`の`execute()`が、`submit_agent`経由で委任されたジョブ(job data`__owner_client_id`が設定されている場合)に限り、ツール実行の都度、委任元OAuth Clientの**現在の**`scope`/`deleted_at`をDBから再解決し(grant時のjob data snapshotではない)、`authorizeOperation()`でゲートする。委任元が見つからない/失効している場合は`delegated_client_not_found`、現在scopeが不足する場合は`insufficient_scope`のreason_codeで`permission_denied`を返し、`op.handler`本体は呼ばれない。`ownerClientId`が未設定の非委任経路(cycle.tsの子ジョブ等)はこのゲートの対象外(意図的なスコープ外、既存挙動を維持)。多段委任・孫委任は引き続き未対応。
 
 ## AUTHZ-INV-006: 各階層で委任は再評価され、委任元の失効は委任先へ伝播する
 
@@ -87,7 +87,7 @@
 ## AUTHZ-INV-010: プロトコルアダプターは認可コアを迂回できない
 
 - **規則**: MCP・HTTP・CLI・管理画面・将来のプロトコルアダプターのいずれも、認証結果・Principal(または未確定状態)・Client・Credential検証結果・Session・Execution Instance・要求Capability・対象Resource・Delegation context・信頼境界情報を認可コアへ渡すのみとし、アダプター自身が最終許可判断を完結させてはならない。ネットワーク到達制御・構文検証・レート制限等のアダプター固有処理は分離して保持してよい。GitHub Webhookのようにそもそも主体認証(Principal/Client識別)を伴わないメッセージ真正性検証のみのアダプターは、本条件の対象外とする(`PHASE9A-CURRENT-STATE-AUDIT.md`§2「認証機構の分類」参照)。
-- **理由**: `PHASE9A-SUPPLEMENTAL-AUDIT.md`§2で確認した通り、現状の管理画面(`requireAdmin`)は認可コア(`hasScope`)を経由しない独立した最終判断を下しており、この不変条件に**現時点で違反している**(Phase 9Dで是正対象)。
+- **理由**: `PHASE9A-SUPPLEMENTAL-AUDIT.md`§2で確認した通り、現状の管理画面(`requireAdmin`)は認可コア(`hasScope`)を経由しない独立した最終判断を下しており、この不変条件に**現時点で違反している**(Phase 9Dで是正対象)。同様に、委任先ジョブのツール実行アダプター(`src/core/minions/tools/brain-allowlist.ts`)もPhase 9E-1時点では`authorizeOperation()`を経由せず`op.handler`を直接呼んでいたが、**Phase 9E-2dで是正済み**(AUTHZ-INV-005の記載参照)。
 - **違反例**: 現行の`requireAdmin`ミドルウェアが、`hasScope`を一切呼び出さずに「Cookie一致=全操作許可」を単独で完結させている状態。
 - **検証方法**: 各アダプターのエントリポイントが、最終的に共通のPolicy Decision関数(`hasScope`相当)を経由してから初めてハンドラ本体を実行することを、コードパス追跡で確認する。
 - **対応テスト候補**: 管理画面・MCP・HTTPそれぞれについて、共通のPolicy Decision関数にモックを仕込み、全アダプターがそれを実際に呼び出すことを確認する統合テスト(Phase 9D実装時に追加)。

@@ -35,7 +35,30 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await engine.executeRaw('DELETE FROM pages');
+  // Phase 9E-2d: fixtures below seed oauth_clients rows per test (Case J
+  // isolation requirement) — wipe both tables so a client_id reused across
+  // tests never inherits a prior test's scope/deleted_at state.
+  await engine.executeRaw('DELETE FROM oauth_tokens');
+  await engine.executeRaw('DELETE FROM oauth_clients');
 });
+
+/** Phase 9E-2d test fixture: seed a minimal oauth_clients row. */
+interface SeedDelegatingClientOpts {
+  clientId: string;
+  scope?: string;
+  deleted?: boolean;
+}
+
+async function seedDelegatingClient(opts: SeedDelegatingClientOpts): Promise<void> {
+  await engine.executeRaw(
+    `INSERT INTO oauth_clients
+       (client_id, client_name, client_secret_hash, scope, grant_types,
+        redirect_uris, token_endpoint_auth_method, created_at, deleted_at)
+     VALUES ($1, $1, '', $2, ARRAY['client_credentials'],
+             ARRAY[]::text[], 'client_secret_post', now(), $3)`,
+    [opts.clientId, opts.scope ?? 'read agent', opts.deleted ? new Date().toISOString() : null],
+  );
+}
 
 describe('BRAIN_TOOL_ALLOWLIST', () => {
   test('every name exists in src/core/operations.ts OPERATIONS', () => {
@@ -210,6 +233,174 @@ describe('filterAllowedTools', () => {
   test('empty array yields empty registry', () => {
     const tools = buildBrainTools({ subagentId: 1, engine, config });
     expect(filterAllowedTools(tools, [])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 9E-2d (dashboard-2i56j, AUTHZ-INV-005/006/010/013): delegated tool
+// execution must go through authorizeOperation() using the OWNER CLIENT's
+// CURRENT scope (re-resolved from DB at exercise time), not a static grant-
+// time snapshot. Gate only activates when ownerClientId is supplied — cycle/
+// dream's non-delegated child jobs never set it (Case H), so their existing
+// behavior is untouched by design (see PHASE9E-IMPLEMENTATION-SCOPE.md §... /
+// AUTHZ-INV-010 "protocol adapters cannot bypass the authorization core").
+// ---------------------------------------------------------------------------
+describe('delegated tool execution authorization (Phase 9E-2d, AUTHZ-INV-005/006/010/013)', () => {
+  test('[Case A] valid owner client + sufficient scope + explicit source/slug binding -> succeeds via authorizeOperation()', async () => {
+    await seedDelegatingClient({ clientId: 'agent-a', scope: 'write agent' });
+    const tools = buildBrainTools({
+      subagentId: 1, engine, config, ownerClientId: 'agent-a',
+      allowedSlugPrefixes: ['wiki/personal/*'], sourceId: 'default',
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 501, remote: true };
+    const res = await putPage.execute(
+      { slug: 'wiki/personal/case-a', content: '---\ntitle: A\n---\nbody' },
+      ctx,
+    );
+    expect(res).toBeTruthy();
+  });
+
+  test('[Case B] owner client not found in DB -> fail-closed, tool body not executed', async () => {
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'ghost-client' });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 502, remote: true };
+    await expect(
+      putPage.execute({ slug: 'wiki/agents/1/x', content: '---\ntitle: x\n---\nb' }, ctx),
+    ).rejects.toBeInstanceOf(OperationError);
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages WHERE slug = 'wiki/agents/1/x'`,
+    );
+    expect(rows[0].n).toBe(0);
+  });
+
+  test('[Case C] owner client soft-deleted -> exercise-time deny, static job payload alone is not trusted', async () => {
+    await seedDelegatingClient({ clientId: 'agent-c-revoked', scope: 'write agent', deleted: true });
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'agent-c-revoked' });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 503, remote: true };
+    await expect(
+      putPage.execute({ slug: 'wiki/agents/1/x', content: '---\ntitle: x\n---\nb' }, ctx),
+    ).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('[Case D] owner client scope no longer covers the tool -> authorizeOperation() denies, tool body not executed', async () => {
+    await seedDelegatingClient({ clientId: 'agent-d', scope: 'read agent' }); // no write
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'agent-d' });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 504, remote: true };
+    await expect(
+      putPage.execute({ slug: 'wiki/agents/1/x', content: '---\ntitle: x\n---\nb' }, ctx),
+    ).rejects.toBeInstanceOf(OperationError);
+    const rows = await engine.executeRaw<{ n: number }>(
+      `SELECT count(*)::int AS n FROM pages WHERE slug = 'wiki/agents/1/x'`,
+    );
+    expect(rows[0].n).toBe(0);
+  });
+
+  test('[Case D variant] admin-scoped tool (file_list) denied for an owner client with no admin scope', async () => {
+    await seedDelegatingClient({ clientId: 'agent-d2', scope: 'write agent' }); // no admin
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'agent-d2' });
+    const fileList = tools.find(t => t.name === 'brain_file_list')!;
+    const ctx: ToolCtx = { engine, jobId: 505, remote: true };
+    await expect(fileList.execute({}, ctx)).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('[Case E] source scoping is unchanged by the new authz gate — no implicit default, still writes to the job-scoped sourceId', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config, archived, created_at)
+       VALUES ('case-e-source', 'Case E', '/tmp/case-e', '{}'::jsonb, false, now())
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await seedDelegatingClient({ clientId: 'agent-e', scope: 'write agent' });
+    const tools = buildBrainTools({
+      subagentId: 1, engine, config, ownerClientId: 'agent-e',
+      allowedSlugPrefixes: ['wiki/personal/*'], sourceId: 'case-e-source',
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 506, remote: true };
+    await putPage.execute(
+      { slug: 'wiki/personal/case-e', content: '---\ntitle: E\n---\nbody' },
+      ctx,
+    );
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages WHERE slug = 'wiki/personal/case-e'`,
+    );
+    expect(rows[0].source_id).toBe('case-e-source');
+  });
+
+  test('[Case F] slug-prefix fence still rejects out-of-bound writes even with a valid delegated auth context (no double-judgment conflict)', async () => {
+    await seedDelegatingClient({ clientId: 'agent-f', scope: 'write agent' });
+    const tools = buildBrainTools({
+      subagentId: 1, engine, config, ownerClientId: 'agent-f',
+      allowedSlugPrefixes: ['wiki/personal/*'],
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 507, remote: true };
+    await expect(
+      putPage.execute({ slug: 'wiki/forbidden/x', content: '---\ntitle: x\n---\nb' }, ctx),
+    ).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('[Case G] a tool outside grant-time allowed_tools is unreachable regardless of the owner client\'s scope', async () => {
+    await seedDelegatingClient({ clientId: 'agent-g', scope: 'admin agent' }); // full scope
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'agent-g' });
+    const filtered = filterAllowedTools(tools, ['get_page']); // grant-time only allowed get_page
+    expect(filtered.find(t => t.name === 'brain_put_page')).toBeUndefined();
+  });
+
+  test('[Case H] ownerClientId unset (cycle/dream non-delegated path) -> authz gate is skipped, existing behavior unchanged', async () => {
+    // No oauth_clients row seeded at all — if the gate ran unconditionally,
+    // this would fail-closed. It must not: cycle.ts's child jobs never set
+    // ownerClientId and must keep working exactly as before Phase 9E-2d.
+    const tools = buildBrainTools({
+      subagentId: 1, engine, config,
+      allowedSlugPrefixes: ['wiki/personal/*'],
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 508, remote: true };
+    const res = await putPage.execute(
+      { slug: 'wiki/personal/case-h', content: '---\ntitle: H\n---\nbody' },
+      ctx,
+    );
+    expect(res).toBeTruthy();
+  });
+
+  test('[Case I] deny audit event records the actual denial with reason_code + correlation_id', async () => {
+    await seedDelegatingClient({ clientId: 'agent-i', scope: 'read agent' }); // no write
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: 'agent-i' });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 509, remote: true };
+    await expect(
+      putPage.execute({ slug: 'wiki/agents/1/x', content: '---\ntitle: x\n---\nb' }, ctx),
+    ).rejects.toBeInstanceOf(OperationError);
+    const rows = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT decision, outcome, reason_code, client_id, correlation_id FROM audit_events
+        WHERE client_id = $1 ORDER BY recorded_at DESC LIMIT 1`,
+      ['agent-i'],
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0].decision).toBe('denied');
+    expect(rows[0].outcome).toBe('rejected');
+    expect(rows[0].reason_code).toBe('insufficient_scope');
+    expect(rows[0].correlation_id).toBeTruthy();
+  });
+
+  test('[Case J] test isolation: a client_id seeded fresh (not deleted) in a later test is not tainted by an earlier test that soft-deleted the same id', async () => {
+    // beforeEach wipes oauth_clients entirely — a fresh valid seed of the
+    // SAME id Case C soft-deleted must succeed here, proving no leakage.
+    await seedDelegatingClient({ clientId: 'agent-c-revoked', scope: 'write agent' }); // NOT deleted this time
+    const tools = buildBrainTools({
+      subagentId: 1, engine, config, ownerClientId: 'agent-c-revoked',
+      allowedSlugPrefixes: ['wiki/personal/*'],
+    });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const ctx: ToolCtx = { engine, jobId: 510, remote: true };
+    const res = await putPage.execute(
+      { slug: 'wiki/personal/case-j', content: '---\ntitle: J\n---\nbody' },
+      ctx,
+    );
+    expect(res).toBeTruthy();
   });
 });
 

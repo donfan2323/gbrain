@@ -24,10 +24,14 @@
 
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
-import { operations } from '../../operations.ts';
-import type { Operation, OperationContext } from '../../operations.ts';
+import { operations, OperationError } from '../../operations.ts';
+import type { Operation, OperationContext, AuthInfo } from '../../operations.ts';
 import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import { validateSourceId } from '../../utils.ts';
+import { authorizeOperation, parseScopeString } from '../../scope.ts';
+import { sqlQueryForEngine } from '../../sql-query.ts';
+import { writeAuditEvent } from '../../audit/audit-events-writer.ts';
+import { randomUUID } from 'node:crypto';
 import type { ToolCtx, ToolDef } from '../types.ts';
 
 /**
@@ -209,6 +213,17 @@ export interface BuildBrainToolsOpts {
    * Unset → legacy 'default'.
    */
   sourceId?: string;
+  /**
+   * Phase 9E-2d (dashboard-2i56j, AUTHZ-INV-005/006/010): the OAuth
+   * client_id that delegated this job (SubagentHandlerData.__owner_client_id,
+   * written by submit_agent's jobData at grant time). When set, every
+   * tool-call re-resolves this client's CURRENT scope/deleted_at from the
+   * DB and gates the call through authorizeOperation() — closing the AUTHZ-
+   * INV-005 gap where exercise-time execution bypassed the authorization
+   * core entirely. When unset (cycle.ts's non-delegated child jobs never
+   * set it), the gate is skipped and behavior is unchanged from pre-9E-2d.
+   */
+  ownerClientId?: string;
 }
 
 interface OpContextDeps {
@@ -220,6 +235,7 @@ interface OpContextDeps {
   brainId?: string;
   allowedSlugPrefixes?: readonly string[];
   sourceId?: string;
+  auth?: AuthInfo;
 }
 
 function buildOpContext(deps: OpContextDeps): OperationContext {
@@ -242,7 +258,108 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     allowedSlugPrefixes: deps.allowedSlugPrefixes
       ? [...deps.allowedSlugPrefixes]
       : undefined,
+    // Phase 9E-2d: undefined for non-delegated (ownerClientId-less) child
+    // jobs, matching pre-9E-2d behavior exactly (OperationContext.auth was
+    // always undefined here before this phase).
+    auth: deps.auth,
   };
+}
+
+/**
+ * Phase 9E-2d — re-resolve the delegating OAuth client's CURRENT state from
+ * the DB (not the job payload snapshot) so exercise-time authorization
+ * reflects revoke/scope-change since grant time (AUTHZ-INV-006/014: a
+ * Credential/snapshot does not embed Capability; Capability is resolved
+ * from the current Client row at decision time). `deleted_at IS NULL`
+ * catches BOTH revocation paths in this codebase: the CLI's hard DELETE
+ * (src/commands/auth.ts revokeClient — zero rows either way) and the admin
+ * console's soft-delete (`UPDATE oauth_clients SET deleted_at = now()`).
+ *
+ * principal_id is threaded through for audit attribution ONLY (AUTHZ-INV-
+ * 001/003/004: Principal never participates in the authorization decision
+ * itself — only `scopes` does, via authorizeOperation()/hasScope()).
+ */
+async function resolveDelegatedAuth(
+  engine: BrainEngine,
+  ownerClientId: string,
+): Promise<{ ok: true; auth: AuthInfo } | { ok: false; reasonCode: string; message: string }> {
+  const sql = sqlQueryForEngine(engine);
+  const rows = await sql`
+    SELECT client_id, client_name, scope, principal_id
+      FROM oauth_clients
+     WHERE client_id = ${ownerClientId} AND deleted_at IS NULL
+  `;
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      reasonCode: 'delegated_client_not_found',
+      message: `delegated tool execution: owner client "${ownerClientId}" was not found or is no longer active. The delegating job cannot be re-authorized.`,
+    };
+  }
+  const row = rows[0] as {
+    client_id: string;
+    client_name: string;
+    scope: string | null;
+    principal_id: string | null;
+  };
+  return {
+    ok: true,
+    auth: {
+      token: '(delegated — re-resolved from oauth_clients, no live token)',
+      clientId: row.client_id,
+      clientName: row.client_name,
+      scopes: parseScopeString(row.scope),
+      principalId: row.principal_id ?? undefined,
+      credentialSource: 'oauth_client',
+    },
+  };
+}
+
+/**
+ * Phase 9E-2d — record a delegated-execution denial. Mirrors submit_agent's
+ * grant-time `auditDeny` pattern (operations.ts) but for the exercise-time
+ * gate: same `class2_denial` failure policy (fail-open write, never blocks
+ * the deny decision itself — §7-1 of PHASE9C-FAILURE-AND-DURABILITY-
+ * POLICY.md), same `operation.request` event_kind the HTTP/MCP adapters use
+ * for their own scope-denial audit rows (serve-http.ts) — no new event_kind
+ * introduced. `channel_id: 'internal'` because this fires from the job
+ * worker's tool-dispatch loop, not a live protocol connection.
+ */
+async function auditDelegatedDeny(
+  engine: BrainEngine,
+  opName: string,
+  requiredScope: string | null,
+  ownerClientId: string,
+  reasonCode: string,
+  message: string,
+): Promise<void> {
+  await writeAuditEvent(engine, {
+    envelope_version: 1,
+    occurred_at: new Date().toISOString(),
+    event_kind: 'operation.request',
+    channel_id: 'internal',
+    attribution_state: 'client_only',
+    principal_id: null,
+    client_id: ownerClientId,
+    actor_label: ownerClientId,
+    credential_ref: null,
+    operation: opName,
+    required_scope: requiredScope,
+    scopes_snapshot: null,
+    decision: 'denied',
+    outcome: 'rejected',
+    reason_code: reasonCode,
+    resource_kind: 'brain_tool',
+    resource_ref: opName,
+    source_id: null,
+    job_id: null,
+    correlation_id: randomUUID(),
+    parent_event_id: null,
+    latency_ms: null,
+    params_summary: null,
+    adapter: { jsonrpc_method: 'tools/call', tool: `brain_${opName}` },
+    errorMessageRaw: message,
+  }, { class: 'class2_denial' });
 }
 
 /**
@@ -284,6 +401,31 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
       // Keyed by the unprefixed op name. Undefined when no hint is registered.
       usage_hint: BRAIN_TOOL_USAGE_HINTS[op.name],
       async execute(input: unknown, ctx: ToolCtx): Promise<unknown> {
+        // Phase 9E-2d (dashboard-2i56j, AUTHZ-INV-005/006/010): re-resolve
+        // + gate ONLY when this job was delegated via submit_agent
+        // (ownerClientId set). Non-delegated child jobs (cycle.ts) skip
+        // this block entirely — identical to pre-9E-2d behavior.
+        let auth: AuthInfo | undefined;
+        if (opts.ownerClientId !== undefined) {
+          const resolved = await resolveDelegatedAuth(ctx.engine, opts.ownerClientId);
+          if (!resolved.ok) {
+            await auditDelegatedDeny(
+              ctx.engine, op.name, op.scope ?? 'read', opts.ownerClientId,
+              resolved.reasonCode, resolved.message,
+            );
+            throw new OperationError('permission_denied', resolved.message);
+          }
+          auth = resolved.auth;
+          const { allowed, requiredScope } = authorizeOperation(auth.scopes, op);
+          if (!allowed) {
+            const msg = `brain tool "${op.name}" requires scope "${requiredScope}", but owner client "${opts.ownerClientId}"'s current scopes (${auth.scopes.join(', ') || '(none)'}) do not satisfy it.`;
+            await auditDelegatedDeny(
+              ctx.engine, op.name, requiredScope, opts.ownerClientId,
+              'insufficient_scope', msg,
+            );
+            throw new OperationError('permission_denied', msg);
+          }
+        }
         const opCtx = buildOpContext({
           engine: ctx.engine,
           config: opts.config,
@@ -293,6 +435,7 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
           brainId: opts.brainId,
           allowedSlugPrefixes: opts.allowedSlugPrefixes,
           sourceId: opts.sourceId,
+          auth,
         });
         const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
         return op.handler(opCtx, params);

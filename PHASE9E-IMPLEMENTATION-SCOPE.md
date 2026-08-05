@@ -39,7 +39,7 @@ Phase 9E-1は**挙動保存を原則とする**。「挙動保存」とは、既
 - AUTHZ-INV-017のenforce切替(拒否化)。
 - AUTHZ-INV-016のレガシーsandbox opt-out(fail-closed)モード。
 - `bound_source_id`未設定時の`'default'`フォールバック是正(`dashboard-z7a1o`) — 挙動変更を伴うため9E-2。
-- 子ジョブ実行経路への`authorizeOperation()`導入(AUTHZ-INV-010の委任経路への適用) — 影響範囲が広く9E-2。
+- 子ジョブ実行経路への`authorizeOperation()`導入(AUTHZ-INV-010の委任経路への適用) — 影響範囲が広く9E-2。**Phase 9E-2dで実装済み(dashboard-2i56j, 2026-08-05)**: `src/core/minions/tools/brain-allowlist.ts`の`execute()`が、`submit_agent`委任ジョブ(`ownerClientId`設定時)に限り、委任元Clientの現在scopeをDB再解決した上で既存の`hasScope`/`authorizeOperation()`(変更なし、そのまま再利用)を通す。詳細は`PHASE9A-AUTHORIZATION-INVARIANTS.md`のAUTHZ-INV-005/010を参照。多段委任・孫委任・AUTHZ-INV-017のenforce切替はこのフェーズでも未実施のまま。
 - 隣接発見6件(`dashboard-7nqk9`・`dashboard-037qj`・`dashboard-1etlb`・`dashboard-z7a1o`・`dashboard-yug65`・`dashboard-vpfmz`)の実装 — Phase 9E設計とは独立、または9E-2対応。今回の文書確定作業では一切のコード修正を行わない。
 
 ### 2-4. Phase 9E-1完了後に追加した9E-2準備作業(`dashboard-v3mjk`、2026-08-03)

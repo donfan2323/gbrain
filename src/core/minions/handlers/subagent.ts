@@ -274,6 +274,11 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       allowedSlugPrefixes: data.allowed_slug_prefixes,
       // #1586: cycle-resolved source scope for tool-call OperationContexts.
       sourceId: data.source_id,
+      // Phase 9E-2d (dashboard-2i56j): present only for submit_agent-
+      // delegated jobs (jobData.__owner_client_id, set at grant time).
+      // cycle.ts's own child jobs never set this key, so they keep
+      // buildBrainTools's pre-9E-2d behavior unchanged.
+      ownerClientId: data.__owner_client_id,
     });
     const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
       ? filterAllowedTools(registry, data.allowed_tools)

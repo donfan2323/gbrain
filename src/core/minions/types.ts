@@ -504,6 +504,17 @@ export interface SubagentHandlerData {
    * Read by audit + diagnostic surfaces (jobs get / dashboard).
    */
   self_fix_cluster?: string;
+  /**
+   * Phase 9E-1 (src/core/operations.ts submit_agent) — the OAuth client_id
+   * that delegated this job. Already written into job data by submit_agent
+   * (`jobData.__owner_client_id = clientId`); this field only makes the
+   * existing key visible to TypeScript so subagent.ts can pass it through
+   * to buildBrainTools without an `as any` cast. Omitted for non-delegated
+   * child jobs (cycle.ts's synthesize/patterns phases queue.add() directly
+   * and never set this key) — Phase 9E-2d's delegated-execution authz gate
+   * in brain-allowlist.ts activates ONLY when this is present.
+   */
+  __owner_client_id?: string;
 }
 
 /**

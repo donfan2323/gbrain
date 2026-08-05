@@ -734,3 +734,103 @@ describe('AUTHZ-INV-010: requireAdmin() routes its final allow/deny decision thr
     expect(allowedCheckIndex).toBeLessThan(nextIndex);
   });
 });
+
+// ---------------------------------------------------------------------------
+// AUTHZ-INV-010 (delegated exercise path) / AUTHZ-INV-005 (exercise-time
+// monotonicity) / AUTHZ-INV-006 (groundwork) — Phase 9E-2d (dashboard-2i56j).
+//
+// The requireAdmin() block above proves the ADMIN HTTP adapter routes
+// through authorizeOperation(). This block proves the SAME is now true of
+// the delegated subagent tool-dispatch path (src/core/minions/tools/
+// brain-allowlist.ts), which is a second, independent "protocol adapter" in
+// AUTHZ-INV-010's sense (a job-worker tool loop, not an HTTP/MCP transport)
+// that used to build an OperationContext with NO `auth` and call
+// op.handler() directly — bypassing the authorization core entirely
+// (documented as AUTHZ-INV-005's "既知の未充足" item 2 before this phase).
+// ---------------------------------------------------------------------------
+describe('AUTHZ-INV-010/005/006: delegated subagent tool execution routes through the authorization core (Phase 9E-2d)', () => {
+  test('AUTHZ-INV-010: a delegated tool call is denied via authorizeOperation() (insufficient_scope), not silently allowed by the allow-list adapter', async () => {
+    const { buildBrainTools } = await import('../src/core/minions/tools/brain-allowlist.ts');
+    const { OperationError } = await import('../src/core/operations.ts');
+    const clientName = `inv010-delegated-${Date.now()}-${Math.random()}`;
+    const { clientId } = await provider.registerClientManual(clientName, ['client_credentials'], 'read agent');
+    const config = { engine: 'pglite' } as any;
+    const tools = buildBrainTools({ subagentId: 1, engine, config, ownerClientId: clientId });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    await expect(
+      putPage.execute(
+        { slug: `wiki/agents/1/inv010-${Date.now()}`, content: '---\ntitle: x\n---\nbody' },
+        { engine, jobId: 9001, remote: true },
+      ),
+    ).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('AUTHZ-INV-005 exercise-time monotonicity: shrinking the owner client\'s scope after grant denies a tool the child previously could have used — exercise-time never exceeds the CURRENT parent scope', async () => {
+    const { buildBrainTools } = await import('../src/core/minions/tools/brain-allowlist.ts');
+    const clientName = `inv005-monotone-${Date.now()}-${Math.random()}`;
+    const { clientId } = await provider.registerClientManual(clientName, ['client_credentials'], 'write agent');
+    const config = { engine: 'pglite' } as any;
+    const tools = buildBrainTools({ subagentId: 2, engine, config, ownerClientId: clientId });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+
+    // Before scope shrink: write scope covers put_page (required_scope='write').
+    const okRes = await putPage.execute(
+      { slug: `wiki/agents/2/inv005-before-${Date.now()}`, content: '---\ntitle: before\n---\nbody' },
+      { engine, jobId: 9002, remote: true },
+    );
+    expect(okRes).toBeTruthy();
+
+    // Simulate the owner client's scope being reduced after this job's
+    // grant-time (an operator re-scoping the client, or a future policy
+    // change) — no NEW job, no NEW grant, same already-delegated job.
+    await sql`UPDATE oauth_clients SET scope = 'read agent' WHERE client_id = ${clientId}`;
+
+    const { OperationError } = await import('../src/core/operations.ts');
+    await expect(
+      putPage.execute(
+        { slug: `wiki/agents/2/inv005-after-${Date.now()}`, content: '---\ntitle: after\n---\nbody' },
+        { engine, jobId: 9002, remote: true },
+      ),
+    ).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('AUTHZ-INV-006 groundwork: owner client revoke (soft-delete) denies the delegated job\'s NEXT tool call — a prior grant-time success does not keep permitting new tool calls', async () => {
+    const { buildBrainTools } = await import('../src/core/minions/tools/brain-allowlist.ts');
+    const { OperationError } = await import('../src/core/operations.ts');
+    const clientName = `inv006-revoke-${Date.now()}-${Math.random()}`;
+    const { clientId } = await provider.registerClientManual(clientName, ['client_credentials'], 'write agent');
+    const config = { engine: 'pglite' } as any;
+    const tools = buildBrainTools({ subagentId: 3, engine, config, ownerClientId: clientId });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+
+    const okRes = await putPage.execute(
+      { slug: `wiki/agents/3/inv006-before-${Date.now()}`, content: '---\ntitle: before\n---\nbody' },
+      { engine, jobId: 9003, remote: true },
+    );
+    expect(okRes).toBeTruthy();
+
+    // Admin-console-style soft-delete (src/commands/serve-http.ts
+    // /admin/api/revoke-client): UPDATE ... SET deleted_at = now().
+    await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId}`;
+
+    await expect(
+      putPage.execute(
+        { slug: `wiki/agents/3/inv006-after-${Date.now()}`, content: '---\ntitle: after\n---\nbody' },
+        { engine, jobId: 9003, remote: true },
+      ),
+    ).rejects.toBeInstanceOf(OperationError);
+  });
+
+  test('non-delegated child jobs (ownerClientId unset — cycle.ts\'s own path) are unaffected: no authz gate runs, existing behavior unchanged', async () => {
+    const { buildBrainTools } = await import('../src/core/minions/tools/brain-allowlist.ts');
+    const config = { engine: 'pglite' } as any;
+    // No oauth_clients row involved at all — proves the gate is opt-in.
+    const tools = buildBrainTools({ subagentId: 4, engine, config });
+    const putPage = tools.find(t => t.name === 'brain_put_page')!;
+    const res = await putPage.execute(
+      { slug: `wiki/agents/4/inv-nondelegated-${Date.now()}`, content: '---\ntitle: x\n---\nbody' },
+      { engine, jobId: 9004, remote: true },
+    );
+    expect(res).toBeTruthy();
+  });
+});
