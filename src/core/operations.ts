@@ -3290,6 +3290,26 @@ const submit_agent: Operation = {
 
     // Validate each param against the binding.
     const requestedTools = (p.allowed_tools as string[] | undefined) ?? boundTools;
+
+    // AUTHZ-INV-005 (dashboard-z7a1o, Phase 9E-2a): bound_source_id unset
+    // means the source axis of both the write and read namespace is
+    // ungranted — same "NULL != unrestricted" posture AUTHZ-INV-016
+    // established for bound_slug_prefixes. Every BRAIN_TOOL_ALLOWLIST
+    // operation (src/core/minions/tools/brain-allowlist.ts) is source-
+    // scoped, so a client with no source binding cannot delegate ANY
+    // brain-tool access — the prior behavior silently let buildOpContext's
+    // `sourceId ?? 'default'` grant an implicit namespace never actually
+    // bound to this client. Scoped to requestedTools.length > 0 (not a
+    // blanket source requirement) so a delegation that hands the child no
+    // tools at all is unaffected. cycle.ts's own delegated child jobs are a
+    // separate, non-submit_agent code path and are not touched by this
+    // check.
+    if (boundSource === null && requestedTools.length > 0) {
+      const msg = `submit_agent: client ${clientId} has no bound_source_id binding but requested tool(s) (${requestedTools.join(', ')}) that require a source-scoped namespace. Re-register with --bound-source.`;
+      await auditDeny('no_source_binding', msg);
+      throw new OperationError('permission_denied', msg);
+    }
+
     const requestedToolsCapability = requestedCapability(requestedTools, boundSource, null);
     const toolCheck = capabilitySubset(requestedToolsCapability, boundCapability);
     if (!toolCheck.ok) {

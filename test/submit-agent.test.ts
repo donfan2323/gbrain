@@ -158,6 +158,82 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
     });
   });
 
+  describe('bound_source_id requirement (AUTHZ-INV-005, dashboard-z7a1o, Phase 9E-2a)', () => {
+    it('[Case A] refuses delegation when bound_source_id is NULL and tools are requested — no implicit default fallback', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search', 'get_page'],
+        bound_source_id: null, // explicitly unset — the case under test
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_tools: ['search'],
+      })).rejects.toThrow(/no bound_source_id binding/i);
+    });
+
+    it('[Case A variant] no tools requested with bound_source_id NULL does not trigger the check — narrower than a blanket source requirement', async () => {
+      await seedClient('cursor', {
+        bound_tools: [],
+        bound_source_id: null,
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_tools: [],
+      });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Case B] allows delegation when bound_source_id is explicitly set — existing正常系 preserved', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search', 'get_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_tools: ['search'],
+      });
+      expect(result.dry_run).toBe(true);
+      expect(result.bound_source).toBe('default');
+    });
+
+    it('[Case C] a request cannot smuggle a source_id param to escape the bound source — submit_agent has no source_id request param, effective source always derives from bound_source_id', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'wiki-source',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_tools: ['search'],
+        // Attempted injection: submit_agent's params schema has no
+        // source_id field, so this must be silently ignored, never
+        // smuggled through to widen the effective write/read namespace.
+        source_id: 'attacker-source',
+      } as any);
+      expect(result.bound_source).toBe('wiki-source');
+    });
+
+    it('[Case D] bound_source_id explicitly set to "default" is distinct from unset — allowed, not conflated with the NULL case', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default', // explicit, not omitted
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_tools: ['search'],
+      });
+      expect(result.id).toBeGreaterThan(0);
+    });
+  });
+
   describe('allowed_tools subset enforcement', () => {
     it('passes when allowed_tools ⊆ bound_tools', async () => {
       await seedClient('cursor', {
