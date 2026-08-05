@@ -49,6 +49,32 @@ beforeEach(async () => {
   // is preserved (initSchema applied in beforeAll); only the config-table
   // marker row needs re-seeding.
   await engine.setConfig('version', '85');
+  // resetPgliteState also truncates the audit_event_kinds/audit_channels
+  // registry tables (not in its PRESERVE_TABLES set) without re-running
+  // pglite-schema.ts's seed INSERTs, so any audit_events write whose
+  // event_kind/channel_id isn't re-seeded here fails its FK constraint and
+  // silently falls back to disk-spill (writeAuditEvent's class2_denial path
+  // is fail-open and never throws) — Phase 9E-2b's new tests query
+  // audit_events directly, so the rows this file's submit_agent calls
+  // actually use are restored (mirrors pglite-schema.ts's seed values).
+  await engine.executeRaw(`
+    INSERT INTO audit_event_kinds (id, label, description) VALUES
+      ('delegation.grant','Delegation Granted','Authority was delegated to an execution instance.'),
+      ('delegation.deny','Delegation Denied','A delegation attempt was refused.')
+    ON CONFLICT (id) DO NOTHING
+  `);
+  await engine.executeRaw(`
+    INSERT INTO audit_channels (id, label, description) VALUES
+      ('mcp_http','MCP over HTTP','Remote MCP JSON-RPC endpoint.'),
+      ('mcp_stdio','MCP over stdio','MCP over stdio.')
+    ON CONFLICT (id) DO NOTHING
+  `);
+  await engine.executeRaw(`
+    INSERT INTO audit_attribution_states (id, label, description) VALUES
+      ('client_only','Client Only','Client verified but oauth_clients.principal_id is null.'),
+      ('principal_attributed','Principal Attributed','Client verified and oauth_clients.principal_id is set.')
+    ON CONFLICT (id) DO NOTHING
+  `);
   tmpAuditDir = fs.mkdtempSync(path.join(os.tmpdir(), 'submit-agent-audit-'));
 });
 
@@ -92,10 +118,10 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
   );
 }
 
-function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean } = {}): any {
+function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean; config?: Record<string, unknown> } = {}): any {
   return {
     engine,
-    config: {},
+    config: opts.config ?? {},
     logger: console,
     dryRun: opts.dryRun ?? false,
     remote: opts.remote ?? true,
@@ -231,6 +257,152 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         allowed_tools: ['search'],
       });
       expect(result.id).toBeGreaterThan(0);
+    });
+  });
+
+  describe('bound_slug_prefixes strict mode (AUTHZ-INV-016, dashboard-2quyv, Phase 9E-2b)', () => {
+    it('[Case A] strict mode disabled (default) + bound_slug_prefixes unset -> legacy sandbox fallback preserved (compat baseline)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      // makeCtx's default config is {} — strict mode is off.
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(ctx, { prompt: 'go' });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Case A, explicit false] delegation_require_explicit_slug_binding: false behaves identically to unset', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        dryRun: true,
+        config: { delegation_require_explicit_slug_binding: false },
+      });
+      const result = await callSubmitAgent(ctx, { prompt: 'go' });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Case A, invalid value] a non-boolean-true config value fails open to the compat baseline (strict equality gate, no truthy coercion)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        dryRun: true,
+        // A truthy-but-not-`true` value (e.g. a stray string from a
+        // hand-edited config.json) must NOT be treated as strict mode.
+        config: { delegation_require_explicit_slug_binding: 'true' as unknown as boolean },
+      });
+      const result = await callSubmitAgent(ctx, { prompt: 'go' });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Case B] strict mode enabled + bound_slug_prefixes unset -> denied, no job submitted, deny audit event with dedicated reason_code', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        config: { delegation_require_explicit_slug_binding: true },
+      });
+      const before = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM minion_jobs`);
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'go' }),
+      ).rejects.toThrow(/no explicit bound_slug_prefixes binding/i);
+      const after = await engine.executeRaw<{ n: number }>(`SELECT COUNT(*)::int AS n FROM minion_jobs`);
+      expect(after[0].n).toBe(before[0].n);
+
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT reason_code FROM audit_events WHERE client_id = $1 AND event_kind = 'delegation.deny' ORDER BY recorded_at DESC LIMIT 1`,
+        ['cursor'],
+      );
+      expect(rows[0].reason_code).toBe('explicit_slug_binding_required');
+    });
+
+    it('[Case C] strict mode enabled + explicit bound_slug_prefixes present -> succeeds normally, narrowing preserved', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        dryRun: true,
+        config: { delegation_require_explicit_slug_binding: true },
+      });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'go',
+        allowed_slug_prefixes: ['wiki/'],
+      });
+      expect(result.dry_run).toBe(true);
+    });
+
+    it('[Case D] strict mode enabled + explicit empty array -> not treated as unrestricted, fails closed same as omission', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        config: { delegation_require_explicit_slug_binding: true },
+      });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'go', allowed_slug_prefixes: [] }),
+      ).rejects.toThrow(/no explicit bound_slug_prefixes binding/i);
+    });
+
+    it('[Case E] strict mode enabled + an out-of-bound requested prefix -> existing denial preserved, not weakened by strict mode', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({
+        clientId: 'cursor',
+        config: { delegation_require_explicit_slug_binding: true },
+      });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'go', allowed_slug_prefixes: ['private/'] }),
+      ).rejects.toThrow(/slug_prefix "private\/" is not under any.*bound_slug_prefixes/);
+
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT reason_code FROM audit_events WHERE client_id = $1 AND event_kind = 'delegation.deny' ORDER BY recorded_at DESC LIMIT 1`,
+        ['cursor'],
+      );
+      expect(rows[0].reason_code).toBe('slug_prefix_not_bound');
+    });
+
+    it('[Case F] config is isolated per-ctx — a strict-mode ctx does not leak into a subsequent default ctx for the same client', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const strictCtx = makeCtx({
+        clientId: 'cursor',
+        config: { delegation_require_explicit_slug_binding: true },
+      });
+      await expect(
+        callSubmitAgent(strictCtx, { prompt: 'go' }),
+      ).rejects.toThrow(/no explicit bound_slug_prefixes binding/i);
+
+      // A fresh ctx with no config override must behave exactly like the
+      // pre-Phase-9E-2b compat baseline — no global/module-level state
+      // leaked from the strict-mode call above.
+      const defaultCtx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const result = await callSubmitAgent(defaultCtx, { prompt: 'go' });
+      expect(result.dry_run).toBe(true);
     });
   });
 

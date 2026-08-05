@@ -144,7 +144,13 @@
 - **理由**: 現状NULLと`[]`は`submit_agent`の拒否`reason_code`のみが異なり(`no_slug_prefix_binding` vs `slug_prefix_not_bound`)、意味論として区別されていない。区別されていない2値を将来別々の意味に割り当てると、既存行の意味が遡って変わる。加えて、OAuthクライアント登録経路のうちDCR・管理画面・`gbrain connect --register`は`bound_*`列を構造的に設定できずNULL固定であるため、NULLを「制限なし」と解釈すると、それらの経路で登録されたクライアントに無制限の委任書き込みを与えることになる。
 - **違反例**: 未grantを「制限なし」と解釈する実装(`dashboard-5krlu`修正前の挙動)。
 - **検証方法**: `bound_slug_prefixes`がNULL・`[]`・非空の3パターン × `allowed_slug_prefixes`を要求した/しなかったの計6通りの結果が、本条件が定める意味と一致することを確認する。
-- **既知の未充足(Phase 9E-2で是正予定)**: 未grant時の委任ジョブは現在`wiki/agents/<jobId>/`というレガシーsandboxへ書き込める(`src/core/operations.ts`の`enforceSubagentSlugFence`)。これは「実装依存の既定名前空間」であり本条件の趣旨に反するが、`submit_agent`以外のsubagent経路(cycle等)と共有された既存挙動であるため、**Phase 9E-1では変更せず**、Phase 9E-2でopt-inのfail-closedモードとして是正する。
+- **既知の未充足(Phase 9E-1時点。Phase 9E-2bでopt-in是正済み)**: 未grant時の委任ジョブは`wiki/agents/<jobId>/`というレガシーsandboxへ書き込める(`src/core/operations.ts`の`enforceSubagentSlugFence`)。これは「実装依存の既定名前空間」であり本条件の趣旨に反するが、`submit_agent`以外のsubagent経路(cycle等)と共有された既存挙動であるため、Phase 9E-1では変更しなかった。
+- **Phase 9E-2b是正内容(dashboard-2quyv, 2026-08-05)**: `GBrainConfig`(`src/core/config.ts`、`~/.gbrain/config.json`のfile-plane設定)に`delegation_require_explicit_slug_binding?: boolean`を追加した。
+  - **既定値**: 未設定(`undefined`)。`=== true`の厳密等価チェックのため、`false`・未設定・truthyだが`true`でない値(例: 誤って文字列`"true"`を書いた場合)はすべて下記「無効時」の挙動になる — fail-openではなく「未知の値は互換動作側に倒す」設計。
+  - **無効時(既定)の挙動**: 変更なし。`bound_slug_prefixes`が未grant(NULL/`[]`相当)で`allowed_slug_prefixes`も要求されない場合、上記のレガシーsandboxフォールバックがそのまま適用される。
+  - **有効時(`true`)の挙動**: `submit_agent`のgrant-time検証(`requestedSlugPrefixes.length === 0`のケース、すなわち`bound_slug_prefixes`・`allowed_slug_prefixes`のいずれからも実効的なslug prefixが1件も決まらない場合)で、ジョブを`queue.add()`する前に`OperationError('permission_denied', ...)`を投げて拒否する。`reason_code`は`explicit_slug_binding_required`(`auditDeny`経由で`audit_events`に記録)。明示的な空配列`[]`もNULL/未指定と同じ扱いで拒否対象になる(AUTHZ-INV-016の「NULLと`[]`は意味的に同一」原則を維持)。
+  - **影響範囲**: `submit_agent`のこの1分岐のみ。AUTHZ-INV-017(`delegation_scope_shortfall`のwarn-only運用)・既存の`bound_slug_prefixes`絞り込みロジック(dashboard-5krlu)・Phase 9E-2aの`no_source_binding`判定には影響しない。
+  - **将来のデフォルト値変更**: 本設定の導入時点ではスコープ外(既定値を`true`に変更する判断は別タスク)。
 
 ## AUTHZ-INV-017: 委任開始の権限と、委任される能力の保有は別々に検証される(2026-08-03新設)
 

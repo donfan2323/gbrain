@@ -3368,6 +3368,21 @@ const submit_agent: Operation = {
         await auditDeny('slug_prefix_not_bound', msg);
         throw new OperationError('permission_denied', msg);
       }
+    } else if (ctx.config?.delegation_require_explicit_slug_binding === true) {
+      // Phase 9E-2b (dashboard-2quyv, AUTHZ-INV-016): opt-in fail-closed
+      // mode for the legacy sandbox fallback documented above — this branch
+      // only runs when requestedSlugPrefixes.length === 0 (the same
+      // condition that previously fell straight through to the legacy
+      // wiki/agents/<subagentId>/ sandbox at exercise time, untouched here
+      // and in enforceSubagentSlugFence). Default (config unset/false)
+      // leaves that fallback exactly as before — this is purely additive.
+      // Empty array and NULL/omitted are deliberately not distinguished
+      // (both land in this branch via requestedSlugPrefixes's own ??
+      // chain), consistent with AUTHZ-INV-016's "NULL and [] are
+      // semantically identical" rule.
+      const msg = `submit_agent: client ${clientId} has no explicit bound_slug_prefixes binding (and none were requested); the legacy wiki/agents/<subagentId>/ sandbox fallback is disabled under strict mode (delegation_require_explicit_slug_binding). Re-register with --bound-slug-prefixes or request allowed_slug_prefixes explicitly.`;
+      await auditDeny('explicit_slug_binding_required', msg);
+      throw new OperationError('permission_denied', msg);
     }
 
     // Concurrency cap: count active+waiting agent jobs for this client.

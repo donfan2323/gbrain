@@ -325,6 +325,24 @@ export interface GBrainConfig {
   schema_pack?: string;
 
   /**
+   * Phase 9E-2b (dashboard-2quyv, AUTHZ-INV-016) — opt-in fail-closed mode
+   * for `submit_agent` delegation grant-time checks. Default false (or
+   * unset) preserves the pre-Phase-9E-2b legacy behavior: a delegated job
+   * with no explicit bound_slug_prefixes binding (and no
+   * allowed_slug_prefixes requested) still runs, falling back at exercise
+   * time to the wiki/agents/<subagentId>/ sandbox
+   * (enforceSubagentSlugFence in operations.ts). Set true to instead deny
+   * such delegations at grant time (permission_denied, reason_code
+   * explicit_slug_binding_required) — no job is submitted, and the caller
+   * must re-register with --bound-slug-prefixes or explicitly request
+   * allowed_slug_prefixes. Only gates this one fallback; does not affect
+   * AUTHZ-INV-017 (delegation_scope_shortfall) or any other submit_agent
+   * check. Changing the future default is out of scope for this setting's
+   * introduction.
+   */
+  delegation_require_explicit_slug_binding?: boolean;
+
+  /**
    * PR1 — MCP skill-catalog publishing. Lets a thin MCP client (Codex desktop,
    * Claude Code, Perplexity) discover and follow this agent repo's skills over
    * `gbrain serve`. See `src/core/skill-catalog.ts` for the trust-boundary memo.
@@ -878,6 +896,7 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   'embedding_model',
   'embedding_dimensions',
   'embedding_disabled',
+  'delegation_require_explicit_slug_binding',
   'expansion_model',
   'chat_model',
   'chat_fallback_chain',
