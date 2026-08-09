@@ -1,0 +1,55 @@
+# Universal Git Governance — repository-local policy. See
+# /Users/lab/AI_Project/shared_rules/CONSTITUTION.md RULE-8 for cross-repo
+# principles. Not yet enforced (Phase 3 = source-of-truth only).
+
+version = 1
+enabled = true
+
+[repository]
+id = "gbrain"
+toplevel = "/Users/lab/AI_Workspace/gbrain"
+
+[working_tree]
+allow_dirty = true
+status_format = "porcelain-v2-uall"
+
+[staging]
+allow_add_all = false
+explicit_paths_only = true
+
+[push]
+default = "deny"
+force = "deny"
+
+[[remotes]]
+name = "origin"
+fetch_url = "https://github.com/garrytan/gbrain.git"
+push_url = "https://github.com/garrytan/gbrain.git"
+role = "upstream"
+push = "deny"
+# Owned by a different GitHub account (garrytan) than every other
+# repository in this survey (donfan2323). gbrain's own AGENTS.md documents
+# `git clone https://github.com/garrytan/gbrain.git` as the canonical
+# install source and has a "## Forks" section addressed to people who have
+# forked FROM this repository — strong documentary evidence this is an
+# externally-authored upstream, not a user-owned repository. Write-access
+# confirmation was not found. No user-owned mirror/fork remote is
+# configured. push=deny (RULE-8.D: unknown/unconfirmed ownership means
+# deny) pending explicit confirmation of write permission.
+
+[hooks]
+expected_hooks_path = ""
+beads_managed = false
+
+[secrets]
+provider = "gitleaks"
+baseline_present = true
+
+[worktree]
+managed = false
+
+[metadata]
+notes = [
+  "24 local commits ahead of origin/master as of 2026-08-10, with no user-owned mirror/fork remote configured to push them to instead — runtime/diagnostic state, not encoded as a policy value (per Phase 3 instructions, this belongs in a future doctor/diagnostic pass, not fixed in policy).",
+  "4 prunable git worktrees found under a now-likely-deleted past session's scratchpad path — orphaned debris, not removed by this policy work.",
+]
