@@ -5,6 +5,8 @@
 > access. Verify the actual remote URL before assuming push permission
 > (`git remote get-url --push origin`).
 
+> **branch/worktree運用**: `/Users/lab/AI_Project/shared_rules/CONSTITUTION.md` RULE-9を正本とする。要約: 現在のbranchが依頼と同じタスク専用ならそのまま継続、新規独立タスクはfeature branch、並行作業や大型/実験的変更はworktree（`git worktree add`の手動実行よりEnterWorktree/ExitWorktreeツールを優先）。「branchを作りますか」等の技術確認はユーザーへしない。
+
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable
 engines: PGLite (embedded Postgres via WASM, zero-config default) or Postgres + pgvector
 + hybrid search in a managed Supabase instance. `gbrain init` defaults to PGLite;

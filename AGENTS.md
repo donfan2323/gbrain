@@ -4,6 +4,14 @@ This is your install + operating protocol. Claude Code reads `./CLAUDE.md` autom
 Everyone else (Codex, Cursor, OpenClaw, Aider, Continue, or an LLM fetching via URL):
 start here.
 
+> **Branch/worktree**: see `/Users/lab/AI_Project/shared_rules/CONSTITUTION.md` RULE-9 for
+> the full cross-repo decision criteria. Summary: continue the current branch if it's
+> dedicated to the same task as the request; create a feature branch for a new independent
+> task; use a dedicated `git worktree` for parallel work (another AI/session/task) or
+> large/experimental changes. Prefer your tool's own built-in worktree mechanism over
+> manual `git worktree add` where available. Don't ask the user whether to create a
+> branch or worktree; that's a technical decision for the agent to make.
+
 ## Install (5 min)
 
 1. Install gbrain via Bun (the canonical path):
