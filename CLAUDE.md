@@ -1,13 +1,9 @@
 # CLAUDE.md
 
-> **Git operations in this repository** are governed by:
-> 1. `/Users/lab/AI_Project/shared_rules/CONSTITUTION.md` RULE-8 (cross-repo principles)
-> 2. `.gitgov/policy.toml` in this repository (repository-specific facts — notably,
->    `origin` here is a third-party/upstream remote, not confirmed user-owned; push is
->    denied pending confirmation of write access)
->
-> When policy and the actual measured repository state disagree, stop and report the
-> drift rather than proceeding.
+> **Git operations in this repository**: `origin` here is a third-party/upstream
+> remote, not confirmed user-owned — push is denied pending confirmation of write
+> access. Verify the actual remote URL before assuming push permission
+> (`git remote get-url --push origin`).
 
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable
 engines: PGLite (embedded Postgres via WASM, zero-config default) or Postgres + pgvector
