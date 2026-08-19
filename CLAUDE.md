@@ -654,6 +654,13 @@ The /ship workflow's Step 1 should be augmented to run the mismatch
 check; until that lands upstream, ALWAYS run the check above before
 `/ship` invokes its first push or PR-create step.
 
+## Local checkout git governance
+
+Separate from the Conductor rule above: this checkout's remote roles
+(`origin` fetch-only, `fork` writable), protected-branch rules, and
+destructive-ref-update hooks are documented in
+**[docs/GIT_GOVERNANCE.md](docs/GIT_GOVERNANCE.md)** — read it before any
+`git reset`/`branch -f`/force-push in this working tree.
 
 ## Releasing
 

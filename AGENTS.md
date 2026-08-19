@@ -135,3 +135,12 @@ use generic placeholders (`alice-example`, `acme-example`, `fund-a`).
 
 If you are a fork, regenerate `llms.txt` + `llms-full.txt` with your own URL base before
 publishing: `LLMS_REPO_BASE=https://raw.githubusercontent.com/your-org/your-fork/main bun run build:llms`.
+
+## Local checkout git governance
+
+This checkout has its own local-deployment git rules — remote roles, branch
+roles, commit timing, upstream-sync workflow — in **`docs/GIT_GOVERNANCE.md`**.
+Read it before running `git reset`, `git push`, or any branch surgery here;
+it's separate from the Conductor branch-naming rule in `CLAUDE.md` and from
+upstream contribution conventions. Applies to any agent operating this
+checkout, not just one particular tool.
