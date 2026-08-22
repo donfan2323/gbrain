@@ -161,9 +161,15 @@ const submit_agent: Operation = {
       throw new OperationError('invalid_request', 'submit_agent over the local CLI: use `gbrain agent run` instead.');
     }
 
+    const { logAgentGrantDecision } = await import('../minions/agent-audit.ts');
+
     const clientId = (ctx as { auth?: { clientId?: string } }).auth?.clientId;
     if (!clientId || typeof clientId !== 'string') {
-      throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
+      const reason = 'submit_agent requires an OAuth client with the `agent` scope.';
+      try {
+        logAgentGrantDecision({ client_id: null, decision: 'denied', reason_code: 'no_client_id', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
     }
 
     // Load the binding row.
@@ -184,7 +190,11 @@ const submit_agent: Operation = {
       );
     }
     if (bindingRows.length === 0) {
-      throw new OperationError('permission_denied', `submit_agent: client_id ${clientId} not found.`);
+      const reason = `submit_agent: client_id ${clientId} not found.`;
+      try {
+        logAgentGrantDecision({ client_id: clientId, decision: 'denied', reason_code: 'client_not_found', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
     }
     const binding = bindingRows[0];
     const boundTools = (binding.bound_tools as string[] | null) ?? null;
@@ -194,10 +204,35 @@ const submit_agent: Operation = {
     const budgetCapText = (binding.budget_cap as string | null) ?? null;
 
     if (boundTools === null) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
-      );
+      const reason = `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`;
+      try {
+        logAgentGrantDecision({ client_id: clientId, decision: 'denied', reason_code: 'no_binding', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
+    }
+
+    // v0.46-slice (Phase 3B-1, AUTHZ-INV-016): a client bound to `agent`
+    // scope but with NO bound_slug_prefixes binding at all (column is NULL,
+    // as opposed to a non-null-but-empty resolved list, handled below) skips
+    // every slug check in this handler entirely — an explicit
+    // `allowed_slug_prefixes` request from such a client currently flows
+    // through UNCHECKED into the delegated job. This is AUTHZ-INV-016's
+    // still-open gap (see PHASE9A-AUTHORIZATION-INVARIANTS.md). Hard-closing
+    // it (treating NULL as ungranted, same as an empty binding) is deferred
+    // pending confirmation that no production client currently depends on
+    // unfenced access — this warn-audit event is how that gets confirmed
+    // safely, without querying the live production DB. Not enforced yet.
+    if (boundSlugPrefixes === null) {
+      try {
+        logAgentGrantDecision({
+          client_id: clientId,
+          decision: 'allowed_with_warning',
+          reason_code: 'unfenced_null_slug_binding',
+          reason: `submit_agent: client ${clientId} has no bound_slug_prefixes binding — its delegated slug access is currently ungoverned (AUTHZ-INV-016 gap, not yet enforced).`,
+          requested_slug_prefixes: (p.allowed_slug_prefixes as string[] | undefined) ?? [],
+          bound_slug_prefixes: null,
+        });
+      } catch { /* never block submission */ }
     }
 
     // Validate each param against the binding.
@@ -217,10 +252,14 @@ const submit_agent: Operation = {
       : requestedToolsRaw;
     for (const t of requestedTools) {
       if (!boundTools.includes(t)) {
-        throw new OperationError(
-          'permission_denied',
-          `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`,
-        );
+        const reason = `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`;
+        try {
+          logAgentGrantDecision({
+            client_id: clientId, decision: 'denied', reason_code: 'tool_widening', reason,
+            requested_tools: requestedTools, bound_tools: boundTools,
+          });
+        } catch { /* never block the denial */ }
+        throw new OperationError('permission_denied', reason);
       }
     }
     const requestedSlugPrefixesRaw = p.allowed_slug_prefixes as string[] | undefined;
@@ -232,9 +271,16 @@ const submit_agent: Operation = {
     // list reaches the subagent as "use the legacy wiki/agents/<id>/ namespace",
     // which is outside every bound prefix.
     if (boundSlugPrefixes !== null && requestedSlugPrefixes.length === 0) {
+      const reason = `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`;
+      try {
+        logAgentGrantDecision({
+          client_id: clientId, decision: 'denied', reason_code: 'empty_resolved_slug_prefixes', reason,
+          requested_slug_prefixes: requestedSlugPrefixes, bound_slug_prefixes: boundSlugPrefixes,
+        });
+      } catch { /* never block the denial */ }
       throw new OperationError(
         'permission_denied',
-        `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`,
+        reason,
         'Re-scope the client with a non-empty --bound-slug-prefixes.',
       );
     }
@@ -252,10 +298,14 @@ const submit_agent: Operation = {
             ? req.startsWith(base)
             : req === base || req.startsWith(`${base}/`);
         })) {
-          throw new OperationError(
-            'permission_denied',
-            `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
-          );
+          const reason = `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`;
+          try {
+            logAgentGrantDecision({
+              client_id: clientId, decision: 'denied', reason_code: 'slug_widening', reason,
+              requested_slug_prefixes: requestedSlugPrefixes, bound_slug_prefixes: boundSlugPrefixes,
+            });
+          } catch { /* never block the denial */ }
+          throw new OperationError('permission_denied', reason);
         }
       }
     }
@@ -321,9 +371,16 @@ const submit_agent: Operation = {
     // a correctly slug-fenced client could act on the wrong source.
     const delegatedSource = ctx.auth?.sourceId ?? boundSource;
     if (boundSource && ctx.auth?.sourceId && boundSource !== ctx.auth.sourceId) {
+      const reason = `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`;
+      try {
+        logAgentGrantDecision({
+          client_id: clientId, decision: 'denied', reason_code: 'source_disagreement', reason,
+          requested_source: ctx.auth.sourceId, bound_source: boundSource,
+        });
+      } catch { /* never block the denial */ }
       throw new OperationError(
         'permission_denied',
-        `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`,
+        reason,
         'Re-scope the client so the two agree: `gbrain auth rescope-client <id> --source <source>`.',
       );
     }

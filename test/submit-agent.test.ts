@@ -428,4 +428,115 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(data.max_turns).toBe(100);
     });
   });
+
+  describe('Phase 3B-1: grant-decision audit (rejections + unfenced-null-slug warning)', () => {
+    function readAuditLines(): Array<Record<string, unknown>> {
+      const auditFiles = fs.readdirSync(tmpAuditDir).filter(f => f.startsWith('agent-jobs-'));
+      if (auditFiles.length === 0) return [];
+      const content = fs.readFileSync(path.join(tmpAuditDir, auditFiles[0]), 'utf8');
+      return content.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+    }
+
+    it('no-binding rejection is audited (decision=denied, reason_code=no_binding)', async () => {
+      await seedClient('legacy-admin', { bound_tools: null });
+      const ctx = makeCtx({ clientId: 'legacy-admin' });
+      await expect(callSubmitAgent(ctx, { prompt: 'hi' })).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'no_binding');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.client_id).toBe('legacy-admin');
+    });
+
+    it('tool-widening rejection is audited with requested vs bound tools, no prompt/secret leakage', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'super-secret-prompt-text', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'tool_widening');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.requested_tools).toEqual(['put_page']);
+      expect(denial!.bound_tools).toEqual(['search']);
+      const raw = JSON.stringify(lines);
+      expect(raw).not.toContain('super-secret-prompt-text');
+    });
+
+    it('slug-widening rejection is audited with requested vs bound slug prefixes', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['emp-alice/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_slug_prefixes: ['emp-alice-2/'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'slug_widening');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.requested_slug_prefixes).toEqual(['emp-alice-2/']);
+      expect(denial!.bound_slug_prefixes).toEqual(['emp-alice/']);
+    });
+
+    it('source-disagreement rejection is audited with requested vs bound source', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'source-a',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      (ctx as any).auth.sourceId = 'source-b';
+      await expect(callSubmitAgent(ctx, { prompt: 'hi' })).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'source_disagreement');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.requested_source).toBe('source-b');
+      expect(denial!.bound_source).toBe('source-a');
+    });
+
+    it('client with bound_slug_prefixes=NULL is ALLOWED (not enforced) but produces an allowed_with_warning audit event', async () => {
+      await seedClient('legacy-unfenced', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: null,
+      });
+      const ctx = makeCtx({ clientId: 'legacy-unfenced', dryRun: true });
+      // Must NOT throw — this gap is warn-only, not enforced, per the
+      // compatibility gate (production usage could not be safely confirmed).
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'hi',
+        allowed_slug_prefixes: ['anyone/private-slug'],
+      });
+      expect(result.dry_run).toBe(true);
+      const lines = readAuditLines();
+      const warning = lines.find(l => l.reason_code === 'unfenced_null_slug_binding');
+      expect(warning).toBeTruthy();
+      expect(warning!.decision).toBe('allowed_with_warning');
+      expect(warning!.client_id).toBe('legacy-unfenced');
+      expect(warning!.bound_slug_prefixes).toBeNull();
+    });
+
+    it('valid submission still produces exactly the existing "submitted" audit line — no spurious denial events', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor' });
+      await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search'] });
+      const lines = readAuditLines();
+      expect(lines.length).toBe(1);
+      expect(lines[0].outcome).toBe('submitted');
+      expect(lines.some(l => l.decision === 'denied')).toBe(false);
+    });
+  });
 });
