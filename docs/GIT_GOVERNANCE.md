@@ -106,6 +106,75 @@ linked so this file is self-contained per-repo:
   confirmed set for this checkout, not global, so it can't affect any
   other repository on this machine).
 
+## RULE-8.K-1 — Controlled Exception Record
+
+At rollout time (2026-08-20) there was no RULE-8-aware exception for this
+repo — CONSTITUTION.md RULE-8.K had already been in effect since
+2026-08-10, and the governance commit did not reference it. That gap was
+undocumented **policy drift**, not a documented exception. This section,
+added 2026-08-22, retroactively formalizes that rollout under RULE-8.K-1
+(added the same day) on the basis of the evidence below — it does not
+claim a formal exception existed at the time.
+
+**1. Warn-only materially insufficient** — at rollout time, local
+`master` was 27 commits ahead of `origin/master` with no backup anywhere
+but this machine, plus 6 `phase9b-*` branches in the same position: a
+standing, present-tense exposure, not a past or hypothetical one. A
+warn-only/observation window leaves that exposure live throughout — any
+ordinary `reset --hard`, `branch -D`, or force-push during that window
+would realize the same largely-irreversible loss pattern already proven
+concrete at Hermes days earlier, on the same operator's machine. Warn-only
+periods exist to catch false positives in unproven detection logic before
+it blocks real work; that logic was not unproven here — it is ported
+verbatim from Hermes's already isolated-clone-verified implementation —
+so there was materially less to gain from observing it, while every day
+of delay left the 27+6 exposure live for no offsetting benefit.
+
+**2. Scope limited** — the exception covers exactly two hooks:
+`.githooks/reference-transaction` and `.githooks/pre-push`. Protected
+refs: `refs/heads/master`, `refs/heads/rescue/*`. Remote scope: blocks
+push to `origin` (garrytan/gbrain, by name or URL) and any force-push to
+the protected patterns on any remote. This exception does not extend to
+other repos, other hooks, or any future enforcement mechanism in this
+repo — each would need its own K-1 record.
+
+**3. Isolated pre-deployment verification** — commit
+`844559531e45a4e3f308a3c106d65e90bd02ab9d` records empirical testing of
+`git reset --hard`, `git branch -f`, `git branch -D`, and `git
+update-ref` against isolated clones, not this checkout, before the hooks
+were relied on; the hook logic itself is unchanged from Hermes's
+already-verified implementation (see Hermes's own `docs/GIT_GOVERNANCE.md`
+RULE-8.K-1 record), with only `.git-governance/profile.conf` values
+changed for this repo.
+
+**4. Production impact assessed** — production `com.user.gbrain` runs
+from a fully decoupled, immutable release directory
+(`/Users/lab/AI_Production/gbrain/releases/<timestamp>-<sha>/`, no
+`.git`), promoted via a separate deploy step. There is no direct runtime
+path or coupling from this working tree's git state to the running
+service, and the hooks' own execution — blocking or allowing a git
+operation — cannot itself modify or break the running service; they only
+run during this checkout's git plumbing operations. The residual risk is
+indirect and operational, not a runtime-mutation risk: if the hooks
+wrongly block a legitimate commit, push, or force-push, that delays the
+corresponding release-preparation step and, transitively, the next
+deploy — the same category of cost as any CI gate, not a
+production-safety risk.
+
+**5. Explicit RULE-8.K deviation declaration** — both hooks went from
+nonexistent to fully enforcing in one atomic commit, with no non-blocking
+window at all — a stricter case than Hermes's. Evidence for conditions
+1–4 above is this section and the commit it cites.
+
+**6. Observability in lieu of a warn-only phase** — both hooks print the
+specific blocked operation and the reason to stderr at the moment of
+refusal (see "Hard protection" above); there is no persisted audit log
+beyond that.
+
+**7. Reassessment** — by **2026-09-19** (30 days from the 2026-08-20
+rollout), or sooner if this repo's git governance is next touched, or if
+RULE-8 is revised again.
+
 ## Upstream update workflow
 
 1. `git fetch origin`
