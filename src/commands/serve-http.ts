@@ -648,6 +648,53 @@ export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise
   }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-4): POST /ingest's audit-write helper.
+ *
+ * PHASE9A-AUTHORIZATION-INVARIANTS.md's AUTHZ-INV-013 names POST /ingest's
+ * deny/failure asymmetry as its own violation example: the success path
+ * already writes an `mcp_request_log` row (`operation: 'webhook_ingest'`,
+ * `status: 'success'`, wired below in the route handler) but every deny/
+ * failure branch wrote nothing at all. This mirrors that EXACT INSERT shape
+ * (same table, same column set, same best-effort/never-block posture) that
+ * every MCP tools/list and tools/call branch above already uses for
+ * success/denied_after_list/error — no new schema, no new audit
+ * subsystem, one more producer into the existing one.
+ *
+ * Exported (unlike the 6+ existing inline call sites in this file, which
+ * this commit does not touch) so it's independently testable against a
+ * PGLite engine without needing a live HTTP server — the full route is
+ * covered by test/e2e/serve-http-ingest-webhook.test.ts, which needs a real
+ * database this sandbox does not have configured.
+ *
+ * `status: 'denied'` is reserved for a genuine authorization decision (the
+ * slug-bound-client rejection); every other non-success branch (input
+ * validation, queue-submission failure) uses `status: 'error'`, matching
+ * the vocabulary the MCP handlers above already established
+ * (denied_after_list vs error) rather than inventing a third one.
+ */
+export async function logIngestAudit(
+  engine: BrainEngine,
+  input: {
+    clientId: string;
+    agentName: string;
+    latencyMs: number;
+    status: 'denied' | 'error';
+    errorMessage: string;
+    params?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [input.clientId, input.agentName, 'webhook_ingest', input.latencyMs, input.status, input.errorMessage],
+      [input.params ?? null],
+    );
+  } catch { /* best effort — never block the response the caller already sent */ }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -2645,6 +2692,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // throw TypeError. Express's default error handler then served an HTML
       // 500 page. Guard fires first to keep the response shape JSON.
       if (req.body == null) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: 'empty_body',
+        });
         res.status(400).json({
           error: 'empty_body',
           message: 'POST /ingest requires a non-empty body',
@@ -2668,6 +2719,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       if (body.length === 0) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: 'empty_body',
+        });
         res.status(400).json({ error: 'empty_body', message: 'POST /ingest requires a non-empty body' });
         return;
       }
@@ -2690,6 +2745,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         contentType = 'text/plain';
       } else {
         // Binary or unknown — rejected in v1.
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `unsupported_content_type: ${declared}`,
+        });
         res.status(415).json({
           error: 'unsupported_content_type',
           message: `content_type '${declared}' not supported. Use one of: ${[...INGEST_ALLOWED_CONTENT_TYPES].join(', ')}. ` +
@@ -2699,6 +2758,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       if (!INGEST_ALLOWED_CONTENT_TYPES.has(contentType)) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `unsupported_content_type: ${contentType}`,
+        });
         res.status(415).json({
           error: 'unsupported_content_type',
           message: `content_type '${contentType}' is in the taxonomy but not currently accepted by POST /ingest`,
@@ -2724,6 +2787,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // unbound clients.
       const boundPrefixes = authInfo.boundSlugPrefixes;
       if (boundPrefixes || authInfo.fenceProjectionDegraded) {
+        // AUTHZ-INV-013: the one genuine authorization decision in this
+        // route (as opposed to input validation or an operational failure)
+        // — status: 'denied', matching the vocabulary's intent even though
+        // this file's existing MCP call sites happen to spell it
+        // 'denied_after_list' for their own specific reason.
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'denied',
+          errorMessage: authInfo.fenceProjectionDegraded ? 'fence_projection_degraded' : 'slug_bound_client',
+        });
         res.status(403).json({
           error: 'permission_denied',
           message: authInfo.fenceProjectionDegraded
@@ -2756,6 +2829,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const validationErr = validateIngestionEvent(event);
       if (validationErr) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `invalid_event: ${validationErr.field}`,
+        });
         res.status(400).json({
           error: 'invalid_event',
           message: validationErr.message,
@@ -2811,6 +2888,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('POST /ingest queue submission error:', msg);
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `queue_submission_failed: ${msg}`,
+        });
         res.status(500).json({
           error: 'queue_submission_failed',
           message: msg,
@@ -2825,6 +2906,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } catch (outerErr) {
         const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
         console.error('POST /ingest unexpected handler error:', msg);
+        // authInfo may be unset if the throw happened before it was read —
+        // requireBearerAuth already ran (this route can't be reached
+        // otherwise), so req.auth is always present even if the local
+        // `authInfo` binding above wasn't reached yet.
+        const clientId = (req as Request & { auth?: AuthInfo }).auth?.clientId ?? 'unknown';
+        await logIngestAudit(engine, {
+          clientId, agentName: clientId, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `internal_error: ${msg}`,
+        });
         if (!res.headersSent) {
           res.status(500).json({
             error: 'internal_error',
