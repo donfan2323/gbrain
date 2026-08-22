@@ -21,7 +21,7 @@ import { safeHexEqual } from '../core/timing-safe.ts';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { mcpAuthRouter, createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { OAuthTokenRevocationRequestSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { BrainEngine } from '../core/engine.ts';
@@ -878,7 +878,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   };
-  app.use('/mcp', cors(corsOAuthOptions));
+  // v0.43-port (dashboard-h0cfe): /mcp-v2 is a full alias of /mcp, sharing
+  // this exact CORS config, the auth middleware below, and the same route
+  // handlers (registered as an array on both routes) — never a duplicated,
+  // independently-maintained implementation. Kept for ChatGPT Connector
+  // compatibility (the live Connector is configured against /mcp-v2).
+  app.use(['/mcp', '/mcp-v2'], cors(corsOAuthOptions));
   app.use('/token', cors(corsOAuthOptions));
   app.use('/authorize', cors(corsOAuthOptions));
   app.use('/register', cors(corsOAuthOptions));
@@ -1164,8 +1169,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Patch the SDK's OAuth metadata to include client_credentials grant type.
   // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
   // the response and add client_credentials before it reaches the client.
+  // v0.43-port (dashboard-h0cfe): also applies to the openid-configuration
+  // compat route below, which reuses the same createOAuthMetadata() output —
+  // without this the two discovery documents would silently diverge.
   app.use((req, res, next) => {
-    if (req.path === '/.well-known/oauth-authorization-server' && req.method === 'GET') {
+    if (
+      (req.path === '/.well-known/oauth-authorization-server' || req.path === '/.well-known/openid-configuration')
+      && req.method === 'GET'
+    ) {
       const origJson = res.json.bind(res);
       (res as any).json = (body: any) => {
         if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
@@ -1185,6 +1196,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       };
     }
     next();
+  });
+
+  // COMPAT ENDPOINT (v0.43-port, dashboard-h0cfe) — OIDC Discovery-style
+  // alias. Some OAuth/OIDC-aware clients probe
+  // /.well-known/openid-configuration in addition to (or instead of) the
+  // RFC 8414 /.well-known/oauth-authorization-server path the SDK
+  // implements; this SDK version does not register that path at all.
+  // Reuses the SDK's own exported createOAuthMetadata(authRouterOptions) —
+  // the exact same pure function the SDK calls internally for
+  // oauth-authorization-server — so the two documents are guaranteed
+  // identical in content. Does not modify the SDK, does not touch
+  // /authorize, /token, PKCE, or DCR in any way.
+  app.get('/.well-known/openid-configuration', (req, res) => {
+    res.status(200).json(createOAuthMetadata(authRouterOptions));
   });
 
   app.use(authRouter);
@@ -2142,12 +2167,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (not 404) so probing clients (claude.ai, etc.) recognize this as an MCP
   // endpoint, not a missing route. Without this, clients display "endpoint not
   // found" instead of "endpoint exists but no SSE channel."
-  app.get('/mcp', (_req: Request, res: Response) => {
+  // /mcp-v2 is registered alongside /mcp using the same middleware and
+  // handlers (v0.43-port, dashboard-h0cfe) — retained for ChatGPT connector
+  // compatibility.
+  app.get(['/mcp', '/mcp-v2'], (_req: Request, res: Response) => {
     res.set('Allow', 'POST, DELETE');
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post(['/mcp', '/mcp-v2'], requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
