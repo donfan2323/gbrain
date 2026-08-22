@@ -1454,3 +1454,41 @@ export async function isGlobalBasenameEnabled(engine: BrainEngine): Promise<bool
   const normalized = val.trim().toLowerCase();
   return ['1', 'true', 'yes', 'on'].includes(normalized);
 }
+
+/**
+ * Read the `remote_auto_link` config flag. Defaults to FALSE (opt-in only).
+ *
+ * Client-agnostic gate for put_page's remote-caller auto-link path (see
+ * ops/pages.ts runAutoLink's `linkSourceTag` opt): checked ONLY after the
+ * existing `ctx.remote !== false && !trustedWorkspace` transport boundary,
+ * never on client identity/vendor. Mirrors isGlobalBasenameEnabled's
+ * env-first pattern. (v0.43-port, dashboard-h0cfe.)
+ */
+export async function isRemoteAutoLinkEnabled(engine: BrainEngine): Promise<boolean> {
+  const envVal = process.env.GBRAIN_REMOTE_AUTO_LINK;
+  if (envVal != null) {
+    const normalized = envVal.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  const val = await engine.getConfig('remote_auto_link');
+  if (val == null) return false;
+  const normalized = val.trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}
+
+/**
+ * Read the `remote_auto_timeline` config flag. Defaults to FALSE (opt-in
+ * only). Same rationale/pattern as isRemoteAutoLinkEnabled.
+ * (v0.43-port, dashboard-h0cfe.)
+ */
+export async function isRemoteAutoTimelineEnabled(engine: BrainEngine): Promise<boolean> {
+  const envVal = process.env.GBRAIN_REMOTE_AUTO_TIMELINE;
+  if (envVal != null) {
+    const normalized = envVal.trim().toLowerCase();
+    return ['1', 'true', 'yes', 'on'].includes(normalized);
+  }
+  const val = await engine.getConfig('remote_auto_timeline');
+  if (val == null) return false;
+  const normalized = val.trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+}

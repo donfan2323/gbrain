@@ -12,7 +12,7 @@ import { clampSearchLimit } from '../engine.ts';
 import type { PageType } from '../types.ts';
 import { importFromContent } from '../import-file.ts';
 import { writePageThrough, type WriteThroughResult } from '../write-through.ts';
-import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
+import { extractPageLinks, isAutoLinkEnabled, isAutoTimelineEnabled, isGlobalBasenameEnabled, isRemoteAutoLinkEnabled, isRemoteAutoTimelineEnabled, parseTimelineEntries, makeResolver, type UnresolvedFrontmatterRef } from '../link-extraction.ts';
 import { isFactsBackstopEligible } from '../facts/eligibility.ts';
 import { stripTakesFence } from '../takes-fence.ts';
 import type { WriterLintPayload } from '../output/post-write.ts';
@@ -366,15 +366,28 @@ const put_page: Operation = {
     // transaction). Runs even on status='skipped' so reconciliation catches drift
     // between the page text and the links table. Failures are non-blocking.
     //
-    // SECURITY: skipped for remote (MCP) callers. Auto-link's bare-slug regex
-    // matches `people/X` etc. anywhere in page text, including code fences,
-    // quoted strings, and prompt-injected content. An untrusted page can plant
-    // arbitrary outbound links by including `see meetings/board-q1` in its body.
-    // Combined with the backlink boost in hybridSearch, attacker-placed targets
-    // would surface higher in search. Local CLI users (ctx.remote=false) opt
-    // into this behavior; MCP/remote writes do not.
+    // SECURITY: fully disabled by default for remote (MCP) callers. Auto-link's
+    // bare-slug regex matches `people/X` etc. anywhere in page text, including
+    // code fences, quoted strings, and prompt-injected content. An untrusted
+    // page can plant arbitrary outbound links by including `see meetings/board-q1`
+    // in its body. Combined with the backlink boost in hybridSearch, attacker-
+    // placed targets would surface higher in search. Local CLI users
+    // (ctx.remote=false) opt into the full local behavior below unconditionally.
+    //
+    // v0.43-port (dashboard-h0cfe, client-agnostic remote auto-link): remote
+    // callers may ADDITIONALLY opt into a narrower path, gated by the same
+    // transport boundary (ctx.remote — never client name/vendor/User-Agent)
+    // plus a separate, default-OFF config flag (isRemoteAutoLinkEnabled /
+    // isRemoteAutoTimelineEnabled). Links created there are tagged
+    // link_source='remote-auto' (runAutoLink's linkSourceTag opt), which
+    // excludes them from getBacklinkCounts' ranking boost (pglite-engine.ts /
+    // postgres-engine.ts) while still counting toward link_count/orphan-
+    // reduction/graph traversal, and NEVER includes frontmatter-authored
+    // incoming-direction edges (an untrusted page could otherwise attribute a
+    // relationship onto an arbitrary existing page it doesn't own without
+    // writing to it). This closes the threat above without loosening it.
     let autoLinks:
-      | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }
+      | { created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[]; truncated?: number }
       | { error: string }
       | { skipped: 'remote' }
       | undefined;
@@ -391,6 +404,41 @@ const put_page: Operation = {
     if (ctx.remote !== false && !trustedWorkspace) {
       autoLinks = { skipped: 'remote' };
       autoTimeline = { skipped: 'remote' };
+      if (result.parsedPage) {
+        try {
+          const remoteLinkEnabled = await isRemoteAutoLinkEnabled(ctx.engine);
+          if (remoteLinkEnabled) {
+            autoLinks = await runAutoLink(ctx.engine, slug, result.parsedPage, {
+              ...(ctx.sourceId ? { sourceId: ctx.sourceId } : {}),
+              linkSourceTag: 'remote-auto',
+              maxCandidates: REMOTE_AUTO_LINK_MAX_CANDIDATES,
+            });
+          }
+        } catch (e) {
+          autoLinks = { error: e instanceof Error ? e.message : String(e) };
+        }
+        try {
+          const remoteTimelineEnabled = await isRemoteAutoTimelineEnabled(ctx.engine);
+          if (remoteTimelineEnabled) {
+            const fullContent = result.parsedPage.compiled_truth + '\n' + result.parsedPage.timeline;
+            const entries = parseTimelineEntries(fullContent);
+            if (entries.length > 0) {
+              const batch = entries.map(e => ({
+                slug,
+                date: e.date,
+                summary: e.summary,
+                detail: e.detail || '',
+              }));
+              const created = await ctx.engine.addTimelineEntriesBatch(batch, { auditSite: 'mcp.put_page.remote_auto' });
+              autoTimeline = { created };
+            } else {
+              autoTimeline = { created: 0 };
+            }
+          }
+        } catch (e) {
+          autoTimeline = { error: e instanceof Error ? e.message : String(e) };
+        }
+      }
     } else if (result.parsedPage) {
       try {
         const enabled = await isAutoLinkEnabled(ctx.engine);
@@ -622,12 +670,18 @@ export async function autoLinkWrittenPage(
  * counted; the overall function never throws (catch in put_page handler covers
  * extraction errors).
  */
+// v0.43-port (dashboard-h0cfe): cap on candidate links per put_page call when
+// `linkSourceTag` is set (remote-auto path only). Defense-in-depth against
+// one page flooding the graph with edges; excess candidates are dropped
+// (not silently — surfaced via the `truncated` field on the return value).
+const REMOTE_AUTO_LINK_MAX_CANDIDATES = 50;
+
 async function runAutoLink(
   engine: BrainEngine,
   slug: string,
   parsed: { type: PageType; compiled_truth: string; timeline: string; frontmatter: Record<string, unknown> },
-  opts?: { sourceId?: string },
-): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[] }> {
+  opts?: { sourceId?: string; linkSourceTag?: string; maxCandidates?: number },
+): Promise<{ created: number; removed: number; errors: number; unresolved: UnresolvedFrontmatterRef[]; truncated?: number }> {
   const fullContent = parsed.compiled_truth + '\n' + parsed.timeline;
   // v0.31.8 (codex OV-2): thread sourceId through every read + write inside
   // reconcileLinks. Without this the FS walker reads cross-source links/slugs
@@ -675,8 +729,37 @@ async function runAutoLink(
   // but SCOPED to the frontmatter edges this page authored via
   // (link_source='frontmatter' AND origin_slug = slug). We never touch
   // frontmatter edges authored by OTHER pages.
-  const out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
-  const inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+  let out = valid.filter(c => !c.fromSlug || c.fromSlug === slug);
+  let inc = valid.filter(c => c.fromSlug && c.fromSlug !== slug);
+
+  // v0.43-port (dashboard-h0cfe, remote auto-link threat model): when a
+  // linkSourceTag is supplied (remote-caller opt-in path only — never set
+  // for local CLI or trusted-subagent callers), narrow the candidate set:
+  //  - drop self-links (a page mentioning its own slug must never create
+  //    a self-loop edge — the general markdown/bare-slug path has no such
+  //    guard otherwise, unlike the basename-wikilink path).
+  //  - drop ALL incoming-direction candidates entirely. Frontmatter
+  //    `direction: incoming` fields let a page attribute a relationship
+  //    edge onto an arbitrary EXISTING page (fuzzy-resolved) without ever
+  //    writing to it — out of scope for v1 remote automation regardless of
+  //    the ranking-boost exclusion below, since that risk is about graph
+  //    integrity, not just search ranking.
+  //  - cap the remaining candidate count (defense-in-depth), surfacing the
+  //    drop count rather than silently truncating.
+  //  - retag every surviving candidate with linkSourceTag so it (a) writes
+  //    to the DB under that tag and (b) is excluded from getBacklinkCounts'
+  //    ranking boost (pglite-engine.ts / postgres-engine.ts).
+  let truncated = 0;
+  if (opts?.linkSourceTag != null) {
+    out = out.filter(c => c.targetSlug !== slug);
+    inc = [];
+    if (opts.maxCandidates != null && out.length > opts.maxCandidates) {
+      truncated = out.length - opts.maxCandidates;
+      out = out.slice(0, opts.maxCandidates);
+    }
+    const tag = opts.linkSourceTag;
+    out = out.map(c => ({ ...c, linkSource: tag }));
+  }
 
   // Run getLinks + addLink/removeLink loops inside a single transaction so that
   // concurrent put_page calls on the same slug can't race the reconciliation:
@@ -703,7 +786,14 @@ async function runAutoLink(
     const existingOut = await tx.getLinks(slug, sourceOpts);
     // Incoming: we only look at frontmatter edges WE authored (origin_slug=slug).
     // Non-frontmatter and other-page frontmatter edges survive untouched.
-    const existingInRaw = await tx.getBacklinks(slug, sourceOpts);
+    //
+    // v0.43-port: the remote-auto path (linkSourceTag set) never creates
+    // incoming edges (inc is forced empty above), so it must never READ or
+    // reconcile them either — a remote-auto call on a page that also has
+    // pre-existing LOCALLY-authored incoming frontmatter edges must leave
+    // them completely untouched, not remove them for "not being in this
+    // call's incKeys".
+    const existingInRaw = opts?.linkSourceTag != null ? [] : await tx.getBacklinks(slug, sourceOpts);
     const existingIn = existingInRaw.filter(
       l => l.link_source === 'frontmatter' && l.origin_slug === slug,
     );
@@ -716,11 +806,22 @@ async function runAutoLink(
     // survive after the wikilink is deleted from the page OR the
     // link_resolution.global_basename flag is turned off (out no longer
     // includes it, so the stale-removal loop below must be allowed to drop it).
-    const reconcilableOut = existingOut.filter(
-      l => l.link_source === 'markdown' || l.link_source == null ||
-           l.link_source === 'wikilink-resolved' ||
-           (l.link_source === 'frontmatter' && l.origin_slug === slug),
-    );
+    //
+    // v0.43-port: when linkSourceTag is set (remote-auto), scope
+    // reconciliation to ONLY edges previously created under that same tag.
+    // This call's `out` set only ever contains that tag's candidates, so
+    // reconciling against the broader local-mode categories (markdown/
+    // wikilink-resolved/frontmatter) would incorrectly flag pre-existing
+    // LOCALLY-authored edges as "stale" (not in this call's outKeys) and
+    // delete them — remote-auto must never touch edges it didn't itself
+    // create.
+    const reconcilableOut = opts?.linkSourceTag != null
+      ? existingOut.filter(l => l.link_source === opts.linkSourceTag)
+      : existingOut.filter(
+          l => l.link_source === 'markdown' || l.link_source == null ||
+               l.link_source === 'wikilink-resolved' ||
+               (l.link_source === 'frontmatter' && l.origin_slug === slug),
+        );
 
     const outKeys = new Set(out.map(c =>
       `${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? 'markdown'}`
@@ -796,7 +897,7 @@ async function runAutoLink(
     return { created, removed, errors };
   });
 
-  return { ...result, unresolved };
+  return { ...result, unresolved, ...(truncated > 0 ? { truncated } : {}) };
 }
 
 const delete_page: Operation = {

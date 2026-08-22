@@ -1166,6 +1166,10 @@ export const KNOWN_CONFIG_KEYS: readonly string[] = [
   // Link resolution (issue #972)
   'link_resolution',
   'link_resolution.global_basename',
+  // Remote auto-link (v0.43-port, dashboard-h0cfe): client-agnostic opt-in
+  // for put_page's remote-caller auto-link/auto-timeline path. Default OFF.
+  'remote_auto_link',
+  'remote_auto_timeline',
   // Spend controls (v0.42.42.0, issue #2139). Previously `--force`-only — the
   // operator had to discover these by reading source. Registered so `config
   // set` accepts them directly. See docs/operations/spend-controls.md.
