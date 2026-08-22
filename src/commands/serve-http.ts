@@ -1361,7 +1361,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.redirect('/admin/');
   });
 
-  // Admin auth middleware
+  // Admin auth middleware.
+  //
+  // AUTHZ-INV-010 (Phase 9D, historically 7fa7cc7f; reimplemented here on
+  // current architecture, Phase 3B-3): this middleware verifies
+  // Credential/Session validity (cookie presence, session existence,
+  // expiry) itself — that part is adapter-appropriate, not a Policy
+  // Decision. But the final allow/deny Capability check must route through
+  // the same shared Policy Decision function (hasScope) that the MCP
+  // tool-call dispatch below (ListTools/CallTool handlers) uses, not
+  // complete its own separate decision. An established admin session
+  // always carries the 'admin' scope (the strongest, catch-all scope in
+  // scope.ts's IMPLIES table) — this does not change who is allowed to do
+  // what today; it removes requireAdmin's own independent allow/deny
+  // branch so a future change to hasScope's decision logic applies here
+  // too, automatically, instead of needing a second, hand-synced copy.
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
     const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
     if (!sessionId || !adminSessions.has(sessionId)) {
@@ -1372,6 +1386,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (Date.now() > expiresAt) {
       adminSessions.delete(sessionId);
       res.status(401).json({ error: 'Session expired' });
+      return;
+    }
+    const allowed = hasScope(['admin'], 'admin');
+    if (!allowed) {
+      res.status(403).json({ error: 'Forbidden' });
       return;
     }
     next();
