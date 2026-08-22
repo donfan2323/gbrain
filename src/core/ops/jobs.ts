@@ -10,6 +10,7 @@
 import type { Operation, OperationContext } from './contract.ts';
 import { OperationError } from './contract.ts';
 import { normalizeSlugPrefix } from './context.ts';
+import { hasScope } from '../scope.ts';
 
 // --- Jobs (Minions) ---
 
@@ -421,6 +422,46 @@ const submit_agent: Operation = {
         prompt_byte_count: Buffer.byteLength(promptText, 'utf8'),
         outcome: 'submitted',
       });
+    } catch { /* never block submission */ }
+
+    // v0.46-slice (Phase 3B-2, AUTHZ-INV-017, WARN-ONLY): does the
+    // delegating client's OWN OAuth scope cover the required_scope of every
+    // tool it just handed to this job? `agent` is a committal-only scope
+    // (implies nothing else — scope.ts's IMPLIES table) — a client can be
+    // *bound* to tools its own scopes don't cover. That is the
+    // confused-deputy shape AUTHZ-INV-017 names: `agent` grants the right
+    // to *initiate* delegation, not possession of the delegated tools' own
+    // scopes. Historically implemented (commit 1f5243e9, 2026-08-03) as a
+    // warn-only audit that never reached the planned enforce stage — this
+    // reimplementation preserves that: it records, it never denies. Placed
+    // after queue.add() AND the plain "submitted" line (not before, unlike
+    // the historical pre-dry-run placement) so (a) a request about to be
+    // denied for an unrelated reason (tool/slug widening, source
+    // disagreement) never produces a misleading "allowed_with_warning" line
+    // for a delegation that never actually happened, and (b) the JSONL
+    // file's first line for any successful submission stays the plain
+    // "submitted" AgentAuditEvent shape, unchanged for existing readers.
+    try {
+      const { operationsByName } = await import('../operations.ts');
+      const delegatorScopes = ctx.auth?.scopes ?? [];
+      const shortfalls = requestedTools
+        .map(tool => ({ tool, requiredScope: (operationsByName[tool]?.scope as string | undefined) ?? 'read' }))
+        .filter(({ requiredScope }) => !hasScope(delegatorScopes, requiredScope));
+      if (shortfalls.length > 0) {
+        logAgentGrantDecision({
+          client_id: clientId,
+          decision: 'allowed_with_warning',
+          reason_code: 'delegation_scope_shortfall',
+          reason: `submit_agent: client ${clientId}'s own OAuth scopes (${delegatorScopes.join(' ') || '<none>'}) ` +
+            `do not cover the required scope of tool(s) it just delegated to job ${job.id}: ` +
+            `${shortfalls.map(s => `${s.tool} (needs "${s.requiredScope}")`).join(', ')}. ` +
+            `The \`agent\` scope only grants delegation-initiation authority, not possession of the ` +
+            `delegated tools' own scopes (AUTHZ-INV-017, warn-only — not yet enforced).`,
+          requested_tools: shortfalls.map(s => s.tool),
+          bound_tools: boundTools,
+          missing_scopes: [...new Set(shortfalls.map(s => s.requiredScope))],
+        });
+      }
     } catch { /* never block submission */ }
 
     // Amendments 24/25: the returned job id means nothing if the lane is

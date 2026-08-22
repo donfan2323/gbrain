@@ -92,14 +92,14 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
   );
 }
 
-function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean } = {}): any {
+function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean; scopes?: string[] } = {}): any {
   return {
     engine,
     config: {},
     logger: console,
     dryRun: opts.dryRun ?? false,
     remote: opts.remote ?? true,
-    auth: opts.clientId ? { clientId: opts.clientId } : undefined,
+    auth: opts.clientId ? { clientId: opts.clientId, scopes: opts.scopes ?? [] } : undefined,
   };
 }
 
@@ -107,6 +107,14 @@ async function callSubmitAgent(ctx: any, params: Record<string, unknown>): Promi
   return await withEnv({ GBRAIN_AUDIT_DIR: tmpAuditDir }, async () => {
     return await submit_agent.handler(ctx, params);
   });
+}
+
+/** Shared by both the Phase 3B-1 and Phase 3B-2 grant-decision-audit blocks below. */
+function readAuditLines(): Array<Record<string, unknown>> {
+  const auditFiles = fs.readdirSync(tmpAuditDir).filter(f => f.startsWith('agent-jobs-'));
+  if (auditFiles.length === 0) return [];
+  const content = fs.readFileSync(path.join(tmpAuditDir, auditFiles[0]), 'utf8');
+  return content.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
 }
 
 describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with binding enforcement)', () => {
@@ -430,13 +438,6 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
   });
 
   describe('Phase 3B-1: grant-decision audit (rejections + unfenced-null-slug warning)', () => {
-    function readAuditLines(): Array<Record<string, unknown>> {
-      const auditFiles = fs.readdirSync(tmpAuditDir).filter(f => f.startsWith('agent-jobs-'));
-      if (auditFiles.length === 0) return [];
-      const content = fs.readFileSync(path.join(tmpAuditDir, auditFiles[0]), 'utf8');
-      return content.trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
-    }
-
     it('no-binding rejection is audited (decision=denied, reason_code=no_binding)', async () => {
       await seedClient('legacy-admin', { bound_tools: null });
       const ctx = makeCtx({ clientId: 'legacy-admin' });
@@ -531,12 +532,177 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor' });
+      // 'search' requires the 'read' scope (src/core/ops/search.ts) — the
+      // client must actually hold it, or Phase 3B-2's scope-shortfall check
+      // (below) would add its own allowed_with_warning line here too. This
+      // test's premise is "a fully valid, fully-scoped submission produces
+      // no warnings of any kind" — see the Phase 3B-2 block for the
+      // shortfall case itself.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
       await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search'] });
       const lines = readAuditLines();
       expect(lines.length).toBe(1);
       expect(lines[0].outcome).toBe('submitted');
       expect(lines.some(l => l.decision === 'denied')).toBe(false);
+      expect(lines.some(l => l.decision === 'allowed_with_warning')).toBe(false);
+    });
+  });
+
+  // Phase 3B-2 — AUTHZ-INV-017 confused-deputy scope-shortfall audit
+  // (warn-only). Reimplements the *behavior* of historical commit 1f5243e9
+  // (2026-08-03, `delegationScopeShortfalls` in delegation-capability.ts)
+  // on current architecture: does the delegating client's OWN OAuth scope
+  // cover the required_scope of every tool it hands to the child job?
+  // `agent` implies nothing else (scope.ts's IMPLIES table), so a client can
+  // be *bound* to a tool its own scope doesn't cover — that's the
+  // confused-deputy shape. Historically (and here) this is WARN-ONLY: it is
+  // recorded on the grant-decision audit trail, it never denies the
+  // delegation. CD-1..CD-8 below are this task's required test matrix,
+  // reframed around that confirmed definition — NOT the source/client-
+  // identity-mismatch framing floated before the forensic read of 1f5243e9,
+  // which turned out to describe a different, already-implemented check
+  // (source_disagreement, above) rather than AUTHZ-INV-017 itself.
+  describe('Phase 3B-2: AUTHZ-INV-017 confused-deputy scope-shortfall audit (warn-only)', () => {
+    it('CD-1: delegator scopes fully cover the requested tool → ALLOW, no shortfall warning', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // 'search' requires 'read' (src/core/ops/search.ts).
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search'] });
+      expect(result.id).toBeGreaterThan(0);
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
+    });
+
+    it('CD-2: delegator lacks the required scope for a bound write tool → ALLOWED_WITH_WARNING, not denied', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // 'put_page' requires 'write' (src/core/ops/pages.ts); client only has 'agent'.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] });
+      // Not denied — the delegation still succeeds.
+      expect(result.id).toBeGreaterThan(0);
+      const lines = readAuditLines();
+      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(warning).toBeTruthy();
+      expect(warning!.decision).toBe('allowed_with_warning');
+      expect(warning!.client_id).toBe('cursor');
+      expect(warning!.requested_tools).toEqual(['put_page']);
+      expect(warning!.missing_scopes).toEqual(['write']);
+    });
+
+    it('CD-3: partial coverage across multiple tools → shortfall lists only the uncovered tool', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search', 'put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // Covers 'search' (read) but not 'put_page' (write).
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'hi',
+        allowed_tools: ['search', 'put_page'],
+      });
+      expect(result.id).toBeGreaterThan(0);
+      const lines = readAuditLines();
+      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(warning).toBeTruthy();
+      expect(warning!.requested_tools).toEqual(['put_page']);
+      expect(warning!.missing_scopes).toEqual(['write']);
+    });
+
+    it('CD-4: scope hierarchy respected — admin covers write, no false-positive shortfall', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // admin implies write (scope.ts IMPLIES table) even though it's not
+      // spelled 'write' literally.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['admin', 'agent'] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] });
+      expect(result.id).toBeGreaterThan(0);
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
+    });
+
+    it('CD-5: tool-widening still denies before any scope-shortfall consideration, even with broad delegator scopes', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // Delegator holds every scope there is — irrelevant, since bound_tools
+      // narrowing is a completely independent check that runs first.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['admin', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow(/not in client cursor's bound_tools/);
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
+      const denial = lines.find(l => l.reason_code === 'tool_widening');
+      expect(denial).toBeTruthy();
+    });
+
+    it('CD-6: slug-widening still denies before any scope-shortfall consideration, even with full tool-scope coverage', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['emp-alice/'],
+      });
+      // Delegator fully covers put_page's required scope — irrelevant, since
+      // slug-prefix narrowing is a completely independent check.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_slug_prefixes: ['emp-alice-2/'] }),
+      ).rejects.toThrow(/not under any of client cursor's bound_slug_prefixes/);
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
+      const denial = lines.find(l => l.reason_code === 'slug_widening');
+      expect(denial).toBeTruthy();
+    });
+
+    it('CD-7: shortfall audit event carries reconstructable detail with no prompt/secret leakage', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
+      await callSubmitAgent(ctx, { prompt: 'super-secret-prompt-text', allowed_tools: ['put_page'] });
+      const lines = readAuditLines();
+      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(warning).toBeTruthy();
+      expect(warning!.decision).toBe('allowed_with_warning');
+      expect(warning!.bound_tools).toEqual(['put_page']);
+      expect(typeof warning!.reason).toBe('string');
+      expect(warning!.reason as string).toMatch(/AUTHZ-INV-017/);
+      expect(warning!.reason as string).toMatch(/warn-only/);
+      const raw = JSON.stringify(lines);
+      expect(raw).not.toContain('super-secret-prompt-text');
+    });
+
+    it('CD-8: shortfall is genuinely warn-only — job is actually created, not denied', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: [] }); // no scopes at all
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] });
+      expect(result.id).toBeGreaterThan(0);
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT status FROM minion_jobs WHERE id = $1`,
+        [result.id],
+      );
+      expect(rows.length).toBe(1);
+      expect(rows[0].status).not.toBe('denied');
     });
   });
 });

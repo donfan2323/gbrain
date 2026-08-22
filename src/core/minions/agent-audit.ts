@@ -122,6 +122,13 @@ export interface AgentGrantDecisionEvent {
   bound_slug_prefixes?: string[] | null;
   requested_source?: string | null;
   bound_source?: string | null;
+  /**
+   * Phase 3B-2 (AUTHZ-INV-017, warn-only): OAuth scopes required_scope of at
+   * least one `requested_tools` entry that the delegating client's own
+   * `ctx.auth.scopes` did not cover. Only present on
+   * reason_code:'delegation_scope_shortfall' events.
+   */
+  missing_scopes?: string[];
 }
 
 /** Append one grant-decision event. Best-effort; logs to stderr on failure. */
