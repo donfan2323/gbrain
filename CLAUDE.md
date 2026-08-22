@@ -1,5 +1,12 @@
 # CLAUDE.md
 
+> **Git operations in this repository**: `origin` here is a third-party/upstream
+> remote, not confirmed user-owned — push is denied pending confirmation of write
+> access. Verify the actual remote URL before assuming push permission
+> (`git remote get-url --push origin`).
+
+> **branch/worktree運用**: `/Users/lab/AI_Project/shared_rules/CONSTITUTION.md` RULE-9を正本とする。要約: 現在のbranchが依頼と同じタスク専用ならそのまま継続、新規独立タスクはfeature branch、並行作業や大型/実験的変更はworktree（`git worktree add`の手動実行よりEnterWorktree/ExitWorktreeツールを優先）。「branchを作りますか」等の技術確認はユーザーへしない。
+
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable
 engines: PGLite (embedded Postgres via WASM, zero-config default) or Postgres + pgvector
 + hybrid search in a managed Supabase instance. `gbrain init` defaults to PGLite;
@@ -707,6 +714,13 @@ The /ship workflow's Step 1 should be augmented to run the mismatch
 check; until that lands upstream, ALWAYS run the check above before
 `/ship` invokes its first push or PR-create step.
 
+## Local checkout git governance
+
+Separate from the Conductor rule above: this checkout's remote roles
+(`origin` fetch-only, `fork` writable), protected-branch rules, and
+destructive-ref-update hooks are documented in
+**[docs/GIT_GOVERNANCE.md](docs/GIT_GOVERNANCE.md)** — read it before any
+`git reset`/`branch -f`/force-push in this working tree.
 
 ## Releasing
 
