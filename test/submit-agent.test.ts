@@ -508,7 +508,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(denial!.bound_source).toBe('source-a');
     });
 
-    it('client with bound_slug_prefixes=NULL is ALLOWED (not enforced) but produces an allowed_with_warning audit event', async () => {
+    it('client with bound_slug_prefixes=NULL requesting an explicit slug is DENIED (Phase 3B-10, AUTHZ-INV-016 enforced — null is ungranted, not unrestricted)', async () => {
       await seedClient('legacy-unfenced', {
         bound_tools: ['put_page'],
         bound_source_id: 'default',
@@ -516,22 +516,20 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       });
       // scopes must cover 'put_page' (write) so this request isn't instead
       // denied earlier by AUTHZ-INV-017's scope-shortfall enforcement
-      // (Phase 3B-9) — this test is specifically about the AUTHZ-INV-016
-      // null-slug-binding gap, which (unlike AUTHZ-INV-017) remains warn-only.
+      // (Phase 3B-9) — this test is specifically about AUTHZ-INV-016.
       const ctx = makeCtx({ clientId: 'legacy-unfenced', dryRun: true, scopes: ['write', 'agent'] });
-      // Must NOT throw — this gap is warn-only, not enforced, per the
-      // compatibility gate (production usage could not be safely confirmed).
-      const result = await callSubmitAgent(ctx, {
-        prompt: 'hi',
-        allowed_slug_prefixes: ['anyone/private-slug'],
-      });
-      expect(result.dry_run).toBe(true);
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_slug_prefixes: ['anyone/private-slug'] }),
+      ).rejects.toThrow(/not under any of client legacy-unfenced's bound_slug_prefixes/);
       const lines = readAuditLines();
-      const warning = lines.find(l => l.reason_code === 'unfenced_null_slug_binding');
-      expect(warning).toBeTruthy();
-      expect(warning!.decision).toBe('allowed_with_warning');
-      expect(warning!.client_id).toBe('legacy-unfenced');
-      expect(warning!.bound_slug_prefixes).toBeNull();
+      const denial = lines.find(l => l.reason_code === 'slug_widening');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.client_id).toBe('legacy-unfenced');
+      expect(denial!.bound_slug_prefixes).toBeNull();
+      // No stale warn-only event alongside the denial (exactly one decision).
+      expect(lines.some(l => l.reason_code === 'unfenced_null_slug_binding')).toBe(false);
+      expect(lines.length).toBe(1);
     });
 
     it('valid submission still produces exactly the existing "submitted" audit line — no spurious denial events', async () => {
@@ -845,6 +843,150 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(result.name).toBe('subagent');
       expect(result.client_id).toBe('cursor');
       expect(result.queue_state).toBeDefined();
+    });
+  });
+
+  // Phase 3B-10 — AUTHZ-INV-016 null-binding enforcement. `bound_slug_prefixes
+  // = NULL` and `= []` are defined as semantically identical ("no delegation
+  // write namespace granted") per PHASE9A-AUTHORIZATION-INVARIANTS.md's
+  // 2026-08-03 revision — NULL never meant "unrestricted" for this axis, only
+  // "ungranted". Before this phase, only `[]` actually enforced that
+  // definition; NULL was an unchecked pass-through (Phase 3B-1, 41fec1ed,
+  // warn-only, deferred pending a production-compatibility check). This
+  // block proves NULL and `[]` are now behaviorally identical, and that
+  // AUTHZ-INV-016 stays orthogonal to AUTHZ-INV-017 (Phase 3B-9) and to the
+  // separate, untouched direct-write fence (enforceClientSlugFence,
+  // context.ts) whose OWN null="full-source write authority" semantics for a
+  // client's own writes are a genuinely different, still-valid design.
+  describe('Phase 3B-10: AUTHZ-INV-016 null-binding enforcement (null == [] == ungranted)', () => {
+    it('NB-1: null binding + otherwise-valid scopes + explicit slug request → DENIED', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['anyone/private-slug'] }),
+      ).rejects.toThrow(/not under any of client cursor's bound_slug_prefixes/);
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
+      );
+      expect(rows.length).toBe(0);
+    });
+
+    it('NB-2: explicit allowed prefix + matching slug → ALLOWED (unaffected baseline)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: ['wiki/'] });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['wiki/'] });
+      expect(result.id).toBeGreaterThan(0);
+    });
+
+    it('NB-3: explicit allowed prefix + nonmatching slug → existing denial preserved (slug_widening)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: ['wiki/'] });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['private/'] }),
+      ).rejects.toThrow(/not under any of client cursor's bound_slug_prefixes/);
+    });
+
+    it('NB-4: empty binding array ([]) — established meaning preserved (already denied pre-3B-10, unchanged)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: [] });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow(/resolved to an empty prefix list/);
+    });
+
+    it('NB-5: null binding + dry-run — denied as an authorization check, not previewed as if it would succeed (matches the real-submission outcome, same as AUTHZ-INV-017\'s CD-14 precedent)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['anyone/private-slug'] }),
+      ).rejects.toThrow(/not under any of client cursor's bound_slug_prefixes/);
+    });
+
+    it('NB-6: null binding + multiple requested slugs — every one denied, none partially granted', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['a/', 'b/'] }),
+      ).rejects.toThrow();
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
+      );
+      expect(rows.length).toBe(0);
+    });
+
+    it('NB-7: AUTHZ-INV-017 remains orthogonal — explicit valid slug binding + insufficient tool scope is still denied by AUTHZ-INV-017, not AUTHZ-INV-016', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: ['wiki/'] });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] }); // no 'write' — AUTHZ-INV-017 gap
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['wiki/'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(denial).toBeTruthy(); // AUTHZ-INV-017's reason, not AUTHZ-INV-016's
+      expect(lines.some(l => l.reason_code === 'slug_widening' || l.reason_code === 'empty_resolved_slug_prefixes')).toBe(false);
+    });
+
+    it('NB-8: null binding + sufficient tool scopes — AUTHZ-INV-016 is the controlling decision (not masked by AUTHZ-INV-017)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] }); // fully covers put_page — AUTHZ-INV-017 passes
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['anyone/'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false); // NOT AUTHZ-INV-017
+      const denial = lines.find(l => l.reason_code === 'slug_widening');
+      expect(denial).toBeTruthy(); // AUTHZ-INV-016's own reason
+    });
+
+    it('NB-9: exactly-once audit — a null-binding denial produces exactly one decision event, never a legacy warning alongside a new denial', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['anyone/'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      expect(lines.length).toBe(1);
+      expect(lines[0].reason_code).toBe('slug_widening');
+    });
+
+    it('NB-10: zero job/queue side effects on an AUTHZ-INV-016 denial (null, implicit no-request case too — matches [] today)', async () => {
+      await seedClient('cursor', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['write', 'agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }), // no explicit allowed_slug_prefixes
+      ).rejects.toThrow(/resolved to an empty prefix list/);
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
+      );
+      expect(rows.length).toBe(0);
+    });
+
+    it('null and [] bindings now produce byte-identical denial reason_codes for the same request shape', async () => {
+      await seedClient('client-null', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: null });
+      await seedClient('client-empty', { bound_tools: ['put_page'], bound_source_id: 'default', bound_slug_prefixes: [] });
+      const ctxNull = makeCtx({ clientId: 'client-null', scopes: ['write', 'agent'] });
+      const ctxEmpty = makeCtx({ clientId: 'client-empty', scopes: ['write', 'agent'] });
+      let nullCode: unknown, emptyCode: unknown;
+      try { await callSubmitAgent(ctxNull, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['x/'] }); } catch (e: any) { nullCode = e.code; }
+      try { await callSubmitAgent(ctxEmpty, { prompt: 'hi', allowed_tools: ['put_page'], allowed_slug_prefixes: ['x/'] }); } catch (e: any) { emptyCode = e.code; }
+      expect(nullCode).toBe('permission_denied');
+      expect(emptyCode).toBe('permission_denied');
+      const lines = readAuditLines();
+      const nullReason = lines.find(l => l.client_id === 'client-null')?.reason_code;
+      const emptyReason = lines.find(l => l.client_id === 'client-empty')?.reason_code;
+      expect(nullReason).toBe(emptyReason);
+      expect(nullReason).toBe('slug_widening');
+    });
+
+    it('the direct-write fence (enforceClientSlugFence) is untouched — a client\'s own null bound_slug_prefixes still means unrestricted DIRECT writes (separate mechanism, separate axis)', async () => {
+      // Regression guard, not a submit_agent test: import context.ts's own
+      // fence function directly and confirm null still means "no fence" for
+      // a client's OWN write, per its own doc comment ("no binding / no
+      // auth = no fence ... full-source write authority"). AUTHZ-INV-016
+      // (this phase) only changed submit_agent's DELEGATION check.
+      const { slugOutsideCallerFence } = await import('../src/core/ops/context.ts');
+      const ctx = { auth: { clientId: 'x', scopes: ['write'], boundSlugPrefixes: undefined } } as any;
+      expect(slugOutsideCallerFence(ctx, 'anywhere/at-all')).toBe(false);
     });
   });
 });
