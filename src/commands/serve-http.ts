@@ -817,6 +817,70 @@ export async function logAdminAuthorityAudit(
   }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-7): audit for POST /webhooks/github.
+ *
+ * Historical Phase 9C (4a33a63e) precedent for this EXACT route, read in
+ * full: audited exactly 6 of its 13 terminal branches — missing_signature,
+ * webhook_not_configured, the two signature-mismatch branches, sync-job
+ * success, and sync-job queue-submission failure. The other 7 (event!=push
+ * ignore, empty_body, malformed_json, missing_fields, source lookup_failed,
+ * unknown_repo, ref_mismatch ignore) were deliberately left unaudited —
+ * they either fire on UNVERIFIED payload content (before HMAC
+ * verification even runs) or are legitimate webhook-protocol no-ops
+ * (GitHub sends non-push events and off-branch pushes routinely; auditing
+ * every one would flood the log with routine, non-security-relevant
+ * noise, and an attacker can trivially forge any repository/ref/payload
+ * shape without ever holding the real secret — attributing a "denial" to
+ * unverified content would be misleading). This port follows the same
+ * split, for the same reasons, re-derived independently and confirmed
+ * against the historical diff rather than assumed.
+ *
+ * Actor: a GitHub webhook has no OAuth client identity to check — AUTHZ-
+ * INV-010's own source-of-truth text names exactly this adapter shape
+ * ("GitHub Webhookのような...主体認証を伴わないメッセージ真正性検証の
+ * みのアダプター") as the explicit exception to principal/client
+ * identification. Never invent one — use the fixed, non-secret literal
+ * 'github-webhook', the sibling of logAdminAuthorityAudit's 'admin-api'
+ * for the same reason (a verified-message-source adapter is a different,
+ * genuinely distinct actor category from an admin session, so it gets
+ * its own literal rather than reusing that one).
+ *
+ * `target`, when present, is always the internal `sources` table row id
+ * (safe, non-secret, already the identifier every OTHER call site in this
+ * route uses for the same source) — NEVER the GitHub repository full_name
+ * or ref/branch name, matching the historical implementation's own choice
+ * to exclude both even though they were available in scope. `reason` is
+ * always a fixed classified string for every denial/validation-adjacent
+ * branch (Phase 14's own instruction: unverified content is never trusted
+ * as audit metadata) — the one exception, matching /ingest's established
+ * precedent (Phase 3B-4), is the queue-submission-failure branch, which
+ * runs only AFTER signature verification succeeds and carries an internal
+ * exception message, not GitHub-controlled content.
+ */
+export async function logGithubWebhookAudit(
+  engine: BrainEngine,
+  input: {
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+    target?: string | null;
+    latencyMs: number;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['github-webhook', 'github-webhook', 'webhooks_github', input.latencyMs, input.status, input.reason ?? null],
+      [input.target != null ? { target: input.target } : null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[webhook-audit] failed to write webhooks_github/${input.status} audit row: ${msg}\n`);
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -3280,10 +3344,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     githubWebhookLimiter,
     express.raw({ type: '*/*', limit: '1mb' }),
     async (req: Request, res: Response) => {
+      const startTime = Date.now();
       // D3 pre-DB short-circuit: missing signature → 401 without any
       // source lookup. Bot probe traffic ends here.
       const sigHeader = req.header('X-Hub-Signature-256');
       if (!sigHeader) {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'missing_signature', latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'missing_signature', message: 'X-Hub-Signature-256 header is required' });
         return;
       }
@@ -3357,6 +3425,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const secret = cfg.webhook_secret;
       if (!secret || typeof secret !== 'string') {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'webhook_not_configured', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'webhook_not_configured', message: 'Run: gbrain sources webhook set ' + source.id });
         return;
       }
@@ -3370,10 +3441,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
       const prefix = 'sha256=';
       if (!sigHeader.startsWith(prefix)) {
+        // Fixed reason only — never the raw sigHeader value (Phase 14: an
+        // unverified signature-shaped header is not trustworthy audit
+        // metadata, and it's the one piece of this request that's
+        // security-sensitive by construction).
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'missing_signature_prefix', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256= prefix' });
         return;
       }
       if (!safeHexEqual(sigHeader.slice(prefix.length), computedHex)) {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'signature_mismatch', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'signature_mismatch' });
         return;
       }
@@ -3395,10 +3476,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             maxWaiting: 1,
           },
         );
+        await logGithubWebhookAudit(engine, {
+          status: 'success', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(202).json({ job_id: job.id, source_id: source.id });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
+        // Post-signature-verification, trusted: this is an internal
+        // exception message (queue/DB failure), not GitHub-controlled
+        // content, matching /ingest's established precedent (Phase 3B-4)
+        // for the analogous post-auth operational-failure branch.
+        await logGithubWebhookAudit(engine, {
+          status: 'error', reason: `queue_submission_failed: ${msg}`, target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(500).json({ error: 'queue_submission_failed', message: msg });
       }
     },
