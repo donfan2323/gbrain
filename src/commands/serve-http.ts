@@ -695,6 +695,62 @@ export async function logIngestAudit(
   } catch { /* best effort — never block the response the caller already sent */ }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-5): audit for the OAuth credential-lifecycle
+ * endpoints — POST /token (client_credentials, and the confidential-client
+ * authorization_code/refresh_token path) and POST /revoke.
+ *
+ * PHASE9A-AUTHORIZATION-INVARIANTS.md's AUTHZ-INV-013 names these as "the
+ * credential lifecycle itself... currently zero permanent audit" — still
+ * true in current architecture (the historical stopgap, oauth-diagnostic.ts,
+ * does not exist here; historical commit 4a33a63e's audit_events wiring for
+ * these routes never landed upstream). Reuses mcp_request_log exactly like
+ * POST /ingest (Phase 3B-4) — same table, same best-effort posture, one more
+ * producer, no new schema.
+ *
+ * Scope note (found, not assumed): current /token and /revoke are each a
+ * CUSTOM Express handler ONLY for confidential clients (secret presented via
+ * body or Basic auth) — both explicitly `next()`-fall-through to the MCP
+ * SDK's own mounted `authRouter` (@modelcontextprotocol/sdk) for public/PKCE
+ * clients, and GET/POST /authorize is 100% SDK-owned with no custom handler
+ * at all. This function only covers what the fall-through-reached SDK code
+ * ever does. Instrumenting the SDK's own request handling would need a
+ * middleware-wrapper around third-party router internals — Phase 9C's own
+ * implementation report explicitly named this exact gap as out of scope
+ * ("SDKマウント境界...サードパーティコードであり直接編集できない...別途必要",
+ * dashboard-4xj73) and never built it either. This task does not attempt it.
+ *
+ * `reason` MUST be one of the fixed OAuth error-code strings this file's own
+ * handlers already return in the HTTP response body (invalid_request,
+ * invalid_client, invalid_grant, server_error, temporarily_unavailable) —
+ * NEVER a raw exception message, request field, or header value. Every call
+ * site below passes only clientId (the OAuth client_id being authenticated —
+ * itself the credential's own claimed identity, not a secret) plus one of
+ * these fixed strings. No token, secret, code, or PKCE verifier is ever
+ * constructed into a call to this function.
+ */
+export async function logOAuthCredentialAudit(
+  engine: BrainEngine,
+  input: {
+    endpoint: 'token' | 'revoke';
+    grantType?: 'client_credentials' | 'authorization_code' | 'refresh_token';
+    clientId: string | null;
+    latencyMs: number;
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [input.clientId, input.clientId, `oauth_${input.endpoint}`, input.latencyMs, input.status, input.reason ?? null],
+      [input.grantType ? { grant_type: input.grantType } : null],
+    );
+  } catch { /* best effort — never block the response the caller already sent */ }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -980,18 +1036,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
+    const startTime = Date.now();
 
     try {
       const { client_id, client_secret, scope } = req.body;
       if (!client_id || !client_secret) {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'token', grantType: 'client_credentials', clientId: client_id ?? null,
+          latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+        });
         res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret required' });
         return;
       }
 
       const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType: 'client_credentials', clientId: client_id,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       res.json(tokens);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType: 'client_credentials', clientId: req.body?.client_id ?? null,
+        latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_grant',
+      });
       res.status(400).json({ error: 'invalid_grant', error_description: msg });
     }
   });
@@ -1035,6 +1104,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (!clientId || !presentedSecret) {
       return next(); // Public client path; SDK handles.
     }
+    const startTime = Date.now();
 
     try {
       const client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
@@ -1044,6 +1114,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const redirectUri = req.body.redirect_uri;
         const codeVerifier = req.body.code_verifier;
         if (!code) {
+          await logOAuthCredentialAudit(engine, {
+            endpoint: 'token', grantType, clientId,
+            latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+          });
           res.status(400).json({ error: 'invalid_request', error_description: 'code required' });
           return;
         }
@@ -1052,17 +1126,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const refreshToken = req.body.refresh_token;
         const scopeParam = typeof req.body.scope === 'string' ? req.body.scope.split(/\s+/) : undefined;
         if (!refreshToken) {
+          await logOAuthCredentialAudit(engine, {
+            endpoint: 'token', grantType, clientId,
+            latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+          });
           res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
           return;
         }
         tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam);
       }
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType, clientId,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       res.json(tokens);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       // RFC 6749: invalid_client for auth failures, invalid_grant for
       // code/token problems. "Invalid client" → 401; everything else 400.
-      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+      const authFailure = msg === 'Invalid client' || msg === 'Client has been revoked';
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType, clientId,
+        latencyMs: Date.now() - startTime, status: 'denied',
+        reason: authFailure ? 'invalid_client' : 'invalid_grant',
+      });
+      if (authFailure) {
         res.status(401).json({ error: 'invalid_client', error_description: msg });
       } else {
         res.status(400).json({ error: 'invalid_grant', error_description: msg });
@@ -1077,6 +1165,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // secret and continue through to the SDK's PKCE-compatible handler.
   app.post('/revoke', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
+    const startTime = Date.now();
 
     const rawClientId: unknown = req.body?.client_id;
     const rawBodySecret: unknown = req.body?.client_secret;
@@ -1091,6 +1180,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       (rawBodySecret !== undefined && typeof rawBodySecret !== 'string') ||
       (hasBasicAuth && (rawClientId !== undefined || rawBodySecret !== undefined))
     ) {
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId: null,
+        latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+      });
       res.status(400).json({ error: 'invalid_request', error_description: 'Malformed or mixed client authentication' });
       return;
     }
@@ -1110,6 +1203,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         presentedSecret = decodeURIComponent(decoded.slice(idx + 1).replace(/\+/g, ' '));
         if (!presentedSecret) throw new Error('Malformed Basic authentication');
       } catch {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'revoke', clientId: null,
+          latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_client',
+        });
         res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
         res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
         return;
@@ -1119,6 +1216,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
     const parsedRequest = OAuthTokenRevocationRequestSchema.safeParse(req.body);
     if (!parsedRequest.success || parsedRequest.data.token.length === 0) {
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+      });
       res.status(400).json({ error: 'invalid_request', error_description: 'Valid token required' });
       return;
     }
@@ -1129,12 +1230,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
       if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'revoke', clientId,
+          latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_client',
+        });
         if (hasBasicAuth) res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
         res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
         return;
       }
       console.error('[serve-http] revoke client verification failed:', msg || 'Unknown error');
       const retryable = isRetryableError(e);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error',
+        reason: retryable ? 'temporarily_unavailable' : 'server_error',
+      });
       res.status(retryable ? 503 : 500).json({
         error: retryable ? 'temporarily_unavailable' : 'server_error',
         error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
@@ -1144,12 +1254,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
     try {
       await oauthProvider.revokeToken(client, parsedRequest.data);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       // RFC 7009 §2.2: successful revocation, including an unknown token, is 200.
       res.status(200).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       console.error('[serve-http] token revocation failed:', msg);
       const retryable = isRetryableError(e);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error',
+        reason: retryable ? 'temporarily_unavailable' : 'server_error',
+      });
       res.status(retryable ? 503 : 500).json({
         error: retryable ? 'temporarily_unavailable' : 'server_error',
         error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
