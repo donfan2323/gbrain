@@ -109,7 +109,7 @@ async function callSubmitAgent(ctx: any, params: Record<string, unknown>): Promi
   });
 }
 
-/** Shared by both the Phase 3B-1 and Phase 3B-2 grant-decision-audit blocks below. */
+/** Shared by the Phase 3B-1 and Phase 3B-9 grant-decision-audit blocks below. */
 function readAuditLines(): Array<Record<string, unknown>> {
   const auditFiles = fs.readdirSync(tmpAuditDir).filter(f => f.startsWith('agent-jobs-'));
   if (auditFiles.length === 0) return [];
@@ -176,7 +176,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_slug_prefixes: ['wiki/'],
         bound_max_concurrent: 3,
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, {
         prompt: 'go',
         allowed_tools: ['search', 'get_page'],
@@ -203,7 +203,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'go' });
       expect(result.dry_run).toBe(true);
     });
@@ -218,7 +218,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'go', allowed_tools: [] });
       expect(result.dry_run).toBe(true);
       expect(result.resolved_tools).toEqual(['search']);
@@ -232,7 +232,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['emp-alice/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['write', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'go', allowed_slug_prefixes: [] });
       // Normalized into the glob the delegated matcher understands, so the
       // subagent can write descendants rather than one exact slug.
@@ -247,7 +247,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/', 'people/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['write', 'agent'] });
       // 'wiki/' starts with 'wiki/' (exact prefix match)
       const r1 = await callSubmitAgent(ctx, {
         prompt: 'go',
@@ -306,7 +306,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
          VALUES ('subagent', 'active', $1::jsonb, 'default', 0, now())`,
         [JSON.stringify({ prompt: 'one', __owner_client_id: 'cursor' })],
       );
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'two' });
       expect(result.dry_run).toBe(true);
       expect(result.bound_max_concurrent).toBe(3);
@@ -327,7 +327,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
           [JSON.stringify({ prompt: `done-${i}`, __owner_client_id: 'cursor' })],
         );
       }
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'fresh' });
       expect(result.dry_run).toBe(true);
     });
@@ -352,7 +352,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         [JSON.stringify({ prompt: 'alice-busy', __owner_client_id: 'alice' })],
       );
       // Bob's submit should succeed — his cap (1) is independent.
-      const ctxBob = makeCtx({ clientId: 'bob', dryRun: true });
+      const ctxBob = makeCtx({ clientId: 'bob', dryRun: true, scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctxBob, { prompt: 'bob-fresh' });
       expect(result.dry_run).toBe(true);
     });
@@ -367,7 +367,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_max_concurrent: 3,
         budget_usd_per_day: 5.00,
       });
-      const ctx = makeCtx({ clientId: 'cursor' });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, {
         prompt: 'research the YC W26 batch',
         allowed_tools: ['search'],
@@ -421,7 +421,7 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor' });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
       const result = await callSubmitAgent(ctx, {
         prompt: 'long',
         max_turns: 9999, // way over cap
@@ -493,7 +493,11 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'source-a',
         bound_slug_prefixes: ['wiki/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor' });
+      // scopes must cover 'search' (read) so this request reaches the
+      // source_disagreement check rather than being denied earlier by
+      // AUTHZ-INV-017's scope-shortfall enforcement (Phase 3B-9) — this
+      // test is specifically about source disagreement, not scope.
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
       (ctx as any).auth.sourceId = 'source-b';
       await expect(callSubmitAgent(ctx, { prompt: 'hi' })).rejects.toThrow();
       const lines = readAuditLines();
@@ -510,7 +514,11 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: null,
       });
-      const ctx = makeCtx({ clientId: 'legacy-unfenced', dryRun: true });
+      // scopes must cover 'put_page' (write) so this request isn't instead
+      // denied earlier by AUTHZ-INV-017's scope-shortfall enforcement
+      // (Phase 3B-9) — this test is specifically about the AUTHZ-INV-016
+      // null-slug-binding gap, which (unlike AUTHZ-INV-017) remains warn-only.
+      const ctx = makeCtx({ clientId: 'legacy-unfenced', dryRun: true, scopes: ['write', 'agent'] });
       // Must NOT throw — this gap is warn-only, not enforced, per the
       // compatibility gate (production usage could not be safely confirmed).
       const result = await callSubmitAgent(ctx, {
@@ -533,11 +541,11 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_slug_prefixes: ['wiki/'],
       });
       // 'search' requires the 'read' scope (src/core/ops/search.ts) — the
-      // client must actually hold it, or Phase 3B-2's scope-shortfall check
-      // (below) would add its own allowed_with_warning line here too. This
-      // test's premise is "a fully valid, fully-scoped submission produces
-      // no warnings of any kind" — see the Phase 3B-2 block for the
-      // shortfall case itself.
+      // client must actually hold it, or Phase 3B-9's scope-enforcement
+      // check (below) would deny this submission outright. This test's
+      // premise is "a fully valid, fully-scoped submission produces no
+      // warnings or denials of any kind" — see the Phase 3B-9 block for
+      // the shortfall/denial case itself.
       const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
       await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search'] });
       const lines = readAuditLines();
@@ -548,22 +556,29 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
     });
   });
 
-  // Phase 3B-2 — AUTHZ-INV-017 confused-deputy scope-shortfall audit
-  // (warn-only). Reimplements the *behavior* of historical commit 1f5243e9
-  // (2026-08-03, `delegationScopeShortfalls` in delegation-capability.ts)
-  // on current architecture: does the delegating client's OWN OAuth scope
-  // cover the required_scope of every tool it hands to the child job?
-  // `agent` implies nothing else (scope.ts's IMPLIES table), so a client can
-  // be *bound* to a tool its own scope doesn't cover — that's the
-  // confused-deputy shape. Historically (and here) this is WARN-ONLY: it is
-  // recorded on the grant-decision audit trail, it never denies the
-  // delegation. CD-1..CD-8 below are this task's required test matrix,
-  // reframed around that confirmed definition — NOT the source/client-
-  // identity-mismatch framing floated before the forensic read of 1f5243e9,
-  // which turned out to describe a different, already-implemented check
-  // (source_disagreement, above) rather than AUTHZ-INV-017 itself.
-  describe('Phase 3B-2: AUTHZ-INV-017 confused-deputy scope-shortfall audit (warn-only)', () => {
-    it('CD-1: delegator scopes fully cover the requested tool → ALLOW, no shortfall warning', async () => {
+  // Phase 3B-9 — AUTHZ-INV-017 confused-deputy scope enforcement (RESTORED/
+  // ENFORCED). Historical commit 1f5243e9 (2026-08-03) computed this exact
+  // shortfall — via `delegationScopeShortfalls` in delegation-capability.ts
+  // — at this exact point in the handler (after narrowing, before dry-run/
+  // queue.add), but only ever recorded it: "Phase 9E-1 records but does not
+  // deny... Phase 9E-2 will switch this to a denial." Phase 9E-2 never
+  // shipped historically (no commit in this repo's full history implements
+  // it). This project's own Phase 3B-2 ported only the warn-only half onto
+  // current architecture (see git history: 4504e704), deliberately
+  // deferring hard denial pending a production-usage compatibility check it
+  // judged unsafe to perform from this worktree.
+  //
+  // Phase 3B-9 completes that never-shipped enforce stage: does the
+  // delegating client's OWN OAuth scope cover the required_scope of every
+  // tool it is about to hand to the child job? `agent` implies nothing else
+  // (scope.ts's IMPLIES table), so a client can be *bound* to a tool its
+  // own scope doesn't cover — that's the confused-deputy shape. A shortfall
+  // now DENIES the entire delegation, before any job is queued. CD-1..CD-8
+  // preserve the original Phase 3B-2 test matrix's numbering and coverage
+  // intent, updated for DENY semantics; CD-9 onward add the Phase 3B-9
+  // multi-tool/side-effect/dry-run/duplicate/unknown-tool matrix.
+  describe('Phase 3B-9: AUTHZ-INV-017 confused-deputy scope enforcement (DENY)', () => {
+    it('CD-1: delegator scopes fully cover the requested tool → ALLOW, no shortfall', async () => {
       await seedClient('cursor', {
         bound_tools: ['search'],
         bound_source_id: 'default',
@@ -577,27 +592,35 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
     });
 
-    it('CD-2: delegator lacks the required scope for a bound write tool → ALLOWED_WITH_WARNING, not denied', async () => {
+    it('CD-2: delegator (agent-only) attempts to delegate a bound write tool it does not itself possess → DENIED — the confused-deputy case AUTHZ-INV-017 exists for', async () => {
       await seedClient('cursor', {
         bound_tools: ['put_page'],
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
-      // 'put_page' requires 'write' (src/core/ops/pages.ts); client only has 'agent'.
+      // 'put_page' requires 'write' (src/core/ops/pages.ts); client only has
+      // 'agent' — the client is legitimately BOUND to put_page (an operator
+      // set that binding) but does not itself hold 'write'. Binding !=
+      // scope possession — the exact distinction this invariant enforces.
       const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
-      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] });
-      // Not denied — the delegation still succeeds.
-      expect(result.id).toBeGreaterThan(0);
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow(/own OAuth scopes.*do not cover.*put_page.*needs "write"/);
       const lines = readAuditLines();
-      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
-      expect(warning).toBeTruthy();
-      expect(warning!.decision).toBe('allowed_with_warning');
-      expect(warning!.client_id).toBe('cursor');
-      expect(warning!.requested_tools).toEqual(['put_page']);
-      expect(warning!.missing_scopes).toEqual(['write']);
+      const denial = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.client_id).toBe('cursor');
+      expect(denial!.requested_tools).toEqual(['put_page']);
+      expect(denial!.missing_scopes).toEqual(['write']);
+      // No job was created for the denied delegation.
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
+      );
+      expect(rows.length).toBe(0);
     });
 
-    it('CD-3: partial coverage across multiple tools → shortfall lists only the uncovered tool', async () => {
+    it('CD-3: multiple tools, one missing scope → the ENTIRE delegation is denied, not just the uncovered tool', async () => {
       await seedClient('cursor', {
         bound_tools: ['search', 'put_page'],
         bound_source_id: 'default',
@@ -605,19 +628,23 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       });
       // Covers 'search' (read) but not 'put_page' (write).
       const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
-      const result = await callSubmitAgent(ctx, {
-        prompt: 'hi',
-        allowed_tools: ['search', 'put_page'],
-      });
-      expect(result.id).toBeGreaterThan(0);
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search', 'put_page'] }),
+      ).rejects.toThrow();
       const lines = readAuditLines();
-      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
-      expect(warning).toBeTruthy();
-      expect(warning!.requested_tools).toEqual(['put_page']);
-      expect(warning!.missing_scopes).toEqual(['write']);
+      const denial = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.requested_tools).toEqual(['put_page']);
+      expect(denial!.missing_scopes).toEqual(['write']);
+      // No partial grant: zero jobs created, not a job restricted to 'search'.
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
+      );
+      expect(rows.length).toBe(0);
     });
 
-    it('CD-4: scope hierarchy respected — admin covers write, no false-positive shortfall', async () => {
+    it('CD-4: scope hierarchy respected — admin covers write, no false-positive denial', async () => {
       await seedClient('cursor', {
         bound_tools: ['put_page'],
         bound_source_id: 'default',
@@ -668,41 +695,156 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
       expect(denial).toBeTruthy();
     });
 
-    it('CD-7: shortfall audit event carries reconstructable detail with no prompt/secret leakage', async () => {
+    it('CD-7: denial audit event carries reconstructable detail with no prompt/secret leakage', async () => {
       await seedClient('cursor', {
         bound_tools: ['put_page'],
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
       const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
-      await callSubmitAgent(ctx, { prompt: 'super-secret-prompt-text', allowed_tools: ['put_page'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'super-secret-prompt-text', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow();
       const lines = readAuditLines();
-      const warning = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
-      expect(warning).toBeTruthy();
-      expect(warning!.decision).toBe('allowed_with_warning');
-      expect(warning!.bound_tools).toEqual(['put_page']);
-      expect(typeof warning!.reason).toBe('string');
-      expect(warning!.reason as string).toMatch(/AUTHZ-INV-017/);
-      expect(warning!.reason as string).toMatch(/warn-only/);
+      const denial = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(denial).toBeTruthy();
+      expect(denial!.decision).toBe('denied');
+      expect(denial!.bound_tools).toEqual(['put_page']);
+      expect(typeof denial!.reason).toBe('string');
+      expect(denial!.reason as string).toMatch(/AUTHZ-INV-017/);
       const raw = JSON.stringify(lines);
       expect(raw).not.toContain('super-secret-prompt-text');
+      // Exactly one audit line for this denial — no double-audit.
+      expect(lines.length).toBe(1);
     });
 
-    it('CD-8: shortfall is genuinely warn-only — job is actually created, not denied', async () => {
+    it('CD-8: a shortfall now DENIES — no job row is created, no delegated authority is left behind', async () => {
       await seedClient('cursor', {
         bound_tools: ['put_page'],
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/'],
       });
       const ctx = makeCtx({ clientId: 'cursor', scopes: [] }); // no scopes at all
-      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] });
-      expect(result.id).toBeGreaterThan(0);
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow();
       const rows = await engine.executeRaw<Record<string, unknown>>(
-        `SELECT status FROM minion_jobs WHERE id = $1`,
-        [result.id],
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'cursor'`,
       );
-      expect(rows.length).toBe(1);
-      expect(rows[0].status).not.toBe('denied');
+      expect(rows.length).toBe(0);
+    });
+
+    it('CD-9: binding vs possession — a client legitimately BOUND to a tool (operator allowed it to reference the tool) but lacking that tool\'s own OAuth scope is still DENIED; being bound is not sufficient', async () => {
+      // The operator explicitly bound this client to 'put_page' at
+      // registration time (bound_tools) — the client is fully entitled to
+      // NAME put_page in allowed_tools, and tool-widening will not reject
+      // it. AUTHZ-INV-017 is the second, independent gate: possession of
+      // put_page's own required scope, which this client's OAuth grant
+      // never included.
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] }); // bound, but scope-less
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow(/permission_denied|do not cover/);
+    });
+
+    it('CD-10: multi-tool matrix — agent + every required tool scope → ALLOWED', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search', 'get_page', 'put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'write', 'agent'] });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'hi',
+        allowed_tools: ['search', 'get_page', 'put_page'],
+      });
+      expect(result.id).toBeGreaterThan(0);
+    });
+
+    it('CD-11: duplicate requested tool names do not create inconsistent behavior (still denied once, missing_scopes deduped)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
+      // allowed_tools with a duplicate — tool-widening's subset check passes
+      // vacuously for duplicates (both entries are in bound_tools).
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page', 'put_page'] }),
+      ).rejects.toThrow();
+      const lines = readAuditLines();
+      const denial = lines.find(l => l.reason_code === 'delegation_scope_shortfall');
+      expect(denial).toBeTruthy();
+      expect(denial!.missing_scopes).toEqual(['write']); // deduped, not ['write','write']
+    });
+
+    it('CD-12: a bound tool absent from the operation registry defaults its required scope to "read" (matches historical + pre-existing fallback), rather than crashing or being treated specially', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['totally_unregistered_tool_xyz'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // Client has 'agent' only — no 'read' — so the 'read' fallback should
+      // still produce a shortfall denial (proving the fallback is live),
+      // not a crash or a silent allow.
+      const ctxNoRead = makeCtx({ clientId: 'cursor', scopes: ['agent'] });
+      await expect(
+        callSubmitAgent(ctxNoRead, { prompt: 'hi', allowed_tools: ['totally_unregistered_tool_xyz'] }),
+      ).rejects.toThrow();
+      const lines1 = readAuditLines();
+      expect(lines1.find(l => l.reason_code === 'delegation_scope_shortfall')?.missing_scopes).toEqual(['read']);
+
+      // With 'read' held, the same unregistered tool passes (defaulted
+      // requirement is satisfied) — confirms this is a real default, not an
+      // unconditional deny for unregistered tools.
+      const ctxWithRead = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
+      const result = await callSubmitAgent(ctxWithRead, { prompt: 'hi', allowed_tools: ['totally_unregistered_tool_xyz'] });
+      expect(result.id).toBeGreaterThan(0);
+    });
+
+    it('CD-13: empty bound_tools (client bound to nothing) → requestedTools resolves to [] → vacuously no shortfall, existing empty-binding behavior preserved', async () => {
+      await seedClient('cursor', {
+        bound_tools: [],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: [] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi' });
+      expect(result.id).toBeGreaterThan(0);
+      const lines = readAuditLines();
+      expect(lines.some(l => l.reason_code === 'delegation_scope_shortfall')).toBe(false);
+    });
+
+    it('CD-14: dry-run sees the same denial as the real submission — no misleading success preview for a delegation that would actually be denied', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['put_page'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['agent'] });
+      await expect(
+        callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['put_page'] }),
+      ).rejects.toThrow(/do not cover/);
+    });
+
+    it('CD-15: valid delegation protocol is unchanged — a fully-scoped submission still returns the identical success shape (id, name, client_id, queue_state)', async () => {
+      await seedClient('cursor', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'cursor', scopes: ['read', 'agent'] });
+      const result = await callSubmitAgent(ctx, { prompt: 'hi', allowed_tools: ['search'] });
+      expect(result.id).toBeGreaterThan(0);
+      expect(result.name).toBe('subagent');
+      expect(result.client_id).toBe('cursor');
+      expect(result.queue_state).toBeDefined();
     });
   });
 });
