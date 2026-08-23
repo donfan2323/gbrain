@@ -881,6 +881,87 @@ export async function logGithubWebhookAudit(
   }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-8): audit for the MCP SDK's own POST /token and
+ * POST /revoke handlers — reached only by public/PKCE clients (no secret
+ * presented), since confidential clients are fully handled — and already
+ * audited — by this file's own custom handlers before the SDK is ever
+ * reached (Phase 3B-5, logOAuthCredentialAudit).
+ *
+ * Historical note: Phase 9C EXPLICITLY DEFERRED instrumenting any
+ * SDK-owned OAuth surface (its own implementation report names this exact
+ * gap — "SDKマウント境界...サードパーティコードであり直接編集できない
+ * ...別途必要", dashboard-4xj73) and never built anything here. There is
+ * no historical actor/redaction precedent to port for this specific
+ * mechanism; the wrapping TECHNIQUE below (rebinding res.json on a
+ * middleware registered before the SDK router mount) is not new to this
+ * codebase, though — it mirrors the pre-existing OAuth-metadata-patching
+ * middleware a few lines below this file's own `mcpAuthRouter(...)` call,
+ * which does the exact same rebind-then-call-original pattern for a
+ * different purpose (adding a grant type to the discovery document).
+ *
+ * Classification relies ONLY on: (a) the HTTP status code, already set by
+ * the time res.json runs (res.status(nnn) always precedes .json(body) in
+ * this SDK version — confirmed by reading its actual source, not assumed),
+ * and (b) the response body's `error` field IF the status is non-2xx —
+ * the RFC 6749 §5.2 / RFC 7009 §2.2.1 STANDARD OAuth error-response shape
+ * (`{error, error_description, error_uri}`), which this SDK version's own
+ * OAuthError.toResponseObject() implements verbatim (confirmed by reading
+ * its source). `error_description` and `error_uri` are never read — only
+ * the fixed, small-enum `error` field name is inspected, and only on the
+ * non-2xx path; the 2xx path (whose body IS the issued token itself for
+ * /token) is never inspected at all, only its status code.
+ *
+ * GET/POST /authorize is deliberately NOT covered by this mechanism — see
+ * the accompanying report's feasibility findings. Its actual grant/deny
+ * decision is signaled exclusively via res.redirect() to a URL that embeds
+ * the authorization code (success) or an error code (denial) in the query
+ * string itself; there is no status-code-only or body-only discriminator
+ * available the way there is for /token and /revoke, and distinguishing
+ * the two would require inspecting a URL containing a live credential.
+ */
+const OAUTH_SDK_DENIAL_ERROR_CODES = new Set([
+  'invalid_client', 'invalid_grant', 'access_denied', 'unauthorized_client',
+]);
+
+/**
+ * Pure, exported so the security-critical part of Phase 3B-8's res.json
+ * interception — "what, if anything, is safe to read out of this response
+ * body" — is independently unit-testable with real credential-shaped
+ * bodies, not just exercised indirectly through the DB-writing helper
+ * below. Returns the RFC-standard `error` field's value ONLY when the
+ * status is non-2xx AND the body is a plain object with a string `error`
+ * property — never anything else from the body, and never anything at all
+ * from a 2xx body (which, for /token, IS the issued token).
+ */
+export function extractSdkOAuthErrorCode(statusCode: number, body: unknown): string | null {
+  if (statusCode >= 200 && statusCode < 300) return null;
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return null;
+  const errorField = (body as Record<string, unknown>).error;
+  return typeof errorField === 'string' ? errorField : null;
+}
+
+export async function logSdkOAuthFallbackAudit(
+  engine: BrainEngine,
+  input: { endpoint: 'token' | 'revoke'; statusCode: number; errorCode?: string | null; latencyMs: number },
+): Promise<void> {
+  const status: 'success' | 'denied' | 'error' = input.statusCode >= 200 && input.statusCode < 300
+    ? 'success'
+    : (input.errorCode && OAUTH_SDK_DENIAL_ERROR_CODES.has(input.errorCode)) ? 'denied' : 'error';
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['oauth-sdk-fallback', 'oauth-sdk-fallback', `oauth_${input.endpoint}_sdk_fallback`, input.latencyMs, status, status === 'success' ? null : (input.errorCode ?? null)],
+      [null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[oauth-sdk-audit] failed to write oauth_${input.endpoint}_sdk_fallback/${status} audit row: ${msg}\n`);
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -1506,6 +1587,44 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // /authorize, /token, PKCE, or DCR in any way.
   app.get('/.well-known/openid-configuration', (req, res) => {
     res.status(200).json(createOAuthMetadata(authRouterOptions));
+  });
+
+  // AUTHZ-INV-013 (Phase 3B-8): observe the outcome of the SDK's own
+  // POST /token and POST /revoke handlers — reached only by public/PKCE
+  // clients, since every confidential-client request is fully handled (and
+  // already audited, Phase 3B-5) by this file's own custom handlers above,
+  // which never call next() on their own success/handled-failure paths —
+  // this middleware never even runs for those requests. Registered here,
+  // immediately before the SDK router mount, so it wraps the exact
+  // response object the SDK's handler will use.
+  //
+  // Same technique the metadata-patching middleware just above already
+  // uses (rebind res.json, call the original inside the replacement) —
+  // not a new interception mechanism for this codebase, only a new
+  // consumer of it. Reads ONLY res.statusCode (already set by the SDK's
+  // own res.status(nnn) call, which always precedes .json() in this SDK
+  // version) and, on a non-2xx response only, the body's `error` field —
+  // the RFC 6749/7009 standard OAuth error-response field. The 2xx body
+  // (the issued token itself, for /token) is never inspected. No request
+  // data (headers, cookies, body, query string) is ever read here.
+  app.use((req, res, next) => {
+    if (req.path === '/token' || req.path === '/revoke') {
+      const endpoint = req.path === '/token' ? 'token' : 'revoke';
+      const startTime = Date.now();
+      const origJson = res.json.bind(res);
+      // Not awaited: res.json is a synchronous Express API, and this
+      // middleware must not add latency or change response timing. The
+      // helper never throws (own try/catch) so this is a safe fire-and-
+      // forget — no unhandled rejection risk.
+      (res as any).json = (body: any) => {
+        const errorCode = extractSdkOAuthErrorCode(res.statusCode, body);
+        void logSdkOAuthFallbackAudit(engine, {
+          endpoint, statusCode: res.statusCode, errorCode, latencyMs: Date.now() - startTime,
+        });
+        return origJson(body);
+      };
+    }
+    next();
   });
 
   app.use(authRouter);
