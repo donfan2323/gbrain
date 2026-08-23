@@ -751,6 +751,72 @@ export async function logOAuthCredentialAudit(
   } catch { /* best effort — never block the response the caller already sent */ }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-6): audit for admin-panel Authority-mutating
+ * routes — the 9 historical routes named in Phase 9C's own scope doc
+ * (admin login, issue-magic-link, magic-link redemption, sign-out-
+ * everywhere, api-keys issue/revoke, register-client, update-client-ttl,
+ * revoke-client) PLUS rescope-client, an Authority-mutating route added to
+ * this codebase after the historical Phase 9C snapshot (it changes a
+ * client's write source / federated-read / slug-fence / surface grant —
+ * unambiguously "Authority state" by Phase 9C's own category test, "does
+ * this event record a change in Identity/Credential/Authority state").
+ * None of these 10 routes had any audit at all before this change — Phase
+ * 9C's own audit_events wiring for them never landed in current,
+ * independently-evolved upstream (same finding as every other Phase 9
+ * artifact investigated across this reconciliation).
+ *
+ * Actor representation: admin sessions are NOT OAuth clients and must never
+ * be treated as one. This reuses the exact convention this codebase's own
+ * src/core/surface-audit.ts (writeSurfaceChangeAudit, pre-existing, already
+ * called by the current rescope-client handler for its surface sub-mutation)
+ * already established for the identical problem: the fixed, non-secret
+ * literal 'admin-api' as both token_name and agent_name — never a session
+ * ID, cookie value, or any per-request identity, because none exists to
+ * safely use (an admin session is a bearer credential over an anonymous
+ * capability, not a Principal). This function is a general-purpose sibling
+ * of that one, covering success/deny/error rather than only ever recording
+ * one fixed successful surface_change row.
+ *
+ * `credentialRef`, when present, is a SHA-256 hash of a real secret (the
+ * bootstrap token or a magic-link nonce) TRUNCATED to 16 hex chars — never
+ * the secret itself — mirroring Phase 9C's own historical `credential_ref`
+ * pattern for the same 3 routes (login, issue-magic-link, redeem). Every
+ * other route passes no credentialRef at all, matching history: routes
+ * whose input is a client_id/name (not a secret) never had one either.
+ * `target`, when present, is always a safe, non-secret identifier (a
+ * client_id, an access_tokens row's UUID, or a human-given key name) — the
+ * SAME identifier historical Phase 9C used as `resource_ref`. Neither field
+ * is ever a client_secret, issued API-key token, session cookie value, or
+ * request body content — no call site in this file constructs one from
+ * such a value.
+ */
+export async function logAdminAuthorityAudit(
+  engine: BrainEngine,
+  input: {
+    action: string;
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+    target?: string | null;
+    credentialRef?: string | null;
+    latencyMs: number;
+  },
+): Promise<void> {
+  try {
+    const hasParams = input.target != null || input.credentialRef != null;
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['admin-api', 'admin-api', input.action, input.latencyMs, input.status, input.reason ?? null],
+      [hasParams ? { target: input.target ?? null, credential_ref: input.credentialRef ?? null } : null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[admin-audit] failed to write ${input.action}/${input.status} audit row: ${msg}\n`);
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -1395,15 +1461,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
   // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
+  app.post('/admin/login', express.json(), async (req, res) => {
+    const startTime = Date.now();
     const token = req.body?.token;
     if (!token || typeof token !== 'string') {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_login', status: 'error', reason: 'missing_token', latencyMs: Date.now() - startTime,
+      });
       res.status(400).json({ error: 'Token required' });
       return;
     }
 
     const tokenHash = createHash('sha256').update(token).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_login', status: 'denied', reason: 'invalid_bootstrap_token',
+        credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
       return;
     }
@@ -1412,6 +1486,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
     adminSessions.set(sessionId, expiresAt);
 
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_login', status: 'success',
+      credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+    });
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
     res.json({ status: 'authenticated' });
   });
@@ -1465,21 +1543,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  app.post('/admin/api/issue-magic-link', express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_issue_magic_link', status: 'error', reason: 'missing_bearer', latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Authorization: Bearer <bootstrap-token> required' });
       return;
     }
     const tokenHash = createHash('sha256').update(m[1]).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_issue_magic_link', status: 'denied', reason: 'invalid_bootstrap_token',
+        credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Invalid bootstrap token' });
       return;
     }
     pruneExpiredNonces();
     const nonce = randomBytes(32).toString('hex');
     magicLinkNonces.set(nonce, Date.now() + NONCE_TTL_MS);
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_issue_magic_link', status: 'success',
+      credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+    });
     const baseUrl = publicUrl || `http://localhost:${port}`;
     res.json({ url: `${baseUrl}/admin/auth/${nonce}`, expires_in: NONCE_TTL_MS / 1000 });
   });
@@ -1488,14 +1578,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Browser hits it, server validates the nonce (exists + unconsumed +
   // unexpired), marks consumed, sets cookie, redirects to dashboard.
   // Rate-limited at 10/min/IP to harden against DoS via bad-token loops.
-  app.get('/admin/auth/:token', adminAuthRateLimiter, (req: Request, res: Response) => {
+  app.get('/admin/auth/:token', adminAuthRateLimiter, async (req: Request, res: Response) => {
+    const startTime = Date.now();
     const nonce = String(req.params.token ?? '');
     pruneExpiredNonces();
 
     const expiresAt = magicLinkNonces.get(nonce);
     const isValid = !!nonce && !!expiresAt && expiresAt > Date.now() && !consumedNonces.has(nonce);
+    // Referenced, never stored raw — matches the historical credential_ref
+    // pattern for the same route (Phase 9C, hashed+truncated, never the
+    // nonce itself).
+    const nonceRef = nonce ? createHash('sha256').update(nonce).digest('hex').slice(0, 16) : null;
 
     if (!isValid) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_magic_link_redeem', status: 'denied', reason: 'invalid_or_expired_nonce',
+        credentialRef: nonceRef, latencyMs: Date.now() - startTime,
+      });
       res.status(401).send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GBrain</title>
@@ -1523,6 +1622,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
     adminSessions.set(sessionId, sessionExpiresAt);
 
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_magic_link_redeem', status: 'success',
+      credentialRef: nonceRef, latencyMs: Date.now() - startTime,
+    });
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 7 * 24 * 60 * 60 * 1000));
     res.redirect('/admin/');
   });
@@ -1570,9 +1673,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // browser/tab fails its next request, gets 401, redirects to login.
   // The bootstrap token itself is unaffected (still valid for new
   // magic-link mints) — this only revokes existing cookie sessions.
-  app.post('/admin/api/sign-out-everywhere', requireAdmin, (_req: Request, res: Response) => {
+  app.post('/admin/api/sign-out-everywhere', requireAdmin, async (_req: Request, res: Response) => {
+    const startTime = Date.now();
     const count = adminSessions.size;
     adminSessions.clear();
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_sign_out_everywhere', status: 'success', latencyMs: Date.now() - startTime,
+    });
     res.json({ revoked_sessions: count });
   });
 
@@ -1925,33 +2032,68 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   app.post('/admin/api/api-keys', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_create_api_key', status: 'error', reason: 'missing_name', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       const { generateToken, hashToken } = await import('../core/utils.ts');
       const token = generateToken('gbrain_');
       const hash = hashToken(token);
       const id = (await import('crypto')).randomUUID();
       await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_create_api_key', status: 'success',
+        target: id, credentialRef: hash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.json({ name, token, id });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_create_api_key', status: 'error', reason: 'create_api_key_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
     }
   });
 
   app.post('/admin/api/api-keys/revoke', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_revoke_api_key', status: 'error', reason: 'missing_name', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_api_key', status: 'success', target: name, latencyMs: Date.now() - startTime,
+      });
       res.json({ revoked: true });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_api_key', status: 'error', reason: 'revoke_api_key_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
     }
   });
 
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
+    // AUTHZ-INV-013: this route has many validation branches — a local
+    // closure over startTime avoids repeating the same 5-line
+    // logAdminAuthorityAudit call at each one.
+    const auditRegister = (status: 'success' | 'error', reason?: string, target?: string) =>
+      logAdminAuthorityAudit(engine, {
+        action: 'admin_register_client', status, reason, target, latencyMs: Date.now() - startTime,
+      });
     // Set only once the client row has COMMITTED — the catch below folds it
     // into the 500 payload so a post-commit failure never reads as
     // "nothing was created".
@@ -1969,11 +2111,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // missing, empty) and rejects the rest with a structured 400.
       const { name, source, federatedRead, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await auditRegister('error', 'missing_name');
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
       } catch (e) {
+        await auditRegister('error', 'invalid_scopes', name);
         res.status(400).json({
           error: 'invalid_scopes',
           message: e instanceof Error ? e.message : String(e),
@@ -1993,6 +2140,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         validatedAuthMethod = validateTokenEndpointAuthMethod(tokenEndpointAuthMethod);
       } catch (e) {
+        await auditRegister('error', 'invalid_token_endpoint_auth_method', name);
         res.status(400).json({
           error: 'invalid_token_endpoint_auth_method',
           message: e instanceof Error ? e.message : String(e),
@@ -2012,6 +2160,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         sourceId = normalizeSourceInput(source);
         federatedReadIds = normalizeFederatedReadInput(federatedRead);
       } catch (e) {
+        await auditRegister('error', 'invalid_source', name);
         res.status(400).json({
           error: 'invalid_source',
           message: e instanceof Error ? e.message : String(e),
@@ -2033,6 +2182,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         for (const id of idsToCheck) {
           const row = byId.get(id);
           if (!row) {
+            await auditRegister('error', 'unknown_source', name);
             res.status(400).json({
               error: 'unknown_source',
               message: `source "${id}" does not exist — create it first (gbrain sources add ${id})`,
@@ -2040,6 +2190,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             return;
           }
           if (row.archived) {
+            await auditRegister('error', 'archived_source', name);
             res.status(400).json({
               error: 'archived_source',
               message: `source "${id}" is archived — unarchive it or drop it from the grant`,
@@ -2057,6 +2208,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (tokenTtl) {
         const v = Number(tokenTtl);
         if (!Number.isInteger(v) || v < TOKEN_TTL_MIN_SECONDS || v > TOKEN_TTL_MAX_SECONDS) {
+          await auditRegister('error', 'invalid_token_ttl', name);
           res.status(400).json({
             error: 'invalid_token_ttl',
             message: `tokenTtl must be an integer number of seconds between ${TOKEN_TTL_MIN_SECONDS} and ${TOKEN_TTL_MAX_SECONDS} (90 days); got ${JSON.stringify(tokenTtl)}. Omit the field (or pass 0/null) to keep the server default.`,
@@ -2073,6 +2225,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // without token_ttl.
       const columns = await preflightOauthClientColumns(sql);
       if (!columns.has('source_id') || !columns.has('federated_read')) {
+        await auditRegister('error', 'brain_too_old', name);
         res.status(400).json({
           error: 'brain_too_old',
           message: 'this brain predates scoped OAuth clients (source_id/federated_read columns) — run `gbrain apply-migrations --yes` first.',
@@ -2118,6 +2271,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         }, { tokenTtlSeconds: ttlNum, columns });
       });
       if (dupClientId !== null) {
+        await auditRegister('error', 'duplicate_name', name);
         res.status(409).json({
           error: 'duplicate_name',
           client_id: dupClientId,
@@ -2128,6 +2282,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // name the created client (no false "nothing was created").
       const reg = registered!;
       createdClientId = reg.clientId;
+      // clientSecret is returned to the caller (the one time it's ever
+      // visible) but NEVER passed to the audit call below — only the
+      // client_id, matching the historical Phase 9C pattern for this exact
+      // route (resource_ref: created.clientId, never the secret).
+      await auditRegister('success', undefined, reg.clientId);
       res.json({
         clientId: reg.clientId,
         ...(reg.clientSecret !== undefined ? { clientSecret: reg.clientSecret } : {}),
@@ -2137,6 +2296,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // A throw INSIDE the tx rolls the row back (no client persists); the
       // only window where a client exists at failure time is post-commit,
       // marked by createdClientId — include it so the operator can revoke.
+      await auditRegister('error', 'register_client_failed', createdClientId);
       res.status(500).json({
         error: e instanceof Error ? e.message : 'Registration failed',
         ...(createdClientId !== undefined ? { client_id: createdClientId } : {}),
@@ -2146,13 +2306,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // Update client TTL
   app.post('/admin/api/update-client-ttl', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { clientId, tokenTtl } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_update_client_ttl', status: 'error', reason: 'missing_client_id', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
       const ttl = tokenTtl === null || tokenTtl === 0 ? null : Number(tokenTtl);
       await sql`UPDATE oauth_clients SET token_ttl = ${ttl} WHERE client_id = ${clientId}`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_update_client_ttl', status: 'success', target: clientId, latencyMs: Date.now() - startTime,
+      });
       res.json({ updated: true, tokenTtl: ttl });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_update_client_ttl', status: 'error', reason: 'update_ttl_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Update failed' });
     }
   });
@@ -2163,18 +2336,30 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // `gbrain auth rescope-client`. Source ids are validated by the canonical
   // validator inside rescopeClient.
   app.post('/admin/api/rescope-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
+    // AUTHZ-INV-013: not in Phase 9C's original 9 — this route was added to
+    // the codebase after that historical snapshot — but it unambiguously
+    // fits the SAME category (changes a client's write source / federated-
+    // read / slug-fence / surface Authority grant), so it's covered too.
+    const auditRescope = (status: 'success' | 'error', reason?: string, target?: string) =>
+      logAdminAuthorityAudit(engine, {
+        action: 'admin_rescope_client', status, reason, target, latencyMs: Date.now() - startTime,
+      });
     try {
       const { clientId, sourceId, federatedRead, boundSlugPrefixes, surface } = req.body ?? {};
       if (!clientId || typeof clientId !== 'string') {
+        await auditRescope('error', 'missing_client_id');
         res.status(400).json({ error: 'clientId required' });
         return;
       }
       if (federatedRead !== undefined &&
           !(Array.isArray(federatedRead) && federatedRead.every((s: unknown) => typeof s === 'string'))) {
+        await auditRescope('error', 'invalid_federated_read', clientId);
         res.status(400).json({ error: 'federatedRead must be an array of source id strings' });
         return;
       }
       if (sourceId !== undefined && typeof sourceId !== 'string') {
+        await auditRescope('error', 'invalid_source_id', clientId);
         res.status(400).json({ error: 'sourceId must be a string' });
         return;
       }
@@ -2183,6 +2368,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // --bound-slug-prefixes p1,p2|none).
       if (boundSlugPrefixes !== undefined && boundSlugPrefixes !== null &&
           !(Array.isArray(boundSlugPrefixes) && boundSlugPrefixes.every((s: unknown) => typeof s === 'string'))) {
+        await auditRescope('error', 'invalid_bound_slug_prefixes', clientId);
         res.status(400).json({ error: 'boundSlugPrefixes must be null or an array of slug-prefix strings' });
         return;
       }
@@ -2191,6 +2377,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // (mirrors the CLI's --surface verbs|starter|full|clear).
       if (surface !== undefined && surface !== null &&
           surface !== 'verbs' && surface !== 'starter' && surface !== 'full') {
+        await auditRescope('error', 'invalid_surface', clientId);
         res.status(400).json({ error: 'surface must be null or one of: verbs, starter, full' });
         return;
       }
@@ -2206,27 +2393,45 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           via: 'admin_api',
         });
       }
+      // Covers the route's overall outcome (source/federated-read/slug-fence
+      // rescope); writeSurfaceChangeAudit above separately covers the
+      // surface sub-mutation specifically — no need to duplicate that detail.
+      await auditRescope('success', undefined, clientId);
       res.json(result);
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Rescope failed';
-      const status = /No OAuth client found/.test(message) ? 404
-        : /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message) ? 400
-        : 500;
+      const notFound = /No OAuth client found/.test(message);
+      const badRequest = /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message);
+      const status = notFound ? 404 : badRequest ? 400 : 500;
+      await auditRescope('error', notFound ? 'client_not_found' : badRequest ? 'invalid_rescope_request' : 'rescope_failed');
       res.status(status).json({ error: message });
     }
   });
 
   // Revoke OAuth client
   app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { clientId } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_revoke_client', status: 'error', reason: 'missing_client_id', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
       // Soft-delete the client
       await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId} AND deleted_at IS NULL`;
       // Revoke all active tokens for this client
       await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_client', status: 'success', target: clientId, latencyMs: Date.now() - startTime,
+      });
       res.json({ revoked: true });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_client', status: 'error', reason: 'revoke_client_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
     }
   });
