@@ -129,6 +129,18 @@ export interface AgentGrantDecisionEvent {
    * reason_code:'delegation_scope_shortfall' events.
    */
   missing_scopes?: string[];
+  /**
+   * Phase 3B-13 (AUTHZ-INV-005/006): present on exercise-time denials only
+   * (grant-time denials in jobs.ts's submit_agent have no job row yet).
+   * Identifies which already-delegated job's tool call was denied.
+   */
+  job_id?: number;
+  /**
+   * Phase 3B-13: the brain-tool operation name being exercised when an
+   * exercise-time denial fired (e.g. 'put_page'). Grant-time denials leave
+   * this unset — they deny the whole delegation, not one operation.
+   */
+  operation?: string;
 }
 
 /** Append one grant-decision event. Best-effort; logs to stderr on failure. */

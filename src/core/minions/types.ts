@@ -542,6 +542,17 @@ export interface SubagentHandlerData {
    */
   source_id?: string;
   /**
+   * Phase 3B-13 (AUTHZ-INV-005/006): the OAuth client_id that delegated this
+   * job via submit_agent (src/core/ops/jobs.ts already writes this key into
+   * jobData; this field only makes it visible to TypeScript so subagent.ts
+   * can thread it into buildBrainTools without an `as any` cast). Omitted
+   * for non-delegated child jobs (cycle.ts's synthesize/patterns phases
+   * queue.add() directly and never set this key) — brain-allowlist.ts's
+   * delegated-execution re-authorization gate activates ONLY when present.
+   * Also read by admission.ts for owner-lane job-coalescing (unrelated use).
+   */
+  __owner_client_id?: string;
+  /**
    * #4217 — when true, a job whose put_page writes were ALL attempted-and-
    * failed FAILS (UnrecoverableError → dead, idempotency key released)
    * instead of reporting `completed` with zero pages. Set by the dream
