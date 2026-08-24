@@ -1407,6 +1407,32 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
     }
   });
 
+  test('SP-5 (Phase 3B-11R): omitting scope entirely persists as empty/no-privilege, never a more-privileged default — end to end through /authorize', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-no-scope-requested',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      // scope intentionally omitted
+      token_endpoint_auth_method: 'none',
+    } as any);
+    const persisted = await provider.clientsStore.getClient(result.client_id);
+    expect(persisted?.scope ?? '').toBe(''); // no accidental default beyond empty
+
+    // End-to-end through /authorize: even an over-broad request against an
+    // unscoped client must yield zero granted scopes (clamped, not escalated).
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await provider.authorize(persisted!, {
+      codeChallenge: 'challenge',
+      redirectUri: 'https://example.com/cb',
+      scopes: ['admin', 'write', 'read'], // attacker-style over-request
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(persisted!, code, undefined, 'https://example.com/cb');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual([]); // zero privileges — omission never escalates
+  });
+
   test('DCR-5: manual CLI/admin registration (registerClientManual) is unaffected — still accepts admin', async () => {
     const { clientId } = await provider.registerClientManual(
       'operator-admin-client', ['client_credentials'], 'admin',
@@ -1463,8 +1489,23 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
     expect(rows[rows.length - 1].error_message).toBe('invalid_scope');
   });
 
-  test('DCR-9: secret sentinel proof — no client_secret, registration access token, Authorization header, or raw redirect_uri ever appears in an audit row, including for a confidential-client (secret-issuing) success', async () => {
+  test('DCR-9: secret sentinel proof — a confidential-client (secret-issuing) success writes exactly ONE non-vacuous audit row, and it contains zero secret material', async () => {
+    // Phase 3B-11R: the original version of this test read the WHOLE
+    // mcp_request_log table and asserted `serialized).not.toContain(...)`
+    // without ever checking a row count. Against pre-Phase-3B-11 code
+    // (zero audit producer for /register), that check trivially passed —
+    // `JSON.stringify([])` contains nothing, so every `not.toContain`
+    // assertion is vacuously true whether or not anything was ever
+    // verified. This version (a) captures the row count before the
+    // registration and asserts EXACTLY ONE new row after — a genuine
+    // failure if the audit mechanism silently wrote nothing — and (b)
+    // reads ONLY that specific new row (not the whole, multi-test-polluted
+    // table) for the sentinel checks below. RFC 7592 (registration access
+    // tokens) is not implemented in this codebase at all, so there is no
+    // such token to test for leakage — see the accompanying report.
     const FAKE_SECRET_MARKER = 'XPROBE_CLIENT_SECRET_MARKER_9f8e7d6c';
+    const before = (await readDcrAuditRows()).length;
+
     const result = await provider.clientsStore.registerClient!({
       client_name: 'dcr-sentinel-check',
       redirect_uris: ['https://example.com/xprobe-callback-marker'],
@@ -1473,12 +1514,91 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
       token_endpoint_auth_method: 'client_secret_post', // mints a real secret
     } as any);
     expect(result.client_secret).toBeTruthy(); // sanity: a secret really was issued
+    expect(result.client_secret).not.toBe('');
+
     const rows = await readDcrAuditRows();
-    const serialized = JSON.stringify(rows);
+    expect(rows.length).toBe(before + 1); // non-vacuous: fails if no row was written
+    const row = rows[rows.length - 1];
+    expect(row.status).toBe('success');
+    expect(row.token_name).toBe('oauth-dcr');
+    expect(row.agent_name).toBe('oauth-dcr');
+    expect(row.error_message).toBeNull();
+
+    const serialized = JSON.stringify(row);
     expect(serialized).not.toContain(result.client_secret);
     expect(serialized).not.toContain(FAKE_SECRET_MARKER);
     expect(serialized).not.toContain('xprobe-callback-marker'); // no raw redirect_uri
     expect(serialized).not.toMatch(/gbrain_cs_/); // client-secret token prefix never appears
+  });
+
+  // Phase 3B-11R — audit-write failure posture (Phase 8/9/10 of the task).
+  // auditDcrRegistration has its OWN internal try/catch (best-effort, never
+  // block registration) — the SAME pattern every other AUTHZ-INV-013
+  // producer in this reconciliation project uses. Because that catch lives
+  // INSIDE auditDcrRegistration, the call from registerClient's wrapper
+  // (`await this.auditDcrRegistration(...)`) can never itself throw, so a
+  // broken audit sink cannot divert either the success or the denial branch
+  // into the wrong outcome. These tests prove that behaviorally, not just by
+  // source-reading, using a `sql` proxy that selectively fails only queries
+  // targeting mcp_request_log while oauth_clients persistence proceeds via
+  // the real connection unmodified.
+  function flakyAuditSql(onAuditAttempt: () => void) {
+    return async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      if (strings.join('').includes('mcp_request_log')) {
+        onAuditAttempt();
+        throw new Error('simulated audit-sink outage');
+      }
+      return sql(strings, ...values);
+    };
+  }
+
+  test('audit-failure posture (success path): a broken audit sink does not fail the registration, and does not create a duplicate client row', async () => {
+    let auditAttempted = false;
+    const flakyProvider = new GBrainOAuthProvider({ sql: flakyAuditSql(() => { auditAttempted = true; }) as any, tokenTtl: 60 });
+
+    const before = await sql`SELECT count(*)::int AS n FROM oauth_clients WHERE client_name = 'dcr-audit-outage-client'`;
+    expect(Number(before[0].n)).toBe(0);
+
+    // Must RESOLVE (not reject) despite the injected audit-write failure —
+    // the caller (ultimately the SDK's clientRegistrationHandler, then the
+    // HTTP response) must see an ordinary successful registration.
+    const result = await flakyProvider.clientsStore.registerClient!({
+      client_name: 'dcr-audit-outage-client',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(result.client_id).toBeTruthy();
+    expect(auditAttempted).toBe(true); // confirms the injected failure actually fired
+
+    // Exactly one client row — no duplicate from a caller retrying a
+    // spuriously-failed registration (there is nothing to retry: the
+    // caller never saw a failure), and no missing row either.
+    const after = await sql`SELECT count(*)::int AS n FROM oauth_clients WHERE client_name = 'dcr-audit-outage-client'`;
+    expect(Number(after[0].n)).toBe(1);
+  });
+
+  test('audit-failure posture (denial path): a broken audit sink does not mask, alter, or swallow the original denial error', async () => {
+    let auditAttempted = false;
+    const flakyProvider = new GBrainOAuthProvider({ sql: flakyAuditSql(() => { auditAttempted = true; }) as any, tokenTtl: 60 });
+
+    // Must REJECT with the ORIGINAL scope-denial error, unchanged — not a
+    // generic 500, not a swallowed silent success, not a different error
+    // shape caused by the audit sink's own thrown exception leaking through.
+    await expect(
+      flakyProvider.clientsStore.registerClient!({
+        client_name: 'dcr-audit-outage-denied-client',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'admin',
+        token_endpoint_auth_method: 'none',
+      } as any),
+    ).rejects.toThrow(/scope "admin" is not permitted via dynamic client registration/);
+    expect(auditAttempted).toBe(true);
+
+    const rows = await sql`SELECT count(*)::int AS n FROM oauth_clients WHERE client_name = 'dcr-audit-outage-denied-client'`;
+    expect(Number(rows[0].n)).toBe(0); // denied — no client row, audit outage or not
   });
 
   // AUTHZ-INV-016 non-regression (task Phase 7/16): "DCR client with agent
