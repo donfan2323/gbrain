@@ -47,6 +47,31 @@ export const ALLOWED_SCOPES_LIST: ReadonlyArray<Scope> = Object.freeze([
 ]);
 
 /**
+ * Phase 3B-11 (DCR security, AUTHZ-INV-013 cluster): scopes an ANONYMOUS,
+ * unauthenticated dynamic client registration (RFC 7591, `--enable-dcr`) may
+ * self-request. Strictly narrower than ALLOWED_SCOPES — operator-tier scopes
+ * (`admin`, `sources_admin`, `users_admin`) and the delegation-initiation
+ * scope (`agent`) remain reachable only through the operator-trusted
+ * CLI/admin registration path (`registerClientManual`), which does not
+ * consult this set.
+ *
+ * Why this exists: `assertAllowedScopes` (below) only rejects UNKNOWN scope
+ * strings — it was never a privilege gate. GET/POST /authorize has no
+ * consent or session step of its own (100% MCP-SDK-owned; confirmed by
+ * reading the SDK's authorizationHandler directly — it forwards straight to
+ * `provider.authorize()` with no human-in-the-loop check), so an anonymous
+ * DCR registrant that self-assigned an unrestricted scope could walk
+ * straight through authorize+token to a fully-privileged access token with
+ * zero operator involvement. SECURITY.md's own "if you must use a custom
+ * HTTP wrapper" hardening checklist names exactly this ("Restrict scopes —
+ * never issue tokens with unlimited scope"); native `--enable-dcr` was
+ * missing it for its own registration path. `{read, write}` matches
+ * SECURITY.md's own documented DCR-appropriate example (`--scopes
+ * "read write"` for pre-registering claude.ai / ChatGPT-style connectors).
+ */
+export const DCR_ALLOWED_SCOPES: ReadonlySet<Scope> = new Set<Scope>(['read', 'write']);
+
+/**
  * Hierarchy table: which required scopes are implied by which granted scope.
  * `admin` implies all (escape hatch for legacy + super-admin tokens).
  * `write` implies `read`. The two `*_admin` siblings only imply themselves.

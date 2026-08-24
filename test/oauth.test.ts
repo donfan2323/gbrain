@@ -1332,6 +1332,169 @@ describe('v0.28 ALLOWED_SCOPES allowlist', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Phase 3B-11 — DCR scope restriction (AUTHZ-INV-013 cluster)
+// ---------------------------------------------------------------------------
+//
+// assertAllowedScopes (above) only ever rejected UNKNOWN scope strings — a
+// KNOWN, privileged one (admin, sources_admin, users_admin, agent) sailed
+// straight through DCR's registerClient with zero further gate. Confirmed
+// by direct SDK source inspection that GET/POST /authorize has no consent
+// or session step of its own (100% SDK-owned, forwards straight to
+// provider.authorize()), so an anonymous, unauthenticated DCR registrant
+// self-assigning an unrestricted scope could walk straight through
+// authorize+token to a fully-privileged access token with zero operator
+// involvement. SECURITY.md's own "if you must use a custom HTTP wrapper"
+// checklist names exactly this ("Restrict scopes — never issue tokens with
+// unlimited scope"); native --enable-dcr was missing it for its own path.
+describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestable)', () => {
+  async function readDcrAuditRows(): Promise<Array<Record<string, unknown>>> {
+    return sql`
+      SELECT token_name, agent_name, operation, status, error_message, params
+        FROM mcp_request_log WHERE operation = 'oauth_register' ORDER BY id ASC
+    `;
+  }
+
+  test('DCR-1: a fully anonymous, public (PKCE, no secret) registration self-requesting scope=admin is DENIED', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'attacker-dcr-client',
+        redirect_uris: ['https://attacker.example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'admin',
+        token_endpoint_auth_method: 'none',
+      } as any),
+    ).rejects.toThrow(/scope "admin" is not permitted via dynamic client registration/);
+  });
+
+  test('DCR-2: sources_admin, users_admin, and agent are each independently denied', async () => {
+    for (const scope of ['sources_admin', 'users_admin', 'agent']) {
+      await expect(
+        provider.clientsStore.registerClient!({
+          client_name: `dcr-${scope}`,
+          redirect_uris: ['https://example.com/cb'],
+          grant_types: ['authorization_code'],
+          scope,
+          token_endpoint_auth_method: 'none',
+        } as any),
+      ).rejects.toThrow(/is not permitted via dynamic client registration/);
+    }
+  });
+
+  test('DCR-3: a mixed request (one disallowed scope among allowed ones) denies the ENTIRE registration — no partial grant', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'dcr-mixed',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'read write admin',
+        token_endpoint_auth_method: 'none',
+      } as any),
+    ).rejects.toThrow(/scope "admin" is not permitted/);
+    const rows = await sql`SELECT client_id FROM oauth_clients WHERE client_name = 'dcr-mixed'`;
+    expect(rows.length).toBe(0); // no row persisted for the denied attempt
+  });
+
+  test('DCR-4: read, write, and "read write" remain allowed (unaffected baseline)', async () => {
+    for (const scope of ['read', 'write', 'read write']) {
+      const result = await provider.clientsStore.registerClient!({
+        client_name: `dcr-ok-${scope.replace(' ', '_')}`,
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope,
+        token_endpoint_auth_method: 'none',
+      } as any);
+      expect(result.client_id).toBeTruthy();
+    }
+  });
+
+  test('DCR-5: manual CLI/admin registration (registerClientManual) is unaffected — still accepts admin', async () => {
+    const { clientId } = await provider.registerClientManual(
+      'operator-admin-client', ['client_credentials'], 'admin',
+    );
+    const client = await provider.clientsStore.getClient(clientId);
+    expect(client?.scope).toBe('admin');
+  });
+
+  test('DCR-6: audit — a successful DCR registration writes exactly one success row, actor is the fixed literal oauth-dcr', async () => {
+    await provider.clientsStore.registerClient!({
+      client_name: 'dcr-audit-success',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    const rows = await readDcrAuditRows();
+    const success = rows.filter(r => r.status === 'success');
+    expect(success.length).toBeGreaterThanOrEqual(1);
+    expect(success[success.length - 1].token_name).toBe('oauth-dcr');
+    expect(success[success.length - 1].agent_name).toBe('oauth-dcr');
+    expect(success[success.length - 1].error_message).toBeNull();
+  });
+
+  test('DCR-7: audit — a scope-denied DCR registration writes exactly one denied row with error_message=invalid_client_metadata', async () => {
+    const before = (await readDcrAuditRows()).length;
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'dcr-audit-denied',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'admin',
+        token_endpoint_auth_method: 'none',
+      } as any),
+    ).rejects.toThrow();
+    const rows = await readDcrAuditRows();
+    expect(rows.length).toBe(before + 1); // exactly one new row — no double-audit
+    const denial = rows[rows.length - 1];
+    expect(denial.status).toBe('denied');
+    expect(denial.error_message).toBe('invalid_client_metadata');
+  });
+
+  test('DCR-8: audit — an unknown-scope-string denial is classified separately (error_message=invalid_scope)', async () => {
+    await expect(
+      provider.clientsStore.registerClient!({
+        client_name: 'dcr-audit-unknown-scope',
+        redirect_uris: ['https://example.com/cb'],
+        grant_types: ['authorization_code'],
+        scope: 'read totally_bogus_scope',
+        token_endpoint_auth_method: 'none',
+      } as any),
+    ).rejects.toThrow();
+    const rows = await readDcrAuditRows();
+    expect(rows[rows.length - 1].error_message).toBe('invalid_scope');
+  });
+
+  test('DCR-9: secret sentinel proof — no client_secret, registration access token, Authorization header, or raw redirect_uri ever appears in an audit row, including for a confidential-client (secret-issuing) success', async () => {
+    const FAKE_SECRET_MARKER = 'XPROBE_CLIENT_SECRET_MARKER_9f8e7d6c';
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-sentinel-check',
+      redirect_uris: ['https://example.com/xprobe-callback-marker'],
+      grant_types: ['authorization_code'],
+      scope: 'read write',
+      token_endpoint_auth_method: 'client_secret_post', // mints a real secret
+    } as any);
+    expect(result.client_secret).toBeTruthy(); // sanity: a secret really was issued
+    const rows = await readDcrAuditRows();
+    const serialized = JSON.stringify(rows);
+    expect(serialized).not.toContain(result.client_secret);
+    expect(serialized).not.toContain(FAKE_SECRET_MARKER);
+    expect(serialized).not.toContain('xprobe-callback-marker'); // no raw redirect_uri
+    expect(serialized).not.toMatch(/gbrain_cs_/); // client-secret token prefix never appears
+  });
+
+  // AUTHZ-INV-016 non-regression (task Phase 7/16): "DCR client with agent
+  // scope + null delegation binding attempts submit_agent" is now UNREACHABLE
+  // via DCR itself — DCR-2 above proves 'agent' can no longer be
+  // self-requested at all. The realistic remaining shape is an operator
+  // using registerClientManual with --scopes agent but forgetting
+  // --bound-tools/--bound-slug-prefixes; that is exactly what
+  // test/submit-agent.test.ts's Phase 3B-10 block (NB-1..NB-10, and the
+  // pre-existing "refuses when client has agent scope but bound_tools is
+  // NULL" test) already proves is denied, unmodified and unaffected by this
+  // phase's DCR-only changes — see this report's AUTHZ-INV-016/017
+  // non-regression section rather than duplicating that coverage here.
+});
+
+// ---------------------------------------------------------------------------
 // F5 — fail-loud column probes (was: bare catch{})
 // ---------------------------------------------------------------------------
 

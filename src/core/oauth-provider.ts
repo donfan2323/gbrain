@@ -23,10 +23,10 @@ import type {
 import type { OAuthServerProvider, AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
 import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidTokenError, InvalidClientMetadataError, OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { assertValidSourceId } from './source-id.ts';
-import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
+import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError, DCR_ALLOWED_SCOPES, type Scope } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from './legacy-token-scope.ts';
 
@@ -306,6 +306,40 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     private dcrTtlMax: number,
   ) {}
 
+  /**
+   * Phase 3B-11 (AUTHZ-INV-013 cluster): audit for DCR registration outcomes
+   * (POST /register — the only OAuth-provider-owned surface that previously
+   * had zero producer at all; every other route this reconciliation project
+   * has covered was a custom Express handler or SDK-fallback wrapper, but
+   * registerClient() IS application code, so no interception is needed).
+   * Reuses mcp_request_log exactly like every prior producer — same table,
+   * same best-effort/never-block posture, no new schema, `params` unused
+   * (always NULL — nothing here needs structured detail beyond a fixed
+   * error code).
+   *
+   * Actor is the fixed, non-secret literal 'oauth-dcr': this endpoint has no
+   * per-request authenticated identity (the client_id doesn't exist yet on
+   * a denial, and registration itself is what creates it).
+   *
+   * `errorCode` MUST be one of the fixed OAuth error-code strings
+   * (OAuthError.errorCode, or the literal 'invalid_scope' for GBrain's own
+   * InvalidScopeError, which predates the SDK's OAuthError hierarchy and
+   * isn't a subclass of it) — never a raw exception message, header, or any
+   * request field. This mirrors logOAuthCredentialAudit's identical rule for
+   * /token and /revoke (Phase 3B-5).
+   */
+  private async auditDcrRegistration(
+    status: 'success' | 'denied' | 'error',
+    errorCode: string | null,
+  ): Promise<void> {
+    try {
+      await this.sql`
+        INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+        VALUES (${'oauth-dcr'}, ${'oauth-dcr'}, ${'oauth_register'}, ${0}, ${status}, ${errorCode}, ${null}::text::jsonb)
+      `;
+    } catch { /* best-effort — never block registration */ }
+  }
+
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
     const rows = await this.sql`
       SELECT client_id, client_secret_hash, client_name, redirect_uris,
@@ -334,7 +368,31 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     };
   }
 
+  /**
+   * Phase 3B-11: thin audited wrapper. All actual registration logic lives
+   * in doRegisterClient (unchanged apart from the DCR-scope-restriction
+   * addition below) — this method only adds exactly-once audit coverage
+   * around it, classifying the outcome without inspecting or logging any
+   * part of the request/response bodies themselves.
+   */
   async registerClient(
+    client: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>,
+  ): Promise<OAuthClientInformationFull> {
+    try {
+      const response = await this.doRegisterClient(client);
+      await this.auditDcrRegistration('success', null);
+      return response;
+    } catch (err) {
+      const isKnownDenial = err instanceof OAuthError || err instanceof InvalidScopeError;
+      const errorCode = err instanceof OAuthError ? err.errorCode
+        : err instanceof InvalidScopeError ? 'invalid_scope'
+        : 'server_error';
+      await this.auditDcrRegistration(isKnownDenial ? 'denied' : 'error', errorCode);
+      throw err;
+    }
+  }
+
+  private async doRegisterClient(
     client: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>,
   ): Promise<OAuthClientInformationFull> {
     // Enforce HTTPS for all redirect_uris on the DCR path (RFC 6749 §3.1.2.1).
@@ -349,7 +407,27 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     // path is reachable by any unauthenticated network caller when --enable-dcr
     // is on, so this is the security-relevant gate (manual CLI registration
     // is operator-trusted).
-    assertAllowedScopes(parseScopeString(client.scope));
+    const requestedScopes = parseScopeString(client.scope);
+    assertAllowedScopes(requestedScopes);
+
+    // Phase 3B-11 (DCR security): assertAllowedScopes above only rejects
+    // UNKNOWN scope strings — a KNOWN, privileged one (`admin`,
+    // `sources_admin`, `users_admin`, `agent`) sailed straight through.
+    // DCR_ALLOWED_SCOPES (scope.ts) is the narrower, DCR-appropriate subset;
+    // see its own doc comment for why this matters (no consent step exists
+    // between registration and token issuance on this path). Manual CLI/
+    // admin registration (registerClientManual, below) does not call this
+    // method at all, so operator-trusted elevated-scope registration is
+    // unaffected.
+    for (const s of requestedScopes) {
+      if (!DCR_ALLOWED_SCOPES.has(s as Scope)) {
+        throw new InvalidClientMetadataError(
+          `scope "${s}" is not permitted via dynamic client registration (only ` +
+          `${[...DCR_ALLOWED_SCOPES].join(', ')} may be self-requested); register the ` +
+          'client via the gbrain CLI / admin API for elevated scopes.',
+        );
+      }
+    }
 
     // v0.41.3 (T5): validate token_endpoint_auth_method on the DCR path so
     // `--enable-dcr` is not the looser entry point. CLI and admin paths gate
