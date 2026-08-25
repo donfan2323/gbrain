@@ -82,6 +82,13 @@ describe('/.well-known/openid-configuration — OIDC discovery compat route', ()
 
 describe('excluded from this port: temporary diagnostic instrumentation', () => {
   test('ingress-diagnostic.ts / oauth-diagnostic.ts are not reintroduced', () => {
-    expect(SOURCE).not.toMatch(/ingress-diagnostic|oauth-diagnostic/);
+    // Scoped to actual import/require syntax, not any textual mention of
+    // the name — src/commands/serve-http.ts's own AUTHZ-INV-013 comment
+    // (Phase 3B-4) names "oauth-diagnostic.ts" in prose specifically to
+    // document that it does NOT exist in this architecture ("the historical
+    // stopgap, oauth-diagnostic.ts, does not exist here"); a bare substring
+    // match trips on that documentary sentence itself, not on a real import.
+    const importPattern = /(?:from\s+['"][^'"]*|require\(\s*['"][^'"]*)(ingress-diagnostic|oauth-diagnostic)/;
+    expect(SOURCE).not.toMatch(importPattern);
   });
 });

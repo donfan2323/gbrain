@@ -106,8 +106,14 @@ describe('PAGE-1: ordinary page creation/update', () => {
       slug: 'notes/page1-baseline',
       content: '---\ntype: note\ntitle: Baseline\n---\n\nplain body, no mentions',
     });
-    expect(result.auto_links).toEqual({ skipped: 'remote' });
-    expect(result.auto_timeline).toEqual({ skipped: 'remote' });
+    // #4525 (upstream): the skip envelope now carries a `hint` explaining
+    // why and what to do about it, instead of a bare {skipped: 'remote'}.
+    const remoteSkipHint = 'auto_link/auto_timeline run for trusted local writers only '
+      + '(or remote callers with GBRAIN_REMOTE_AUTO_LINK/TIMELINE enabled); '
+      + 'body wikilinks were saved as text but NOT reconciled into the graph. '
+      + 'Use local `gbrain capture`/`gbrain call put_page` for link extraction.';
+    expect(result.auto_links).toEqual({ skipped: 'remote', hint: remoteSkipHint });
+    expect(result.auto_timeline).toEqual({ skipped: 'remote', hint: remoteSkipHint });
     const rows = await getLinkRows();
     expect(rows.length).toBe(0);
   });

@@ -22,6 +22,13 @@ function run(args: string[]): { exitCode: number; stdout: string; stderr: string
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: REPO,
+      // --recent's target set is mtime-driven (recentlyModified() in
+      // src/commands/skillify-check.ts): any fresh checkout or in-progress
+      // merge gives most of src/commands + src/core + scripts a <7-day
+      // mtime, so the JSON payload can exceed Node's 1MB execFileSync
+      // default and get silently truncated (ENOBUFS) into invalid JSON.
+      // Same fix already applied below in runWithPath() for the same reason.
+      maxBuffer: 10 * 1024 * 1024,
     });
     return { exitCode: 0, stdout, stderr: '' };
   } catch (err: any) {

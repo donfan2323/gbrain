@@ -121,8 +121,16 @@ describe('AUTHZ-INV-013: every non-success branch of POST /ingest calls logInges
   function extractIngestRouteBody(src: string): string {
     const startIdx = src.indexOf("'/ingest',");
     expect(startIdx).toBeGreaterThan(-1);
-    const endIdx = src.indexOf("'/webhooks/github'", startIdx);
-    expect(endIdx).toBeGreaterThan(startIdx);
+    // Slice to this route's OWN closing `  );` (2-space indent, matching
+    // the `  app.post(` opener) rather than to the next route's string
+    // literal. v0.46 (upstream merge) inserted a GitHub item-event webhook
+    // helper (handleGitHubItemEvent, ~130 lines, its own unrelated
+    // res.status(4xx|5xx) branches) between this route and
+    // '/webhooks/github', so the old "up to the next route's literal"
+    // boundary now overshoots into that unrelated code.
+    const closeMatch = /\n  \);\n/.exec(src.slice(startIdx));
+    expect(closeMatch).not.toBeNull();
+    const endIdx = startIdx + closeMatch!.index;
     return src.slice(startIdx, endIdx);
   }
 
