@@ -382,7 +382,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       }
       if (pendingToolUses.length > 0) {
         const synthesizedResults: ContentBlock[] = [];
-        for (const use of pendingToolUses) {
+        for (const [useOrdinal, use] of pendingToolUses.entries()) {
           const prior = priorToolByUseId.get(use.id);
           if (prior?.status === 'complete') {
             synthesizedResults.push({
@@ -405,7 +405,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           const toolDef = toolDefs.find(t => t.name === use.name);
           if (!toolDef) {
             await persistToolExecFailed(
-              engine, ctx.id, last.message_idx, use.id, use.name, use.input,
+              engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input,
               `tool "${use.name}" is not in the registry for this subagent`,
             );
             synthesizedResults.push({
@@ -417,19 +417,19 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           if (prior?.status === 'pending' && !toolDef.idempotent) {
             throw new Error(`non-idempotent tool "${use.name}" pending on resume; cannot safely re-run`);
           }
-          await persistToolExecPending(engine, ctx.id, last.message_idx, use.id, use.name, use.input);
+          await persistToolExecPending(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input);
           try {
             const output = await toolDef.execute(use.input, {
               engine, jobId: ctx.id, remote: true, signal: ctx.signal,
             });
-            await persistToolExecComplete(engine, ctx.id, use.id, output);
+            await persistToolExecComplete(engine, ctx.id, last.message_idx, useOrdinal, use.id, output);
             synthesizedResults.push({
               type: 'tool_result', tool_use_id: use.id,
               content: asStringIfNotObject(output),
             } as ContentBlock);
           } catch (e) {
             const errText = e instanceof Error ? (e.stack ?? e.message) : String(e);
-            await persistToolExecFailed(engine, ctx.id, last.message_idx, use.id, use.name, use.input, errText);
+            await persistToolExecFailed(engine, ctx.id, last.message_idx, useOrdinal, use.id, use.name, use.input, errText);
             synthesizedResults.push({
               type: 'tool_result', tool_use_id: use.id,
               content: errText, is_error: true,
@@ -671,7 +671,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
 
       // 5. Dispatch each tool_use. Two-phase persist (pending → complete/failed).
       const toolResults: ContentBlock[] = [];
-      for (const use of toolUses) {
+      for (const [useOrdinal, use] of toolUses.entries()) {
         if (ctx.signal.aborted || ctx.shutdownSignal.aborted) {
           throw new Error('subagent aborted during tool dispatch');
         }
@@ -682,7 +682,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           // Model called a tool we didn't expose. Mark execution failed
           // with a clear error and feed the error back in the next turn.
           await persistToolExecFailed(
-            engine, ctx.id, assistantIdx, use.id, toolName, use.input,
+            engine, ctx.id, assistantIdx, useOrdinal, use.id, toolName, use.input,
             `tool "${toolName}" is not in the registry for this subagent`,
           );
           toolResults.push({
@@ -727,7 +727,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
         }
 
         // Fresh or idempotent-replay dispatch.
-        await persistToolExecPending(engine, ctx.id, assistantIdx, use.id, toolName, use.input);
+        await persistToolExecPending(engine, ctx.id, assistantIdx, useOrdinal, use.id, toolName, use.input);
         logSubagentHeartbeat({ job_id: ctx.id, event: 'tool_called', turn_idx: turnIdx, tool_name: toolName });
 
         const toolStart = Date.now();
@@ -738,7 +738,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
             remote: true,
             signal: ctx.signal,
           });
-          await persistToolExecComplete(engine, ctx.id, use.id, output);
+          await persistToolExecComplete(engine, ctx.id, assistantIdx, useOrdinal, use.id, output);
           logSubagentHeartbeat({
             job_id: ctx.id,
             event: 'tool_result',
@@ -755,7 +755,7 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           const errText = e instanceof Error
             ? (e.stack ?? e.message)
             : String(e);
-          await persistToolExecFailed(engine, ctx.id, assistantIdx, use.id, toolName, use.input, errText);
+          await persistToolExecFailed(engine, ctx.id, assistantIdx, useOrdinal, use.id, toolName, use.input, errText);
           logSubagentHeartbeat({
             job_id: ctx.id,
             event: 'tool_failed',
@@ -1193,21 +1193,21 @@ async function reconcileGatewayReplay(args: ReconcileArgs): Promise<ReconcileRes
       }
       const toolDef = toolDefs.find(t => t.name === call.toolName);
       if (!toolDef) {
-        await persistToolExecFailed(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input, `tool "${call.toolName}" is not in the registry for this subagent`);
+        await persistToolExecFailed(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input, `tool "${call.toolName}" is not in the registry for this subagent`);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: `tool "${call.toolName}" is not available`, isError: true });
         continue;
       }
       if (exec?.status === 'pending' && !toolDef.idempotent) {
         throw new Error(`non-idempotent tool "${call.toolName}" pending on resume; cannot safely re-run`);
       }
-      await persistToolExecPending(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input);
+      await persistToolExecPending(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input);
       try {
         const output = await toolDef.execute(call.input, { engine, jobId, remote: true, signal });
-        await persistToolExecComplete(engine, jobId, call.toolCallId, output);
+        await persistToolExecComplete(engine, jobId, msg.message_idx, callIdx, call.toolCallId, output);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output });
       } catch (e) {
         const errText = e instanceof Error ? (e.stack ?? e.message) : String(e);
-        await persistToolExecFailed(engine, jobId, msg.message_idx, call.toolCallId, call.toolName, call.input, errText);
+        await persistToolExecFailed(engine, jobId, msg.message_idx, callIdx, call.toolCallId, call.toolName, call.input, errText);
         results.push({ type: 'tool-result', toolCallId: call.toolCallId, toolName: call.toolName, output: errText, isError: true });
       }
     }
@@ -1439,6 +1439,7 @@ async function persistToolExecPending(
   engine: BrainEngine,
   jobId: number,
   messageIdx: number,
+  ordinal: number,
   toolUseId: string,
   toolName: string,
   input: unknown,
@@ -1449,25 +1450,55 @@ async function persistToolExecPending(
   // postgres.js .unsafe() (#2339 class; PGLite hides it). The ::text cast makes
   // the text→jsonb parse produce a real jsonb object.
   const jsonStr = typeof input === 'string' ? input : JSON.stringify(input);
+  // Phase 3B-19 rollback-compatibility bridge: the job-wide ON CONFLICT
+  // (job_id, tool_use_id) DO NOTHING target is dropped by migration v131
+  // (upstream #4155 — raw provider ids may legitimately repeat across
+  // turns), which this codebase's own release may run against post-rollback.
+  // This bridge keys off the pre-existing stable-id constraint instead
+  // (job_id, message_idx, ordinal), introduced migration v81 and untouched
+  // by v131 either way, so it runs unmodified whether v131 has applied:
+  //   1. NOT EXISTS, restricted to legacy ordinal=NULL rows, preserves the
+  //      DO NOTHING semantics for rows written before ordinal stamping.
+  //   2. ON CONFLICT on the stable-id constraint is the backstop for the
+  //      residual race (an expired job reclaimed while a partitioned old
+  //      worker still writes).
   await engine.executeRaw(
-    `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status)
-     VALUES ($1, $2, $3, $4, $5::text::jsonb, 'pending')
-     ON CONFLICT (job_id, tool_use_id) DO NOTHING`,
-    [jobId, messageIdx, toolUseId, toolName, jsonStr],
+    `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, ordinal)
+     SELECT $1, $2, $3, $4, $5::text::jsonb, 'pending', $6
+      WHERE NOT EXISTS (
+        SELECT 1 FROM subagent_tool_executions
+         WHERE job_id = $1 AND message_idx = $2 AND tool_use_id = $3
+           AND ordinal IS NULL
+      )
+     ON CONFLICT (job_id, message_idx, ordinal) DO NOTHING`,
+    [jobId, messageIdx, toolUseId, toolName, jsonStr, ordinal],
   );
 }
 
 async function persistToolExecComplete(
   engine: BrainEngine,
   jobId: number,
+  messageIdx: number,
+  ordinal: number,
   toolUseId: string,
   output: unknown,
 ): Promise<void> {
+  // Phase 3B-19 bridge: scoped by message_idx/ordinal instead of the
+  // (job_id, tool_use_id) pair alone — see persistToolExecPending. Targets
+  // exactly one row: this call's own ordinal first, else a legacy
+  // ordinal=NULL row; never an already-complete row.
   await engine.executeRaw(
     `UPDATE subagent_tool_executions
-        SET status = 'complete', output = $3::text::jsonb, ended_at = now()
-      WHERE job_id = $1 AND tool_use_id = $2`,
-    [jobId, toolUseId, typeof output === 'string' ? output : JSON.stringify(output)],
+        SET status = 'complete', output = $4::text::jsonb, ended_at = now()
+      WHERE id = (
+        SELECT id FROM subagent_tool_executions
+         WHERE job_id = $1 AND message_idx = $2 AND tool_use_id = $3
+           AND (ordinal = $5 OR ordinal IS NULL)
+           AND status <> 'complete'
+         ORDER BY CASE WHEN ordinal = $5 THEN 0 ELSE 1 END, id
+         LIMIT 1
+      )`,
+    [jobId, messageIdx, toolUseId, typeof output === 'string' ? output : JSON.stringify(output), ordinal],
   );
 }
 
@@ -1475,6 +1506,7 @@ async function persistToolExecFailed(
   engine: BrainEngine,
   jobId: number,
   messageIdx: number,
+  ordinal: number,
   toolUseId: string,
   toolName: string,
   input: unknown,
@@ -1482,13 +1514,35 @@ async function persistToolExecFailed(
 ): Promise<void> {
   // INSERT-or-UPDATE to failed — covers both "no pending row yet" (tool
   // rejected upfront) and "pending row exists" (tool threw mid-execute).
-  await engine.executeRaw(
-    `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, error, ended_at)
-     VALUES ($1, $2, $3, $4, $5::text::jsonb, 'failed', $6, now())
-     ON CONFLICT (job_id, tool_use_id) DO UPDATE
-       SET status = 'failed', error = EXCLUDED.error, ended_at = now()`,
-    [jobId, messageIdx, toolUseId, toolName, typeof input === 'string' ? input : JSON.stringify(input), error],
+  // Phase 3B-19 bridge: UPDATE-then-INSERT replaces the dropped-constraint
+  // upsert — see persistToolExecPending. The UPDATE targets exactly one row
+  // (own ordinal first, else legacy ordinal=NULL), never an already-complete
+  // row. The INSERT leg carries the same stable-id ON CONFLICT backstop.
+  const updated = await engine.executeRaw<{ id: number }>(
+    `UPDATE subagent_tool_executions
+        SET status = 'failed', error = $4, ended_at = now()
+      WHERE id = (
+        SELECT id FROM subagent_tool_executions
+         WHERE job_id = $1 AND message_idx = $2 AND tool_use_id = $3
+           AND (ordinal = $5 OR ordinal IS NULL)
+           AND status <> 'complete'
+         ORDER BY CASE WHEN ordinal = $5 THEN 0 ELSE 1 END, id
+         LIMIT 1
+      )
+      RETURNING id`,
+    [jobId, messageIdx, toolUseId, error, ordinal],
   );
+  if (updated.length === 0) {
+    await engine.executeRaw(
+      `INSERT INTO subagent_tool_executions (job_id, message_idx, tool_use_id, tool_name, input, status, error, ended_at, ordinal)
+       VALUES ($1, $2, $3, $4, $5::text::jsonb, 'failed', $6, now(), $7)
+       ON CONFLICT (job_id, message_idx, ordinal) DO UPDATE
+         SET status = 'failed', error = EXCLUDED.error, ended_at = now()
+         WHERE subagent_tool_executions.tool_use_id = EXCLUDED.tool_use_id
+           AND subagent_tool_executions.status <> 'complete'`,
+      [jobId, messageIdx, toolUseId, toolName, typeof input === 'string' ? input : JSON.stringify(input), error, ordinal],
+    );
+  }
 }
 
 // ── Internal: helpers ───────────────────────────────────────
