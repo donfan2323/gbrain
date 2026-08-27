@@ -8,8 +8,7 @@
  */
 import { describe, test, expect, beforeAll, afterAll, afterEach, beforeEach } from 'bun:test';
 import net from 'node:net';
-import { mkdtempSync, rmSync, statSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
@@ -28,6 +27,7 @@ import type { PointerBlock } from '../src/core/context/retrieval-reflex.ts';
 import { assembleTurnContext, TURN_CONTEXT_ENVELOPE, type TurnContextResult } from '../src/core/context/turn-context.ts';
 import { __resetHotMemoryCacheForTests } from '../src/core/facts/meta-hook.ts';
 import type { WindowTurn } from '../src/core/context/entity-salience.ts';
+import { shortSocketTestDir } from './helpers/short-socket-dir.ts';
 
 let engine: PGLiteEngine;
 
@@ -39,7 +39,7 @@ afterEach(() => {
 });
 
 function tmpDir(): string {
-  const d = mkdtempSync(join(tmpdir(), 'rr-ipc-v2-'));
+  const d = shortSocketTestDir('v2-');
   dirs.push(d);
   return d;
 }

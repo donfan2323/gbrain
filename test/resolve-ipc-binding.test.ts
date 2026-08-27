@@ -10,13 +10,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { bindResolveIpcForServe } from '../src/mcp/resolve-ipc-binding.ts';
 import { resolveSocketPath } from '../src/core/context/resolve-ipc.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { shortSocketTestDir } from './helpers/short-socket-dir.ts';
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const readSrc = (rel: string) => Bun.file(join(REPO_ROOT, rel));
@@ -24,7 +24,7 @@ const readSrc = (rel: string) => Bun.file(join(REPO_ROOT, rel));
 let tmp: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gb-ipc-bind-'));
+  tmp = shortSocketTestDir('gb-');
 });
 
 afterEach(() => {

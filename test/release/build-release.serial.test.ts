@@ -1,46 +1,62 @@
 /**
  * scripts/release/build-release.sh regression tests (dashboard-yct90).
  *
- * These tests temporarily edit the REAL repo's README.md (a tracked file)
- * to exercise the dirty-tree gate and the secret scanner against a real
- * `git diff HEAD` — `git archive HEAD` only ever emits COMMITTED content
- * (see build-release.sh's own header comment), so a secret injected only
- * into an uncommitted edit can never leak into app/src itself; it can only
- * ever reach the built artifact via `source.diff` (git diff HEAD, captured
+ * These tests temporarily edit README.md (a tracked file) to exercise the
+ * dirty-tree gate and the secret scanner against a real `git diff HEAD` —
+ * `git archive HEAD` only ever emits COMMITTED content (see
+ * build-release.sh's own header comment), so a secret injected only into an
+ * uncommitted edit can never leak into app/src itself; it can only ever
+ * reach the built artifact via `source.diff` (git diff HEAD, captured
  * verbatim) when `--allow-dirty` is used. That's exactly what the secret-
  * rejection test below exploits, without ever committing anything.
  *
- * Every edit here is reverted in a `finally` block and verified via
- * `git status --porcelain` before AND after, per this repo's git-safety
- * norms — no `git checkout`/`git restore`/`git reset` is ever used (those
- * are also the literal strings build-release.sh itself must never use).
+ * The edit happens inside a PRIVATE `git worktree` (createIsolatedWorktree),
+ * not the shared repo checkout — build-release.sh is pointed at it via
+ * GBRAIN_REPO_ROOT. This is what makes the file `.serial.test.ts`-safe
+ * without actually needing cross-file serialization: it no longer shares
+ * any mutable state with deploy.serial.test.ts (whose own build-release.sh
+ * calls use their own separate isolated worktree) or with the developer's
+ * own in-progress edits to the real checkout.
  *
- * `.serial.test.ts`: spawns real subprocesses (git, bun install) and writes
- * to a shared resource (the repo's own working tree, briefly) — must not
- * run concurrently with another file doing the same.
+ * Every edit here is reverted in a `finally` block and verified via a real
+ * `git diff HEAD` before AND after, per this repo's git-safety norms — no
+ * `git checkout`/`git restore`/`git reset` is ever used (those are also the
+ * literal strings build-release.sh itself must never use).
  */
-import { describe, test, expect, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { freshEnv, nodeModulesDigestSync, readManifest, removeFreshEnv, runScript, REPO_ROOT } from './fixtures';
+import {
+  createIsolatedWorktree,
+  freshEnv,
+  nodeModulesDigestSync,
+  readManifest,
+  removeFreshEnv,
+  removeIsolatedWorktree,
+  runScript,
+  type IsolatedWorktree,
+} from './fixtures';
 
-const README_PATH = join(REPO_ROOT, 'README.md');
+let repoWt: IsolatedWorktree;
+let README_PATH: string;
+
+beforeAll(() => {
+  repoWt = createIsolatedWorktree('gbrain-buildrelease-test-repo-');
+  README_PATH = join(repoWt.path, 'README.md');
+});
+
+afterAll(() => {
+  removeIsolatedWorktree(repoWt);
+});
 
 /**
  * Mirrors build-release.sh's OWN dirty-tree check exactly (`git diff --quiet
- * HEAD --`) — i.e. tracked-file modifications only. Untracked files (this
- * very test/release/ directory, docs/adr/ from this session) are
- * deliberately NOT part of that check (git archive HEAD never includes them
- * either way), so `git status --porcelain`'s `??` noise would be the wrong
- * signal here.
+ * HEAD --`) — i.e. tracked-file modifications only, against the isolated
+ * worktree.
  */
 function trackedDiffFromHead(): string {
-  return execFileSync('git', ['diff', 'HEAD', '--'], { cwd: REPO_ROOT, encoding: 'utf8' });
-}
-
-function currentHeadSha(): string {
-  return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+  return execFileSync('git', ['diff', 'HEAD', '--'], { cwd: repoWt.path, encoding: 'utf8' });
 }
 
 /** Appends `line` to README.md, returns a restore function. Verifies clean before editing. */
@@ -76,7 +92,7 @@ describe('build-release.sh', () => {
       const fe = freshEnv();
       const { root, env } = fe;
       pendingEnvs.push(fe);
-      const result = runScript('build-release.sh', [], env, 30_000);
+      const result = runScript('build-release.sh', [], { ...env, GBRAIN_REPO_ROOT: repoWt.path }, 30_000);
       expect(result.status).not.toBe(0);
       expect(result.stdout + result.stderr).toMatch(/uncommitted changes|dirty tree/);
       // Nothing published under releases/.
@@ -97,9 +113,9 @@ describe('build-release.sh', () => {
           const fe = freshEnv();
           const { root, env } = fe;
           pendingEnvs.push(fe);
-          const expectedHeadSha = currentHeadSha();
+          const expectedHeadSha = repoWt.headSha;
 
-          const result = runScript('build-release.sh', ['--allow-dirty'], env, 60_000);
+          const result = runScript('build-release.sh', ['--allow-dirty'], { ...env, GBRAIN_REPO_ROOT: repoWt.path }, 60_000);
           expect(result.status).toBe(0);
           const releaseDir = result.stdout.trim().split('\n').pop()!;
           expect(existsSync(releaseDir)).toBe(true);
@@ -147,7 +163,7 @@ describe('build-release.sh', () => {
         const fe = freshEnv();
         const { root, env } = fe;
         pendingEnvs.push(fe);
-        const result = runScript('build-release.sh', ['--allow-dirty'], env, 60_000);
+        const result = runScript('build-release.sh', ['--allow-dirty'], { ...env, GBRAIN_REPO_ROOT: repoWt.path }, 60_000);
         expect(result.status).not.toBe(0);
         expect(result.stdout + result.stderr).toMatch(/secret-shaped pattern found/);
         // No directory should appear under releases/ afterward — the

@@ -26,7 +26,14 @@ import {
 } from 'node:fs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { join } from 'node:path';
-import { freshEnv, makeFixtureRelease, runScript } from './fixtures';
+import {
+  createIsolatedWorktree,
+  freshEnv,
+  makeFixtureRelease,
+  removeIsolatedWorktree,
+  runScript,
+  type IsolatedWorktree,
+} from './fixtures';
 
 const PORT = 18902;
 
@@ -59,6 +66,7 @@ describe('deploy.sh', () => {
   let env: Record<string, string>;
   let releaseA: string;
   let releaseB: string;
+  let repoWt: IsolatedWorktree;
 
   beforeAll(() => {
     const fe = freshEnv({ GBRAIN_HTTP_PORT: String(PORT) });
@@ -66,6 +74,14 @@ describe('deploy.sh', () => {
     dataDir = fe.dataDir;
     homeParent = fe.homeParent;
     env = fe.env;
+
+    // build-release.sh's dirty-tree gate checks whatever GBRAIN_REPO_ROOT
+    // resolves to; pointing it at a private worktree (rather than the
+    // default, the shared repo checkout) means these builds are immune to
+    // another test file's temporary edits, or ordinary in-progress local
+    // edits, to the real working tree.
+    repoWt = createIsolatedWorktree('gbrain-deploy-test-repo-');
+    env = { ...env, GBRAIN_REPO_ROOT: repoWt.path };
 
     const buildA = runScript('build-release.sh', [], env, 90_000);
     if (buildA.status !== 0) {
@@ -87,7 +103,7 @@ describe('deploy.sh', () => {
 
     // Real data dir init (gotcha #2: creates .gbrain under GBRAIN_HOME
     // itself — GBRAIN_HOME here is homeParent, the PARENT of dataDir).
-    const init = spawnSync('bash', ['-c', `"${releaseA}/bin/gbrain" init --pglite --no-embedding --yes`], {
+    const init = spawnSync('bash', ['-c', `"${releaseA}/bin/gbrain" init --pglite --no-embedding --non-interactive`], {
       env: { ...process.env, GBRAIN_HOME: homeParent },
       encoding: 'utf8',
       timeout: 60_000,
@@ -99,9 +115,31 @@ describe('deploy.sh', () => {
   }, 180_000);
 
   afterAll(() => {
-    killTestServicePid(root);
-    forceRemove(root);
-    forceRemove(homeParent);
+    // Each step runs independently — an exception from an earlier step (e.g.
+    // forceRemove hitting a file a just-killed process hasn't fully released
+    // yet) must never skip a later one, or cleanup silently leaks state
+    // (observed: a leaked `git worktree` registration when this was a
+    // straight-line sequence).
+    try {
+      killTestServicePid(root);
+    } catch {
+      /* best effort */
+    }
+    try {
+      forceRemove(root);
+    } catch {
+      /* best effort */
+    }
+    try {
+      forceRemove(homeParent);
+    } catch {
+      /* best effort */
+    }
+    try {
+      removeIsolatedWorktree(repoWt);
+    } catch {
+      /* best effort */
+    }
   });
 
   test('first deploy: current -> A, no previous release exists', () => {

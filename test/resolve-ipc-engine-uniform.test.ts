@@ -10,8 +10,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   ensureIpcSecretForConfig,
@@ -26,6 +25,7 @@ import {
   IPC_UNAVAILABLE,
 } from '../src/core/context/resolve-ipc.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { shortSocketTestDir } from './helpers/short-socket-dir.ts';
 
 const URL_A = 'postgresql://user:hunter2@db.example.com:5432/brain_a';
 const URL_B = 'postgresql://user:hunter2@db.example.com:5432/brain_b';
@@ -33,7 +33,7 @@ const URL_B = 'postgresql://user:hunter2@db.example.com:5432/brain_b';
 let tmp: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-ipc-uniform-'));
+  tmp = shortSocketTestDir('u-');
 });
 
 afterEach(() => {

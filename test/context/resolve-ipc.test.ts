@@ -2,9 +2,7 @@
  * Retrieval Reflex resolve IPC round-trip tests (#1981, T3/T5).
  */
 import { describe, test, expect, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { rmSync, existsSync } from 'node:fs';
 import {
   resolveSocketPath,
   startResolveIpcServer,
@@ -12,6 +10,7 @@ import {
   IPC_UNAVAILABLE,
 } from '../../src/core/context/resolve-ipc.ts';
 import type { PointerBlock } from '../../src/core/context/retrieval-reflex.ts';
+import { shortSocketTestDir } from '../helpers/short-socket-dir.ts';
 
 const servers: Array<{ close: () => void }> = [];
 afterEach(() => {
@@ -19,7 +18,7 @@ afterEach(() => {
 });
 
 function tmpDir(): string {
-  return mkdtempSync(join(tmpdir(), 'rr-ipc-'));
+  return shortSocketTestDir('rr-');
 }
 
 describe('resolve IPC', () => {

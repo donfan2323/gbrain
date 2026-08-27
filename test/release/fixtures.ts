@@ -10,7 +10,7 @@
  * (/Users/lab/AI_Production) or the real data dir (~/.gbrain) — every
  * caller must supply fresh mktemp-based paths.
  */
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -18,6 +18,51 @@ import { join } from 'node:path';
 
 export const REPO_ROOT = join(import.meta.dir, '..', '..');
 export const SCRIPTS_DIR = join(REPO_ROOT, 'scripts', 'release');
+
+/**
+ * A private `git worktree` checked out from REPO_ROOT's current HEAD, for
+ * tests that invoke build-release.sh and need its OWN independent
+ * "GBRAIN_REPO_ROOT" — decoupled from whatever the shared checkout's
+ * dirty/clean state happens to be at the moment (another `.serial.test.ts`
+ * file's temporary edit, or just an in-progress local edit). build-release.sh
+ * `cd`s into `$GBRAIN_REPO_ROOT` and runs plain `git` commands there, so
+ * pointing it at this worktree is enough — no script change needed.
+ */
+export interface IsolatedWorktree {
+  path: string;
+  headSha: string;
+}
+
+export function createIsolatedWorktree(prefix: string): IsolatedWorktree {
+  const path = makeTempDir(prefix);
+  // The temp dir must not exist yet for `git worktree add` to create it;
+  // mkdtempSync already created it, so remove it first (still under tmpdir,
+  // still guaranteed-unique).
+  rmSync(path, { recursive: true, force: true });
+  const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).trim();
+  execFileSync('git', ['worktree', 'add', '--detach', path, headSha], { cwd: REPO_ROOT, encoding: 'utf8' });
+  return { path, headSha };
+}
+
+export function removeIsolatedWorktree(wt: IsolatedWorktree): void {
+  try {
+    execFileSync('git', ['worktree', 'remove', '--force', wt.path], { cwd: REPO_ROOT, encoding: 'utf8' });
+  } catch {
+    // Best effort: fall back to a manual remove + prune if `worktree
+    // remove` itself failed (e.g. the dir was already gone).
+    try {
+      spawnSync('chmod', ['-R', 'u+w', wt.path]);
+    } catch {
+      /* best effort */
+    }
+    rmSync(wt.path, { recursive: true, force: true });
+    try {
+      execFileSync('git', ['worktree', 'prune'], { cwd: REPO_ROOT, encoding: 'utf8' });
+    } catch {
+      /* best effort */
+    }
+  }
+}
 
 export interface RunResult {
   status: number;
