@@ -192,6 +192,9 @@ describe('buildBrainTools', () => {
   // put_page → importFromContent, so subagent writes land in the cycle's
   // resolved source instead of the hardcoded 'default'.
   test('execute() on put_page writes to the configured sourceId (#1586)', async () => {
+    // Write-through needs a real directory for this source's local_path —
+    // put_page now rejects a write whose file can't be written to disk.
+    fs.mkdirSync('/tmp/mybrain', { recursive: true });
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config, archived, created_at)
        VALUES ('mybrain', 'My Brain', '/tmp/mybrain', '{}'::jsonb, false, now())

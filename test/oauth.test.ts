@@ -1018,7 +1018,7 @@ describe('redirect_uri validation (DCR)', () => {
         scope: 'read',
         token_endpoint_auth_method: 'client_secret_post',
       }),
-    ).rejects.toThrow(/https/);
+    ).rejects.toThrow(/https|loopback|custom scheme/i);
   });
 
   test('non-URL string is rejected', async () => {
@@ -1031,6 +1031,59 @@ describe('redirect_uri validation (DCR)', () => {
         token_endpoint_auth_method: 'client_secret_post',
       }),
     ).rejects.toThrow();
+  });
+
+  test('native-app custom scheme redirect_uri is allowed (RFC 8252 §7.1)', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'warp-custom-scheme',
+      redirect_uris: ['warp://oauth/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+    expect(result.client_id).toStartWith('gbrain_cl_');
+    const stored = await provider.clientsStore.getClient(result.client_id);
+    expect(stored!.redirect_uris).toEqual(['warp://oauth/callback']);
+  });
+
+  test('browser pseudo-schemes are rejected in the custom-scheme branch', async () => {
+    // javascript:/data:/vbscript:/blob: are not native-app schemes — a
+    // "redirect" to one is script injection. The custom-scheme allow branch
+    // must not let them through.
+    for (const uri of [
+      'javascript://alert(1)',
+      'data://text/html;base64,PGh0bWw+',
+      'vbscript://msgbox',
+      'blob://example.com/uuid',
+    ]) {
+      await expect(
+        provider.clientsStore.registerClient!({
+          client_name: 'pseudo-scheme-client',
+          redirect_uris: [uri],
+          grant_types: ['authorization_code'],
+          scope: 'read',
+          token_endpoint_auth_method: 'none',
+        }),
+      ).rejects.toThrow(/pseudo-scheme/);
+    }
+  });
+
+  test('DCR validation failures throw InvalidClientMetadataError (not plain Error)', async () => {
+    const { InvalidClientMetadataError } = await import(
+      '@modelcontextprotocol/sdk/server/auth/errors.js'
+    );
+    try {
+      await provider.clientsStore.registerClient!({
+        client_name: 'http-rejected-type',
+        redirect_uris: ['http://example.com/callback'],
+        grant_types: ['authorization_code'],
+        scope: 'read',
+        token_endpoint_auth_method: 'client_secret_post',
+      });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidClientMetadataError);
+    }
   });
 
   // pgArray escape regression: an element containing a comma must be stored
@@ -1318,16 +1371,38 @@ describe('v0.28 ALLOWED_SCOPES allowlist', () => {
     }
   });
 
-  test('registerClient (DCR) rejects unknown scope strings', async () => {
-    await expect(
-      provider.clientsStore.registerClient!({
-        client_name: 'dcr-bad-scope',
+  test('registerClient (DCR) filters unknown scopes and keeps allowed ones', async () => {
+    // DCR is unauthenticated and clients (rmcp / OIDC-flavored stacks) often
+    // append offline_access etc. Filter unknowns instead of 500ing.
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-filter-scope',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read write offline_access openid',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(result.scope).toBe('read write');
+    const stored = await provider.clientsStore.getClient(result.client_id);
+    expect(stored!.scope).toBe('read write');
+  });
+
+  test('registerClient (DCR) rejects when every requested scope is unknown', async () => {
+    const { InvalidClientMetadataError } = await import(
+      '@modelcontextprotocol/sdk/server/auth/errors.js'
+    );
+    try {
+      await provider.clientsStore.registerClient!({
+        client_name: 'dcr-all-unknown-scope',
         redirect_uris: ['https://example.com/cb'],
         grant_types: ['authorization_code'],
-        scope: 'read bogus_scope',
-        token_endpoint_auth_method: 'client_secret_post',
-      } as any),
-    ).rejects.toThrow(/Unknown scope/);
+        scope: 'openid offline_access',
+        token_endpoint_auth_method: 'none',
+      } as any);
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(InvalidClientMetadataError);
+      expect((e as Error).message).toMatch(/No recognized scopes/);
+    }
   });
 });
 
@@ -1354,7 +1429,24 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
     `;
   }
 
-  test('DCR-1: a fully anonymous, public (PKCE, no secret) registration self-requesting scope=admin is DENIED', async () => {
+  // Phase 3B-30 note: registerClient's scope handling was reconciled against
+  // upstream v0.46.32 (77bb9d8c)'s DCR-500 fix. Upstream replaced the old
+  // "throw on ANY unrecognized scope string" behavior with a filter (RFC 7591
+  // value replacement) so a legitimate client sending one harmless extra
+  // scope (e.g. `openid`) is not rejected outright. The Phase 3B-11 ceiling
+  // below is preserved through that reconciliation by applying the SAME
+  // filter treatment to known-but-privileged scopes: a solo privileged
+  // request (nothing left after filtering) still 400s via
+  // InvalidClientMetadataError (never the historical opaque 500) — DCR-1/
+  // DCR-2 below. A MIXED request narrows to the safe subset and SUCCEEDS
+  // instead of denying the whole registration — DCR-3 below, superseding the
+  // pre-3B-30 "reject the entire registration" behavior. The security
+  // property this whole suite exists to prove — a self-registered DCR client
+  // can never end up holding admin/sources_admin/users_admin/agent — is
+  // unchanged by this: it's asserted per-test on the PERSISTED scope, not on
+  // whether the call throws.
+
+  test('DCR-1: a fully anonymous, public (PKCE, no secret) registration self-requesting scope=admin alone is DENIED (400, not 500)', async () => {
     await expect(
       provider.clientsStore.registerClient!({
         client_name: 'attacker-dcr-client',
@@ -1363,10 +1455,10 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
         scope: 'admin',
         token_endpoint_auth_method: 'none',
       } as any),
-    ).rejects.toThrow(/scope "admin" is not permitted via dynamic client registration/);
+    ).rejects.toThrow(/No recognized scopes in request \(admin\)/);
   });
 
-  test('DCR-2: sources_admin, users_admin, and agent are each independently denied', async () => {
+  test('DCR-2: sources_admin, users_admin, and agent alone are each independently denied (400, not 500)', async () => {
     for (const scope of ['sources_admin', 'users_admin', 'agent']) {
       await expect(
         provider.clientsStore.registerClient!({
@@ -1376,22 +1468,24 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
           scope,
           token_endpoint_auth_method: 'none',
         } as any),
-      ).rejects.toThrow(/is not permitted via dynamic client registration/);
+      ).rejects.toThrow(/No recognized scopes in request/);
     }
   });
 
-  test('DCR-3: a mixed request (one disallowed scope among allowed ones) denies the ENTIRE registration — no partial grant', async () => {
-    await expect(
-      provider.clientsStore.registerClient!({
-        client_name: 'dcr-mixed',
-        redirect_uris: ['https://example.com/cb'],
-        grant_types: ['authorization_code'],
-        scope: 'read write admin',
-        token_endpoint_auth_method: 'none',
-      } as any),
-    ).rejects.toThrow(/scope "admin" is not permitted/);
-    const rows = await sql`SELECT client_id FROM oauth_clients WHERE client_name = 'dcr-mixed'`;
-    expect(rows.length).toBe(0); // no row persisted for the denied attempt
+  test('DCR-3: a mixed request ("read write admin totally_unknown") narrows to the DCR-safe subset ("read write") and SUCCEEDS — admin and the unknown scope are both silently dropped, never granted', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-mixed',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read write admin totally_unknown',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(result.client_id).toBeTruthy();
+    expect(result.scope).toBe('read write');
+    const persisted = await provider.clientsStore.getClient(result.client_id);
+    expect(persisted?.scope).toBe('read write');
+    expect(persisted?.scope).not.toContain('admin');
+    expect(persisted?.scope).not.toContain('totally_unknown');
   });
 
   test('DCR-4: read, write, and "read write" remain allowed (unaffected baseline)', async () => {
@@ -1475,18 +1569,60 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
     expect(denial.error_message).toBe('invalid_client_metadata');
   });
 
-  test('DCR-8: audit — an unknown-scope-string denial is classified separately (error_message=invalid_scope)', async () => {
+  test('DCR-8: a request mixing a known-allowed scope with an unrecognized scope string SUCCEEDS — the unknown scope is silently dropped, not a 500 or a 400', async () => {
+    const result = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-unknown-scope-mixed',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read totally_bogus_scope',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(result.client_id).toBeTruthy();
+    expect(result.scope).toBe('read');
+    const rows = await readDcrAuditRows();
+    expect(rows[rows.length - 1].status).toBe('success');
+  });
+
+  test('DCR-8b: a request with ONLY an unrecognized scope string (nothing left after filtering) is a clean 400 (InvalidClientMetadataError), never an unhandled 500', async () => {
+    const before = (await readDcrAuditRows()).length;
     await expect(
       provider.clientsStore.registerClient!({
-        client_name: 'dcr-audit-unknown-scope',
+        client_name: 'dcr-unknown-scope-only',
         redirect_uris: ['https://example.com/cb'],
         grant_types: ['authorization_code'],
-        scope: 'read totally_bogus_scope',
+        scope: 'totally_bogus_scope',
         token_endpoint_auth_method: 'none',
       } as any),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/No recognized scopes in request \(totally_bogus_scope\)/);
     const rows = await readDcrAuditRows();
-    expect(rows[rows.length - 1].error_message).toBe('invalid_scope');
+    expect(rows.length).toBe(before + 1);
+    const denial = rows[rows.length - 1];
+    expect(denial.status).toBe('denied');
+    expect(denial.error_message).toBe('invalid_client_metadata'); // classified as client-metadata denial, not a raw/unhandled error
+  });
+
+  test('DCR-10: authorize()/token issuance cannot exceed the DCR-narrowed registered grant — a client that registered "read write admin totally_unknown" (persisted as "read write") requesting admin at /authorize is granted only read+write', async () => {
+    const registered = await provider.clientsStore.registerClient!({
+      client_name: 'dcr-authorize-clamp',
+      redirect_uris: ['https://example.com/cb'],
+      grant_types: ['authorization_code'],
+      scope: 'read write admin totally_unknown',
+      token_endpoint_auth_method: 'none',
+    } as any);
+    expect(registered.scope).toBe('read write');
+    const persisted = await provider.clientsStore.getClient(registered.client_id);
+
+    let redirectUrl = '';
+    const mockRes = { redirect: (url: string) => { redirectUrl = url; } } as any;
+    await provider.authorize(persisted!, {
+      codeChallenge: 'challenge',
+      redirectUri: 'https://example.com/cb',
+      scopes: ['admin', 'write', 'read'], // over-request at the consent step
+    }, mockRes);
+    const code = new URL(redirectUrl).searchParams.get('code')!;
+    const tokens = await provider.exchangeAuthorizationCode(persisted!, code, undefined, 'https://example.com/cb');
+    const authInfo = await provider.verifyAccessToken(tokens.access_token) as unknown as CoreAuthInfo;
+    expect(authInfo.scopes.sort()).toEqual(['read', 'write']); // clamped to the registered grant — admin never issued
   });
 
   test('DCR-9: secret sentinel proof — a confidential-client (secret-issuing) success writes exactly ONE non-vacuous audit row, and it contains zero secret material', async () => {
@@ -1594,7 +1730,7 @@ describe('Phase 3B-11: DCR scope restriction (only {read, write} self-requestabl
         scope: 'admin',
         token_endpoint_auth_method: 'none',
       } as any),
-    ).rejects.toThrow(/scope "admin" is not permitted via dynamic client registration/);
+    ).rejects.toThrow(/No recognized scopes in request \(admin\)/);
     expect(auditAttempted).toBe(true);
 
     const rows = await sql`SELECT count(*)::int AS n FROM oauth_clients WHERE client_name = 'dcr-audit-outage-denied-client'`;
@@ -2052,7 +2188,9 @@ describe('v0.41.3 DCR validator (T5)', () => {
   test('DCR rejects unknown token_endpoint_auth_method — closes --enable-dcr loose path', async () => {
     // Pre-v0.41.3 the DCR registration handler defaulted to 'client_secret_post'
     // for any unknown value, silently swallowing typos. T5 throws so the bad
-    // input fails loud — same gate as CLI + admin paths.
+    // input fails loud. DCR wraps the inner InvalidTokenEndpointAuthMethodError
+    // as InvalidClientMetadataError so the MCP SDK returns HTTP 400 instead of
+    // opaque 500 (Warp/rmcp regression).
     await expect(
       provider.clientsStore.registerClient!({
         client_name: 'dcr-bad-test',
@@ -2061,7 +2199,7 @@ describe('v0.41.3 DCR validator (T5)', () => {
         redirect_uris: ['https://example.test/cb'],
         token_endpoint_auth_method: 'frobnicate',
       } as any),
-    ).rejects.toThrow(InvalidTokenEndpointAuthMethodError);
+    ).rejects.toThrow(InvalidClientMetadataError);
   });
 
   test('DCR accepts "none" → public PKCE client', async () => {

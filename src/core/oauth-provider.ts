@@ -26,7 +26,14 @@ import type { AuthInfo as SdkAuthInfo } from '@modelcontextprotocol/sdk/server/a
 import { InvalidTokenError, InvalidClientMetadataError, OAuthError, InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { assertValidSourceId } from './source-id.ts';
-import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError, DCR_ALLOWED_SCOPES, type Scope } from './scope.ts';
+import {
+  hasScope,
+  assertAllowedScopes,
+  filterAllowedScopes,
+  parseScopeString,
+  InvalidScopeError,
+  DCR_ALLOWED_SCOPES,
+} from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
 import { parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions, normalizeTokenScopes } from './legacy-token-scope.ts';
 
@@ -155,21 +162,42 @@ export function validateTokenEndpointAuthMethod(value: unknown): TokenEndpointAu
 }
 
 /**
- * Validate a redirect_uri per RFC 6749 §3.1.2.1.
- *
- * Production redirect_uris MUST be HTTPS. The only allowed plaintext
- * exceptions are loopback (127.0.0.1, ::1, localhost) which are unreachable
- * from the network. Throws a descriptive error on rejection.
- *
- * Used by the DCR (Dynamic Client Registration) path; the CLI registration
- * path trusts the operator and bypasses this gate.
+ * Re-throw non-OAuth registration errors as `InvalidClientMetadataError` so
+ * the MCP SDK register handler returns HTTP 400 `invalid_client_metadata`
+ * instead of a generic 500 `server_error`. Already-OAuth errors pass through.
  */
-function validateRedirectUri(uri: string): void {
+function asClientMetadataError(err: unknown): never {
+  if (err instanceof InvalidClientMetadataError) throw err;
+  // Duck-type OAuthError from the SDK (has .errorCode) without importing the
+  // base class — keeps the dependency surface stable across SDK versions.
+  if (err && typeof err === 'object' && 'errorCode' in err) throw err;
+  const message = err instanceof Error ? err.message : String(err);
+  console.warn(`[gbrain dcr] rejected registration: ${message}`);
+  throw new InvalidClientMetadataError(message);
+}
+
+/**
+ * Validate a redirect_uri for the DCR path.
+ *
+ * Allowed:
+ * - `https://` (production web clients)
+ * - loopback `http://` (127.0.0.1 / ::1 / localhost) — RFC 8252 §7.3
+ * - custom URI schemes (`warp://`, `myapp://`, …) — RFC 8252 §7.1 native apps
+ *
+ * Rejected:
+ * - non-loopback plaintext `http://` (auth-code exfiltration over the network)
+ * - unparseable strings
+ *
+ * Throws `InvalidClientMetadataError` (OAuthError → SDK maps to HTTP 400
+ * `invalid_client_metadata`) so DCR validation failures never surface as
+ * opaque 500s. CLI registration bypasses this gate (operator-trusted).
+ */
+export function validateRedirectUri(uri: string): void {
   let parsed: URL;
   try {
     parsed = new URL(uri);
   } catch {
-    throw new Error(`Invalid redirect_uri: not a parseable URL: ${uri}`);
+    throw new InvalidClientMetadataError(`Invalid redirect_uri: not a parseable URL: ${uri}`);
   }
   const isLoopback = parsed.hostname === 'localhost'
     || parsed.hostname === '127.0.0.1'
@@ -177,8 +205,22 @@ function validateRedirectUri(uri: string): void {
     || parsed.hostname === '::1';
   if (parsed.protocol === 'https:') return;
   if (parsed.protocol === 'http:' && isLoopback) return;
-  throw new Error(
-    `redirect_uri must use https:// (or http://localhost for loopback): ${uri}`,
+  // Native-app custom schemes (anything other than http/https). Require a
+  // non-empty scheme name so bare strings like "://x" can't sneak through,
+  // and reject browser-executable pseudo-schemes: a javascript:/data:/
+  // vbscript:/blob: "redirect" is script injection, not a native-app callback.
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    const scheme = parsed.protocol.replace(/:$/, '');
+    const pseudoSchemes = new Set(['javascript', 'data', 'vbscript', 'blob']);
+    if (pseudoSchemes.has(scheme.toLowerCase())) {
+      throw new InvalidClientMetadataError(
+        `redirect_uri scheme '${scheme}:' is a browser pseudo-scheme, not a native-app scheme: ${uri}`,
+      );
+    }
+    if (scheme.length > 0) return;
+  }
+  throw new InvalidClientMetadataError(
+    `redirect_uri must use https://, a native-app custom scheme, or http:// loopback: ${uri}`,
   );
 }
 
@@ -395,62 +437,89 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
   private async doRegisterClient(
     client: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>,
   ): Promise<OAuthClientInformationFull> {
-    // Enforce HTTPS for all redirect_uris on the DCR path (RFC 6749 §3.1.2.1).
-    // Without this, an attacker could register a non-loopback http:// URI and
-    // exfiltrate auth codes over plaintext. CLI registrations bypass this gate
-    // (operators are trusted; they can register http:// for testing).
-    for (const uri of client.redirect_uris || []) {
-      validateRedirectUri(String(uri));
-    }
+    // DCR is unauthenticated network input. Every validation failure here
+    // MUST become InvalidClientMetadataError (HTTP 400) — plain Errors are
+    // converted to opaque 500 server_error by the MCP SDK register handler,
+    // which is what broke Warp/rmcp clients against gbrain.
+    let authMethod: TokenEndpointAuthMethod;
+    let registeredScope: string;
+    let grantTypes: string[];
+    try {
+      // redirect_uri: https / loopback http / native custom schemes only.
+      // Non-loopback plaintext http is still rejected (auth-code exfil).
+      // CLI registrations bypass this gate (operator-trusted).
+      for (const uri of client.redirect_uris || []) {
+        validateRedirectUri(String(uri));
+      }
 
-    // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. The DCR
-    // path is reachable by any unauthenticated network caller when --enable-dcr
-    // is on, so this is the security-relevant gate (manual CLI registration
-    // is operator-trusted).
-    const requestedScopes = parseScopeString(client.scope);
-    assertAllowedScopes(requestedScopes);
-
-    // Phase 3B-11 (DCR security): assertAllowedScopes above only rejects
-    // UNKNOWN scope strings — a KNOWN, privileged one (`admin`,
-    // `sources_admin`, `users_admin`, `agent`) sailed straight through.
-    // DCR_ALLOWED_SCOPES (scope.ts) is the narrower, DCR-appropriate subset;
-    // see its own doc comment for why this matters (no consent step exists
-    // between registration and token issuance on this path). Manual CLI/
-    // admin registration (registerClientManual, below) does not call this
-    // method at all, so operator-trusted elevated-scope registration is
-    // unaffected.
-    for (const s of requestedScopes) {
-      if (!DCR_ALLOWED_SCOPES.has(s as Scope)) {
-        throw new InvalidClientMetadataError(
-          `scope "${s}" is not permitted via dynamic client registration (only ` +
-          `${[...DCR_ALLOWED_SCOPES].join(', ')} may be self-requested); register the ` +
-          'client via the gbrain CLI / admin API for elevated scopes.',
+      // Scope policy for DCR, in two stages:
+      //  1. Unknown scope strings (typos, OIDC extras like `offline_access` /
+      //     `openid`) are filtered, not hard-rejected (RFC 7591 value
+      //     replacement) — spec-compliant clients that send these used to
+      //     fail registration with an opaque 500.
+      //  2. Phase 3B-11 (DCR security, preserved through the v0.46.32
+      //     reconciliation — Phase 3B-30): a KNOWN-but-privileged scope
+      //     (`admin`, `sources_admin`, `users_admin`, `agent`) is ALSO
+      //     filtered, never registered via DCR. There is no consent step
+      //     between DCR registration and token issuance on this path (unlike
+      //     /authorize's user-facing consent screen), so a self-registered
+      //     client must never come out of registerClient holding more than
+      //     DCR_ALLOWED_SCOPES — authorize() clamps issued tokens to
+      //     client.scope, so whatever is registered here IS the ceiling.
+      //     Manual CLI/admin registration (registerClientManual, below) does
+      //     not call this method at all, so operator-trusted elevated-scope
+      //     registration is unaffected — this ceiling is DCR-specific.
+      const requestedScopes = parseScopeString(client.scope);
+      const { allowed: knownScopes, dropped: unknownScopes } = filterAllowedScopes(requestedScopes);
+      const allowed = knownScopes.filter(s => DCR_ALLOWED_SCOPES.has(s));
+      const privilegedDropped = knownScopes.filter(s => !DCR_ALLOWED_SCOPES.has(s));
+      if (unknownScopes.length > 0) {
+        console.warn(
+          `[gbrain dcr] dropping unknown scopes from registration ` +
+          `(client_name=${client.client_name || 'unnamed'}): ${unknownScopes.join(' ')}`,
         );
       }
-    }
+      if (privilegedDropped.length > 0) {
+        console.warn(
+          `[gbrain dcr] dropping privileged scope(s) not permitted via dynamic client ` +
+          `registration (client_name=${client.client_name || 'unnamed'}): ` +
+          `${privilegedDropped.join(' ')} (only ${[...DCR_ALLOWED_SCOPES].join(', ')} may be ` +
+          `self-requested; register via the gbrain CLI / admin API for elevated scopes)`,
+        );
+      }
+      if (requestedScopes.length > 0 && allowed.length === 0) {
+        throw new InvalidClientMetadataError(
+          `No recognized scopes in request (${requestedScopes.join(' ')}). ` +
+          `Allowed via dynamic client registration: ${[...DCR_ALLOWED_SCOPES].join(', ')}.`,
+        );
+      }
+      registeredScope = allowed.join(' ');
 
-    // v0.41.3 (T5): validate token_endpoint_auth_method on the DCR path so
-    // `--enable-dcr` is not the looser entry point. CLI and admin paths gate
-    // through the same `validateTokenEndpointAuthMethod` helper — all three
-    // registration entry points share one allow-list.
-    const authMethod = validateTokenEndpointAuthMethod(client.token_endpoint_auth_method);
+      // v0.41.3 (T5): validate token_endpoint_auth_method on the DCR path so
+      // `--enable-dcr` is not the looser entry point. CLI and admin paths gate
+      // through the same `validateTokenEndpointAuthMethod` helper — all three
+      // registration entry points share one allow-list.
+      authMethod = validateTokenEndpointAuthMethod(client.token_endpoint_auth_method);
 
-    // v0.42 (#1353): the DCR path is the unauthenticated network entry point.
-    // `client_credentials` skips /authorize consent entirely, so a self-
-    // registered DCR client must NOT get it by default. Default the grant to
-    // `authorization_code` (the consent-bearing flow) when unspecified, and
-    // reject an explicit `client_credentials` request unless the operator opted
-    // in via `--enable-dcr-insecure`. Manual CLI/admin registration bypasses
-    // this store method, so operators can still mint machine clients directly.
-    const grantTypes = (client.grant_types && client.grant_types.length > 0)
-      ? client.grant_types
-      : ['authorization_code'];
-    if (!this.allowClientCredentialsDcr && grantTypes.includes('client_credentials')) {
-      throw new InvalidClientMetadataError(
-        'client_credentials grant is not permitted via dynamic client registration; ' +
-        'restart the server with --enable-dcr-insecure to allow it, or register the ' +
-        'client via the gbrain CLI / admin API.',
-      );
+      // v0.42 (#1353): the DCR path is the unauthenticated network entry point.
+      // `client_credentials` skips /authorize consent entirely, so a self-
+      // registered DCR client must NOT get it by default. Default the grant to
+      // `authorization_code` (the consent-bearing flow) when unspecified, and
+      // reject an explicit `client_credentials` request unless the operator opted
+      // in via `--enable-dcr-insecure`. Manual CLI/admin registration bypasses
+      // this store method, so operators can still mint machine clients directly.
+      grantTypes = (client.grant_types && client.grant_types.length > 0)
+        ? client.grant_types
+        : ['authorization_code'];
+      if (!this.allowClientCredentialsDcr && grantTypes.includes('client_credentials')) {
+        throw new InvalidClientMetadataError(
+          'client_credentials grant is not permitted via dynamic client registration; ' +
+          'restart the server with --enable-dcr-insecure to allow it, or register the ' +
+          'client via the gbrain CLI / admin API.',
+        );
+      }
+    } catch (err) {
+      asClientMetadataError(err);
     }
 
     const clientId = generateToken('gbrain_cl_');
@@ -484,7 +553,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
         VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                 ${pgArray((client.redirect_uris || []).map(String))},
                 ${pgArray(grantTypes)},
-                ${client.scope || ''}, ${authMethod},
+                ${registeredScope}, ${authMethod},
                 ${now}, ${'default'}, ${pgArray(['default'])})
       `;
     } catch (err) {
@@ -497,7 +566,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
             VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                     ${pgArray((client.redirect_uris || []).map(String))},
                     ${pgArray(grantTypes)},
-                    ${client.scope || ''}, ${authMethod},
+                    ${registeredScope}, ${authMethod},
                     ${now}, ${'default'})
           `;
         } catch (err2) {
@@ -509,7 +578,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
               VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                       ${pgArray((client.redirect_uris || []).map(String))},
                       ${pgArray(grantTypes)},
-                      ${client.scope || ''}, ${authMethod},
+                      ${registeredScope}, ${authMethod},
                       ${now})
             `;
           } else {
@@ -524,7 +593,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
           VALUES (${clientId}, ${secretHash}, ${client.client_name || 'unnamed'},
                   ${pgArray((client.redirect_uris || []).map(String))},
                   ${pgArray(grantTypes)},
-                  ${client.scope || ''}, ${authMethod},
+                  ${registeredScope}, ${authMethod},
                   ${now})
         `;
       } else {
@@ -558,8 +627,11 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     // public client, the authorization server MUST NOT issue a client
     // secret"). Confidential clients return the freshly-generated secret
     // exactly once — same shape as before.
+    // Override scope with the filtered grant so the client sees what was
+    // actually registered (RFC 7591 §3.2.1 returned metadata).
     const response: OAuthClientInformationFull = {
       ...client,
+      scope: registeredScope,
       client_id: clientId,
       client_id_issued_at: now,
     };
