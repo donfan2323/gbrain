@@ -272,3 +272,35 @@ esac
 export function readManifest(releaseDir: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(releaseDir, 'manifest.json'), 'utf8'));
 }
+
+/**
+ * Writes a minimal, valid launchd plist for preflight.sh's DCR-disabled
+ * deployment invariant test (Phase 3B-34) — a real `plutil -lint`-clean XML
+ * plist with a `ProgramArguments` array (the launch command/flags) and an
+ * `EnvironmentVariables` dict carrying a fake, obviously-marked "token" so
+ * tests can assert it never leaks into preflight's stdout/stderr (the
+ * invariant must read ONLY :ProgramArguments, never :EnvironmentVariables).
+ */
+export function makeFixturePlist(path: string, opts: { programArgs: string[]; fakeToken?: string }): void {
+  const argsXml = opts.programArgs.map(a => `        <string>${a}</string>`).join('\n');
+  const token = opts.fakeToken ?? 'FIXTURE-TOKEN-MUST-NEVER-APPEAR-IN-PREFLIGHT-OUTPUT-9f2c';
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.gbrain.fixture</string>
+    <key>ProgramArguments</key>
+    <array>
+${argsXml}
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GBRAIN_ADMIN_BOOTSTRAP_TOKEN</key>
+        <string>${token}</string>
+    </dict>
+</dict>
+</plist>
+`;
+  writeFileSync(path, plist);
+}
