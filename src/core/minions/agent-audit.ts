@@ -68,6 +68,14 @@ function resolveAuditDir(): string {
   return gbrainPath('audit');
 }
 
+/** Shared best-effort JSONL append, used by every writer in this file. */
+function appendAuditLine<T extends object>(line: T): void {
+  const dir = resolveAuditDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, computeAuditFilename());
+  fs.appendFileSync(file, JSON.stringify(line) + '\n', 'utf8');
+}
+
 /** Append one event. Best-effort; logs to stderr on failure. */
 export function logAgentSubmission(event: Omit<AgentAuditEvent, 'ts'>): void {
   const fullEvent: AgentAuditEvent = {
@@ -75,14 +83,78 @@ export function logAgentSubmission(event: Omit<AgentAuditEvent, 'ts'>): void {
     ...event,
   };
   try {
-    const dir = resolveAuditDir();
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, computeAuditFilename());
-    fs.appendFileSync(file, JSON.stringify(fullEvent) + '\n', 'utf8');
+    appendAuditLine(fullEvent);
   } catch (err) {
     process.stderr.write(
       `[agent-audit] failed to write submission event for job ${event.job_id}: ` +
       `${err instanceof Error ? err.message : String(err)}\n`,
+    );
+  }
+}
+
+/**
+ * v0.46-slice (Phase 3B-1) — structured audit for submit_agent GRANT
+ * decisions that are NOT a plain successful submission: security-relevant
+ * rejections (no binding, tool/slug/source widening attempts) and
+ * allowed-but-ungoverned grants (a client with no `bound_slug_prefixes`
+ * binding at all — AUTHZ-INV-016's still-open gap, see
+ * PHASE9A-AUTHORIZATION-INVARIANTS.md — is currently ALLOWED through
+ * unfenced rather than denied, pending a compatibility check this event
+ * makes observable without needing to query production directly).
+ *
+ * Same JSONL stream, same file, same best-effort/never-block posture as
+ * `logAgentSubmission` — this is an additional event shape appended to the
+ * existing mechanism, not a new audit subsystem. Only decision-reconstruction
+ * fields: client_id, decision, reason, and the specific tool/slug/source
+ * values involved (identifiers already logged verbatim by
+ * `logAgentSubmission` on the success path — never the prompt, never a
+ * token/secret).
+ */
+export interface AgentGrantDecisionEvent {
+  ts: string;
+  client_id: string | null;
+  decision: 'denied' | 'allowed_with_warning';
+  reason_code: string;
+  reason: string;
+  requested_tools?: string[];
+  bound_tools?: string[] | null;
+  requested_slug_prefixes?: string[];
+  bound_slug_prefixes?: string[] | null;
+  requested_source?: string | null;
+  bound_source?: string | null;
+  /**
+   * Phase 3B-2 (AUTHZ-INV-017, warn-only): OAuth scopes required_scope of at
+   * least one `requested_tools` entry that the delegating client's own
+   * `ctx.auth.scopes` did not cover. Only present on
+   * reason_code:'delegation_scope_shortfall' events.
+   */
+  missing_scopes?: string[];
+  /**
+   * Phase 3B-13 (AUTHZ-INV-005/006): present on exercise-time denials only
+   * (grant-time denials in jobs.ts's submit_agent have no job row yet).
+   * Identifies which already-delegated job's tool call was denied.
+   */
+  job_id?: number;
+  /**
+   * Phase 3B-13: the brain-tool operation name being exercised when an
+   * exercise-time denial fired (e.g. 'put_page'). Grant-time denials leave
+   * this unset — they deny the whole delegation, not one operation.
+   */
+  operation?: string;
+}
+
+/** Append one grant-decision event. Best-effort; logs to stderr on failure. */
+export function logAgentGrantDecision(event: Omit<AgentGrantDecisionEvent, 'ts'>): void {
+  const fullEvent: AgentGrantDecisionEvent = {
+    ts: new Date().toISOString(),
+    ...event,
+  };
+  try {
+    appendAuditLine(fullEvent);
+  } catch (err) {
+    process.stderr.write(
+      `[agent-audit] failed to write grant-decision event (${event.decision}/${event.reason_code}) ` +
+      `for client ${event.client_id ?? '<unknown>'}: ${err instanceof Error ? err.message : String(err)}\n`,
     );
   }
 }
