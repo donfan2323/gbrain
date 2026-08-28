@@ -143,21 +143,50 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
 }
 
 /**
+ * Parses `ps -o etime=`'s elapsed-duration output — `[[DD-]HH:]MM:SS` (both
+ * BSD/macOS and GNU/Linux ps agree on this shape) — into milliseconds.
+ * Unlike `lstart` (an absolute local wall-clock timestamp), an elapsed
+ * duration carries no timezone at all, so there is no local-vs-UTC
+ * interpretation for any caller — including a caller itself running under a
+ * timezone override — to get wrong.
+ */
+function parseEtimeMs(out: string): number | null {
+  const m = /^(?:(\d+)-)?(?:(\d{1,2}):)?(\d{1,2}):(\d{2})$/.exec(out.trim());
+  if (!m) return null;
+  const [, ddStr, hhStr, mmStr, ssStr] = m;
+  const days = ddStr ? Number(ddStr) : 0;
+  const hours = hhStr ? Number(hhStr) : 0;
+  const minutes = Number(mmStr);
+  const seconds = Number(ssStr);
+  return ((((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000);
+}
+
+/**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
  * us report an unrelated process's niceness (Codex #8). Returns null when
  * undeterminable — callers must NOT treat null as "reused".
+ *
+ * Uses `ps -o etime=` (elapsed duration since start) rather than `ps -o
+ * lstart=` (absolute local timestamp) deliberately: `lstart` requires
+ * parsing a wall-clock string in the SYSTEM's real local timezone, which — if
+ * this calling process's own notion of "local" has been overridden (`bun
+ * test` pins the process to UTC; see test/pglite-snapshot-timezone.serial.test.ts)
+ * — silently produces an epoch value off by exactly the true local UTC
+ * offset. `etime` is a plain duration with no timezone in it at all, so
+ * `Date.now() - etimeMs` is correct regardless of what timezone either this
+ * process or the OS itself is in.
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseEtimeMs(out);
+    return elapsedMs === null ? null : Date.now() - elapsedMs;
   } catch {
     return null;
   }
