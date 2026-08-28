@@ -92,14 +92,22 @@ async function seedClient(clientId: string, opts: SeedOpts = {}): Promise<void> 
   );
 }
 
-function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean } = {}): any {
+function makeCtx(opts: { clientId?: string; remote?: boolean; dryRun?: boolean; scopes?: string[] } = {}): any {
   return {
     engine,
     config: {},
     logger: console,
     dryRun: opts.dryRun ?? false,
     remote: opts.remote ?? true,
-    auth: opts.clientId ? { clientId: opts.clientId } : undefined,
+    // scopes defaults to seedClient()'s own default DB scope ('read agent'
+    // split into an array) — AUTHZ-INV-017 (jobs.ts) reads ctx.auth.scopes
+    // to check the delegating client's own scope covers what it delegates.
+    // Pre-AUTHZ-INV-017 this field was unused by submit_agent, so this mock
+    // never threaded it through; now that jobs.ts enforces it, every
+    // happy-path fixture here needs a scopes array consistent with the
+    // scope column seedClient() actually writes, or every delegated call
+    // fails closed with a spurious "own scopes (<none>)" denial.
+    auth: opts.clientId ? { clientId: opts.clientId, scopes: opts.scopes ?? ['read', 'agent'] } : undefined,
   };
 }
 
@@ -224,7 +232,10 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['emp-alice/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      // put_page requires 'write' — not covered by the default 'read agent'
+      // mock scopes, and unrelated to what this test actually exercises
+      // (slug-prefix normalization), so grant it explicitly.
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'write', 'agent'] });
       const result = await callSubmitAgent(ctx, { prompt: 'go', allowed_slug_prefixes: [] });
       // Normalized into the glob the delegated matcher understands, so the
       // subagent can write descendants rather than one exact slug.
@@ -239,7 +250,10 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         bound_source_id: 'default',
         bound_slug_prefixes: ['wiki/', 'people/'],
       });
-      const ctx = makeCtx({ clientId: 'cursor', dryRun: true });
+      // put_page requires 'write' — not covered by the default 'read agent'
+      // mock scopes, and unrelated to what this test actually exercises
+      // (slug-prefix enforcement), so grant it explicitly.
+      const ctx = makeCtx({ clientId: 'cursor', dryRun: true, scopes: ['read', 'write', 'agent'] });
       // 'wiki/' starts with 'wiki/' (exact prefix match)
       const r1 = await callSubmitAgent(ctx, {
         prompt: 'go',
@@ -426,6 +440,44 @@ describe('submit_agent op (v0.38 Slice 3 — remote-callable agent dispatch with
         ? JSON.parse(rows[0].data as string)
         : (rows[0].data as Record<string, unknown>);
       expect(data.max_turns).toBe(100);
+    });
+  });
+
+  describe('AUTHZ-INV-017 — delegating client scope coverage (Phase 3B-34 reconstruction)', () => {
+    it('denies when the delegating client lacks the scope a bound tool requires', async () => {
+      await seedClient('scopeless', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      // `agent` alone grants delegation-initiation authority only — it does
+      // NOT imply `read`, so a client whose own scope is just `agent` may
+      // not delegate a tool (search) that itself requires `read`.
+      const ctx = makeCtx({ clientId: 'scopeless', scopes: ['agent'] });
+      await expect(callSubmitAgent(ctx, {
+        prompt: 'should be denied',
+        allowed_tools: ['search'],
+      })).rejects.toThrow(/AUTHZ-INV-017/);
+
+      // No job row committed — a denial must commit no delegated authority.
+      const rows = await engine.executeRaw<Record<string, unknown>>(
+        `SELECT id FROM minion_jobs WHERE data->>'__owner_client_id' = 'scopeless'`,
+      );
+      expect(rows.length).toBe(0);
+    });
+
+    it('allows when the delegating client scope covers every bound tool it delegates', async () => {
+      await seedClient('scoped-ok', {
+        bound_tools: ['search'],
+        bound_source_id: 'default',
+        bound_slug_prefixes: ['wiki/'],
+      });
+      const ctx = makeCtx({ clientId: 'scoped-ok', scopes: ['read', 'agent'] });
+      const result = await callSubmitAgent(ctx, {
+        prompt: 'should be allowed',
+        allowed_tools: ['search'],
+      });
+      expect(result.id).toBeGreaterThan(0);
     });
   });
 });
