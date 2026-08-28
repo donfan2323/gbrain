@@ -244,9 +244,15 @@ const submit_agent: Operation = {
       throw new OperationError('invalid_request', 'submit_agent over the local CLI: use `gbrain agent run` instead.');
     }
 
+    const { logAgentGrantDecision } = await import('../minions/agent-audit.ts');
+
     const clientId = (ctx as { auth?: { clientId?: string } }).auth?.clientId;
     if (!clientId || typeof clientId !== 'string') {
-      throw new OperationError('permission_denied', 'submit_agent requires an OAuth client with the `agent` scope.');
+      const reason = 'submit_agent requires an OAuth client with the `agent` scope.';
+      try {
+        logAgentGrantDecision({ client_id: null, decision: 'denied', reason_code: 'no_client_id', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
     }
 
     // Load the binding row.
@@ -267,7 +273,11 @@ const submit_agent: Operation = {
       );
     }
     if (bindingRows.length === 0) {
-      throw new OperationError('permission_denied', `submit_agent: client_id ${clientId} not found.`);
+      const reason = `submit_agent: client_id ${clientId} not found.`;
+      try {
+        logAgentGrantDecision({ client_id: clientId, decision: 'denied', reason_code: 'client_not_found', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
     }
     const binding = bindingRows[0];
     const boundTools = (binding.bound_tools as string[] | null) ?? null;
@@ -277,11 +287,57 @@ const submit_agent: Operation = {
     const budgetCapText = (binding.budget_cap as string | null) ?? null;
 
     if (boundTools === null) {
-      throw new OperationError(
-        'permission_denied',
-        `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`,
-      );
+      const reason = `submit_agent: client ${clientId} has the agent scope but no bindings. Re-register with --bound-tools, --bound-source, --bound-slug-prefixes, --bound-max-concurrent, --budget-usd-per-day.`;
+      try {
+        logAgentGrantDecision({ client_id: clientId, decision: 'denied', reason_code: 'no_binding', reason });
+      } catch { /* never block the denial */ }
+      throw new OperationError('permission_denied', reason);
     }
+
+    // v0.46-slice (Phase 3B-10, AUTHZ-INV-016 — ENFORCED): `bound_slug_prefixes
+    // = NULL` and `= []` are DEFINED as semantically identical — both mean
+    // "no delegation-write namespace granted" — per
+    // PHASE9A-AUTHORIZATION-INVARIANTS.md's 2026-08-03 revision: "NULLは
+    // 「制限なし」を意味しない...既存クライアントを即座に壊さないため" the
+    // definition explicitly REJECTS interpreting either state as unrestricted
+    // for THIS (delegation) axis specifically, because DCR/admin-panel/
+    // `gbrain connect --register` clients can never affirmatively choose
+    // "unrestricted delegation" — they are just structurally NULL, and
+    // treating that as a wildcard would hand them unlimited delegated write
+    // authority by accident.
+    //
+    // Phase 3B-1 (this project's own earlier phase, 41fec1ed) already found
+    // this exact gap and left the fix spelled out in its own comment (now
+    // implemented below): "Hard-closing it (treating NULL as ungranted, same
+    // as an empty binding)". Until this phase, only `[]` actually enforced
+    // that definition (an explicitly-empty binding was ALREADY denied,
+    // below) — `null` was left as an unchecked pass-through, letting a
+    // client's own EXPLICIT `allowed_slug_prefixes` request reach the
+    // delegated job completely unvalidated. Proven directly: a null-bound
+    // client's request for `['anyone/private-secret-slug']` was accepted
+    // verbatim pre-fix (see the accompanying report's behavioral proof).
+    //
+    // `effectiveBoundSlugPrefixes` folds null into `[]` for the TWO existing
+    // checks below only — this is a read-time interpretation, matching the
+    // definition's own "この意味は読み取り側の解釈規則であり、既存行の値
+    // そのものは変更しない" (no migration/backfill of the stored column).
+    // `boundSlugPrefixes` itself (raw, still nullable) is kept for
+    // diagnostics/reason-text only.
+    //
+    // Deliberately OUT OF SCOPE (unchanged by this phase): (1) a client's
+    // OWN direct writes (put_page etc.) — `enforceClientSlugFence`
+    // (src/core/ops/context.ts) is a completely separate mechanism on the
+    // same column, and its null="full-source write authority" semantics are
+    // a genuinely different, still-valid, intentional design for THAT axis
+    // (submit_agent is explicitly excluded from `CLIENT_FENCED_WRITE_OPS`
+    // precisely because it enforces this column itself); (2) the shared
+    // execution-time `wiki/agents/<jobId>/` legacy-sandbox fallback for an
+    // EMPTY/absent delegated prefix list (`enforceSubagentSlugFence`) —
+    // the design doc names this a separate, still-open, cross-cutting gap
+    // shared with non-submit_agent subagent-spawning paths (e.g. cycle),
+    // explicitly deferred to a broader fix outside this single-invariant
+    // phase's scope.
+    const effectiveBoundSlugPrefixes = boundSlugPrefixes ?? [];
 
     // Validate each param against the binding.
     //
@@ -300,10 +356,14 @@ const submit_agent: Operation = {
       : requestedToolsRaw;
     for (const t of requestedTools) {
       if (!boundTools.includes(t)) {
-        throw new OperationError(
-          'permission_denied',
-          `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`,
-        );
+        const reason = `submit_agent: tool "${t}" is not in client ${clientId}'s bound_tools (${boundTools.join(', ')}).`;
+        try {
+          logAgentGrantDecision({
+            client_id: clientId, decision: 'denied', reason_code: 'tool_widening', reason,
+            requested_tools: requestedTools, bound_tools: boundTools,
+          });
+        } catch { /* never block the denial */ }
+        throw new OperationError('permission_denied', reason);
       }
     }
     const requestedSlugPrefixesRaw = p.allowed_slug_prefixes as string[] | undefined;
@@ -311,23 +371,39 @@ const submit_agent: Operation = {
       requestedSlugPrefixesRaw === undefined || requestedSlugPrefixesRaw.length === 0
         ? (boundSlugPrefixes ?? [])
         : requestedSlugPrefixesRaw;
-    // A bound client must end up with a non-empty delegated fence: an empty
-    // list reaches the subagent as "use the legacy wiki/agents/<id>/ namespace",
-    // which is outside every bound prefix.
-    if (boundSlugPrefixes !== null && requestedSlugPrefixes.length === 0) {
+    // A bound (grant-known) client must end up with a non-empty delegated
+    // fence: an empty list reaches the subagent as "use the legacy
+    // wiki/agents/<id>/ namespace", which is outside every bound prefix.
+    // AUTHZ-INV-016 (Phase 3B-10): this check is now UNCONDITIONAL — a null
+    // binding resolves to `[]` too (see effectiveBoundSlugPrefixes above),
+    // so a null-bound client with no explicit request is denied exactly the
+    // way an explicitly-[]-bound client already was.
+    if (requestedSlugPrefixes.length === 0) {
+      const reason = `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`;
+      try {
+        logAgentGrantDecision({
+          client_id: clientId, decision: 'denied', reason_code: 'empty_resolved_slug_prefixes', reason,
+          requested_slug_prefixes: requestedSlugPrefixes, bound_slug_prefixes: boundSlugPrefixes,
+        });
+      } catch { /* never block the denial */ }
       throw new OperationError(
         'permission_denied',
-        `submit_agent: client ${clientId} is slug-bound but its binding resolved to an empty prefix list, which the subagent would read as the unfenced legacy namespace.`,
+        reason,
         'Re-scope the client with a non-empty --bound-slug-prefixes.',
       );
     }
-    if (boundSlugPrefixes !== null) {
+    {
       for (const sp of requestedSlugPrefixes) {
         // Boundary-aware, same rule as the direct fence: a raw `startsWith`
         // let a boundary-less binding (`emp-alice`) authorize a requested
         // prefix in a SIBLING namespace (`emp-alice-2/`), which is then handed
         // to the child as a full glob grant over another employee's pages.
-        if (!boundSlugPrefixes.some(bp => {
+        // AUTHZ-INV-016 (Phase 3B-10): uses effectiveBoundSlugPrefixes (null
+        // folded to []) — a null-bound client's `.some()` over an empty
+        // array is vacuously false for every requested prefix, so an
+        // explicit request against a null binding is now denied instead of
+        // passing through unchecked.
+        if (!effectiveBoundSlugPrefixes.some(bp => {
           const base = normalizeSlugPrefix(bp);
           const req = normalizeSlugPrefix(sp);
           if (base === '') return false;
@@ -335,10 +411,14 @@ const submit_agent: Operation = {
             ? req.startsWith(base)
             : req === base || req.startsWith(`${base}/`);
         })) {
-          throw new OperationError(
-            'permission_denied',
-            `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`,
-          );
+          const reason = `submit_agent: slug_prefix "${sp}" is not under any of client ${clientId}'s bound_slug_prefixes.`;
+          try {
+            logAgentGrantDecision({
+              client_id: clientId, decision: 'denied', reason_code: 'slug_widening', reason,
+              requested_slug_prefixes: requestedSlugPrefixes, bound_slug_prefixes: boundSlugPrefixes,
+            });
+          } catch { /* never block the denial */ }
+          throw new OperationError('permission_denied', reason);
         }
       }
     }
@@ -357,6 +437,75 @@ const submit_agent: Operation = {
         'rate_limited',
         `submit_agent: client ${clientId} at concurrency cap (${inflightCount}/${boundMaxConcurrent}).`,
       );
+    }
+
+    // v0.46-slice (Phase 3B-9, AUTHZ-INV-017 — RESTORED/ENFORCED): does the
+    // delegating client's OWN OAuth scope cover the required_scope of every
+    // tool it is about to hand to this job? `agent` is a committal-only
+    // scope (implies nothing else — scope.ts's IMPLIES table) — a client
+    // can be *bound* to tools its own scopes don't cover. That is the
+    // confused-deputy shape AUTHZ-INV-017 names: `agent` grants the right
+    // to *initiate* delegation, not possession of the delegated tools' own
+    // scopes.
+    //
+    // Historical note: commit 1f5243e9 (2026-08-03) computed this exact
+    // shortfall at this exact point in the handler — after tool/slug
+    // narrowing and the concurrency cap, but BEFORE the dry-run echo and
+    // BEFORE the job was ever queued — yet only ever recorded it.
+    // `delegationScopeShortfalls`'s own doc comment says so explicitly:
+    // "Phase 9E-1 records but does not deny... Phase 9E-2 will switch this
+    // to a denial." Phase 9E-2 never shipped historically (verified: no
+    // commit in this repository's full history implements it — the last
+    // touch is a read-only enforce-migration readiness report, f35518ac).
+    // This project's own Phase 3B-2 knowingly ported only the warn-only
+    // half onto current architecture, deliberately deferring hard denial
+    // pending a production-usage compatibility check it judged unsafe to
+    // perform from this worktree (oauth_clients is held by the live
+    // single-writer production process, PID 3719).
+    //
+    // Phase 3B-9 is an explicit, scoped mandate to complete that
+    // never-shipped enforce stage. This is a DELIBERATE, DOCUMENTED
+    // divergence from both the historical warn-only behavior and Phase
+    // 3B-2's own prior choice — not a silent strengthening. It does not
+    // reopen the earlier production-compatibility concern: this phase only
+    // changes code in the candidate worktree and the `fork` branch: no
+    // deployment happens here, so no currently-running production traffic
+    // is affected until a separate, later, explicitly-authorized deploy
+    // decision is made (see the accompanying report's deployment note).
+    //
+    // Placed HERE — after tool/slug narrowing and the concurrency cap, but
+    // before the dry-run echo and before queue.add() — so (a) requestedTools
+    // is the final, fully-narrowed delegated set, (b) a denial commits no
+    // delegated authority (no job row, no queue publication — the
+    // side-effect-ordering invariant), and (c) dry-run and the real
+    // submission see and act on the identical shortfall computation,
+    // matching the historical placement exactly.
+    {
+      const { operationsByName } = await import('../operations.ts');
+      const delegatorScopes = ctx.auth?.scopes ?? [];
+      const scopeShortfalls = requestedTools
+        .map(tool => ({ tool, requiredScope: (operationsByName[tool]?.scope as string | undefined) ?? 'read' }))
+        .filter(({ requiredScope }) => !hasScope(delegatorScopes, requiredScope));
+      if (scopeShortfalls.length > 0) {
+        const missingScopes = [...new Set(scopeShortfalls.map(s => s.requiredScope))];
+        const reason = `submit_agent: client ${clientId}'s own OAuth scopes (${delegatorScopes.join(' ') || '<none>'}) ` +
+          `do not cover the required scope of tool(s) it is attempting to delegate: ` +
+          `${scopeShortfalls.map(s => `${s.tool} (needs "${s.requiredScope}")`).join(', ')}. ` +
+          `The \`agent\` scope only grants delegation-initiation authority, not possession of the ` +
+          `delegated tools' own scopes (AUTHZ-INV-017).`;
+        try {
+          logAgentGrantDecision({
+            client_id: clientId,
+            decision: 'denied',
+            reason_code: 'delegation_scope_shortfall',
+            reason,
+            requested_tools: scopeShortfalls.map(s => s.tool),
+            bound_tools: boundTools,
+            missing_scopes: missingScopes,
+          });
+        } catch { /* never block the denial */ }
+        throw new OperationError('permission_denied', reason);
+      }
     }
 
     // Dry-run echo.
@@ -404,9 +553,16 @@ const submit_agent: Operation = {
     // a correctly slug-fenced client could act on the wrong source.
     const delegatedSource = ctx.auth?.sourceId ?? boundSource;
     if (boundSource && ctx.auth?.sourceId && boundSource !== ctx.auth.sourceId) {
+      const reason = `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`;
+      try {
+        logAgentGrantDecision({
+          client_id: clientId, decision: 'denied', reason_code: 'source_disagreement', reason,
+          requested_source: ctx.auth.sourceId, bound_source: boundSource,
+        });
+      } catch { /* never block the denial */ }
       throw new OperationError(
         'permission_denied',
-        `submit_agent: client ${clientId}'s bound_source_id (${boundSource}) disagrees with its authenticated source (${ctx.auth.sourceId}); refusing to guess which one governs the delegated write.`,
+        reason,
         'Re-scope the client so the two agree: `gbrain auth rescope-client <id> --source <source>`.',
       );
     }
