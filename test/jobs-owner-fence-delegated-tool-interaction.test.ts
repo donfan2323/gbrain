@@ -25,7 +25,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { MinionQueue } from '../src/core/minions/queue.ts';
 import { operationsByName, type OperationContext } from '../src/core/operations.ts';
 import { buildBrainTools } from '../src/core/minions/tools/brain-allowlist.ts';
-import { hasScope, DCR_ALLOWED_SCOPES } from '../src/core/scope.ts';
+import { hasScope } from '../src/core/scope.ts';
 import { withEnv } from './helpers/with-env.ts';
 import type { GBrainConfig } from '../src/core/config.ts';
 import type { ToolCtx } from '../src/core/minions/types.ts';
@@ -196,19 +196,17 @@ describe('Phase 3B-16A X-3: a revoked (soft-deleted) owner', () => {
 });
 
 describe('Phase 3B-16A X-4: DCR clients cannot use job APIs as an authority-escalation path', () => {
-  test('DCR ceiling {read,write} never satisfies the agentCallable carve-out (hasScope(scopes, "agent"))', () => {
-    // Pins the exact precondition enforced at the three real dispatch
-    // gates (src/commands/serve-http.ts:2950 tools/list filter, :3028
-    // tools/call dispatch, src/core/ops/request-tools.ts:108) — all three
-    // use this identical `op.agentCallable === true && hasScope(scopes,
-    // 'agent')` condition, none reachable by a DCR-ceilinged token.
-    const dcrScopes = Array.from(DCR_ALLOWED_SCOPES);
-    expect(dcrScopes).toEqual(['read', 'write']);
-    expect(hasScope(dcrScopes, 'agent')).toBe(false);
-    expect(hasScope(dcrScopes, 'admin')).toBe(false);
-  });
-
-  test('even called directly (bypassing the dispatch gate), a DCR-scoped identity owns no job and gains nothing', async () => {
+  // The original test here pinned the fork-original DCR_ALLOWED_SCOPES
+  // registration-time ceiling ({read,write}) — a source patch the
+  // official-first candidate (Phase 3B-34) intentionally does NOT carry.
+  // That ceiling is replaced by a deployment invariant instead (see
+  // scripts/release/preflight.sh's DCR-disabled check): official's own DCR
+  // registration path is unbounded, so this exact assertion no longer has
+  // anything to pin. The test below — the real content of X-4 — is
+  // untouched and does not depend on any DCR-specific scope ceiling: it
+  // proves a delegated identity, whatever scopes it happens to carry,
+  // cannot resolve to job ownership it was never granted.
+  test('even called directly (bypassing the dispatch gate), a scoped-but-unowning identity owns no job and gains nothing', async () => {
     await seedOwnerClient('agent-x4-real-owner', { scope: 'write agent' });
     const realJob = await seedJob('agent-x4-real-owner');
     const dcrCtx = ctx({ auth: { clientId: 'dcr-client-x4', scopes: ['read', 'write'] } as OperationContext['auth'] });
