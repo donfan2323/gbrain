@@ -1,0 +1,107 @@
+#!/bin/sh
+# git-governance: reference-transaction hook (fail-closed, blocks in "prepared")
+#
+# Universal Git Governance — cross-repo rollout. Logic ported verbatim from
+# /Users/lab/.hermes/hermes-agent (commit 35d37c000468dd5fdffb43d41c2e14bd64c8bfad,
+# itself corrected there after an initial version wrongly assumed this hook
+# state can't abort a transaction — see that repo's docs/GIT_GOVERNANCE.md
+# for the verification history). Only the protected-branch patterns are
+# repo-specific now, read from .git-governance/profile.conf.
+#
+# Per `git help hooks`: "The exit status of the hook is ignored for any
+# state except for the 'prepared' state. In the 'prepared' state, a
+# non-zero exit status will cause the transaction to be aborted." Verified
+# empirically (not just read off the docs) against `git reset --hard`,
+# `git branch -f`, `git branch -D`, and `git update-ref` (including its
+# two-argument and -d forms) before this was relied on in Hermes; ported
+# here with the same behavior.
+#
+# WHAT THIS DOES: for the branches profile.conf lists as protected, if a
+# ref update is a non-fast-forward move or a deletion, and the true old tip
+# is not already reachable from any other local branch, the writable
+# remote's remote-tracking ref, or a tag, this hook REFUSES the
+# transaction — exit 1 in "prepared" state, before the ref store applies
+# anything.
+#
+# Never trusts stdin's <old-value> field — `git branch -D` and the
+# two-argument `git update-ref <ref> <new>` both report it as all-zeroes
+# even when a real prior value exists, indistinguishable from a genuine
+# create if trusted. Instead independently re-derives the true prior value
+# via `git rev-parse --verify` inside the hook, which still resolves
+# correctly in "prepared" (empty only for a genuine create).
+#
+# Deliberately does NOT create a rescue ref itself as a side effect —
+# calling `git update-ref` on a different ref from inside a hook that's
+# mid-transaction, with the transacted refs already locked on disk, is a
+# nested-reference-transaction shape this design doesn't rely on the safety
+# of. Refuse-and-guide instead: the error message names the exact
+# `git branch rescue/<name> <sha>` command to run.
+
+state="$1"
+[ "$state" = "prepared" ] || exit 0
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+profile="$repo_root/.git-governance/profile.conf"
+[ -f "$profile" ] || exit 0
+# shellcheck disable=SC1090
+. "$profile"
+
+[ -n "${PROTECTED_BRANCH_GLOBS:-}" ] || exit 0
+writable_remote="${WRITABLE_REMOTE:-fork}"
+
+is_protected() {
+    ref="$1"
+    for glob in $PROTECTED_BRANCH_GLOBS; do
+        case "$ref" in
+            $glob) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+zero="0000000000000000000000000000000000000000"
+blocked=0
+
+while read -r _stdin_old new_oid refname; do
+    is_protected "$refname" || continue
+
+    old_oid=$(git rev-parse --verify -q "$refname" 2>/dev/null) || old_oid=""
+    [ -n "$old_oid" ] || continue
+
+    if [ "$new_oid" = "$zero" ]; then
+        danger=1
+    elif git merge-base --is-ancestor "$old_oid" "$new_oid" 2>/dev/null; then
+        danger=0
+    else
+        danger=1
+    fi
+    [ "$danger" = "1" ] || continue
+
+    already_safe=0
+    for other_ref in $(git for-each-ref --format='%(refname)' refs/heads "refs/remotes/$writable_remote" refs/tags 2>/dev/null); do
+        [ "$other_ref" = "$refname" ] && continue
+        if git merge-base --is-ancestor "$old_oid" "$other_ref" 2>/dev/null; then
+            already_safe=1
+            break
+        fi
+    done
+    [ "$already_safe" = "1" ] && continue
+
+    short=$(printf '%s' "$old_oid" | cut -c1-12)
+    {
+        echo ""
+        echo "git-governance: REFUSING this ref update."
+        echo "  '$refname' would move non-fast-forward (or be deleted), and its old tip"
+        echo "  $short is not reachable from any other local branch, tag, or '$writable_remote'."
+        echo ""
+        echo "  Protect it first, then retry:"
+        echo "    git branch rescue/<description> $old_oid"
+        echo "    git push $writable_remote rescue/<description>"
+        echo ""
+        echo "  See docs/GIT_GOVERNANCE.md."
+    } >&2
+    blocked=1
+done
+
+[ "$blocked" = "1" ] && exit 1
+exit 0
