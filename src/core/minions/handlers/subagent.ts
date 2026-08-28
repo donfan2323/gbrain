@@ -464,6 +464,10 @@ export function makeSubagentHandler(deps: SubagentDeps) {
       allowedSlugPrefixes: data.allowed_slug_prefixes,
       // #1586: cycle-resolved source scope for tool-call OperationContexts.
       sourceId: data.source_id,
+      // Phase 3B-13 (AUTHZ-INV-005/006): present only for submit_agent-
+      // delegated jobs. cycle.ts's own child jobs never set this key, so
+      // they keep buildBrainTools's pre-3B-13 behavior unchanged.
+      ownerClientId: data.__owner_client_id,
     });
     const toolDefs = data.allowed_tools && data.allowed_tools.length > 0
       ? filterAllowedTools(registry, data.allowed_tools)
@@ -530,6 +534,8 @@ export function makeSubagentHandler(deps: SubagentDeps) {
           allowedSlugPrefixes: data.allowed_slug_prefixes,
           sourceId: data.source_id,
           deferEmbeds: true,
+          // Phase 3B-13: see the loop-registry buildBrainTools call above.
+          ownerClientId: data.__owner_client_id,
         });
         // Honor allowed_tools EXACTLY like the loop registry — a submitter
         // that scoped its job read-only must not gain write capability by
