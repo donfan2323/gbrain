@@ -19,13 +19,12 @@ import rateLimit from 'express-rate-limit';
 import { randomBytes, createHash, createHmac } from 'crypto';
 import { safeHexEqual } from '../core/timing-safe.ts';
 import { isValidRepoName } from '../core/github-source.ts';
-import { createMetricsCounters, metricsTrackingMiddleware, renderPrometheusMetrics } from './serve-http-metrics.ts';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import { mcpAuthRouter, createOAuthMetadata } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { OAuthTokenRevocationRequestSchema } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { BrainEngine } from '../core/engine.ts';
@@ -778,6 +777,320 @@ export async function embeddingWidthStartupWarning(engine: BrainEngine): Promise
   }
 }
 
+/**
+ * AUTHZ-INV-013 (Phase 3B-4): POST /ingest's audit-write helper.
+ *
+ * PHASE9A-AUTHORIZATION-INVARIANTS.md's AUTHZ-INV-013 names POST /ingest's
+ * deny/failure asymmetry as its own violation example: the success path
+ * already writes an `mcp_request_log` row (`operation: 'webhook_ingest'`,
+ * `status: 'success'`, wired below in the route handler) but every deny/
+ * failure branch wrote nothing at all. This mirrors that EXACT INSERT shape
+ * (same table, same column set, same best-effort/never-block posture) that
+ * every MCP tools/list and tools/call branch above already uses for
+ * success/denied_after_list/error — no new schema, no new audit
+ * subsystem, one more producer into the existing one.
+ *
+ * Exported (unlike the 6+ existing inline call sites in this file, which
+ * this commit does not touch) so it's independently testable against a
+ * PGLite engine without needing a live HTTP server — the full route is
+ * covered by test/e2e/serve-http-ingest-webhook.test.ts, which needs a real
+ * database this sandbox does not have configured.
+ *
+ * `status: 'denied'` is reserved for a genuine authorization decision (the
+ * slug-bound-client rejection); every other non-success branch (input
+ * validation, queue-submission failure) uses `status: 'error'`, matching
+ * the vocabulary the MCP handlers above already established
+ * (denied_after_list vs error) rather than inventing a third one.
+ */
+export async function logIngestAudit(
+  engine: BrainEngine,
+  input: {
+    clientId: string;
+    agentName: string;
+    latencyMs: number;
+    status: 'denied' | 'error';
+    errorMessage: string;
+    params?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [input.clientId, input.agentName, 'webhook_ingest', input.latencyMs, input.status, input.errorMessage],
+      [input.params ?? null],
+    );
+  } catch { /* best effort — never block the response the caller already sent */ }
+}
+
+/**
+ * AUTHZ-INV-013 (Phase 3B-5): audit for the OAuth credential-lifecycle
+ * endpoints — POST /token (client_credentials, and the confidential-client
+ * authorization_code/refresh_token path) and POST /revoke.
+ *
+ * PHASE9A-AUTHORIZATION-INVARIANTS.md's AUTHZ-INV-013 names these as "the
+ * credential lifecycle itself... currently zero permanent audit" — still
+ * true in current architecture (the historical stopgap, oauth-diagnostic.ts,
+ * does not exist here; historical commit 4a33a63e's audit_events wiring for
+ * these routes never landed upstream). Reuses mcp_request_log exactly like
+ * POST /ingest (Phase 3B-4) — same table, same best-effort posture, one more
+ * producer, no new schema.
+ *
+ * Scope note (found, not assumed): current /token and /revoke are each a
+ * CUSTOM Express handler ONLY for confidential clients (secret presented via
+ * body or Basic auth) — both explicitly `next()`-fall-through to the MCP
+ * SDK's own mounted `authRouter` (@modelcontextprotocol/sdk) for public/PKCE
+ * clients, and GET/POST /authorize is 100% SDK-owned with no custom handler
+ * at all. This function only covers what the fall-through-reached SDK code
+ * ever does. Instrumenting the SDK's own request handling would need a
+ * middleware-wrapper around third-party router internals — Phase 9C's own
+ * implementation report explicitly named this exact gap as out of scope
+ * ("SDKマウント境界...サードパーティコードであり直接編集できない...別途必要",
+ * dashboard-4xj73) and never built it either. This task does not attempt it.
+ *
+ * `reason` MUST be one of the fixed OAuth error-code strings this file's own
+ * handlers already return in the HTTP response body (invalid_request,
+ * invalid_client, invalid_grant, server_error, temporarily_unavailable) —
+ * NEVER a raw exception message, request field, or header value. Every call
+ * site below passes only clientId (the OAuth client_id being authenticated —
+ * itself the credential's own claimed identity, not a secret) plus one of
+ * these fixed strings. No token, secret, code, or PKCE verifier is ever
+ * constructed into a call to this function.
+ */
+export async function logOAuthCredentialAudit(
+  engine: BrainEngine,
+  input: {
+    endpoint: 'token' | 'revoke';
+    grantType?: 'client_credentials' | 'authorization_code' | 'refresh_token';
+    clientId: string | null;
+    latencyMs: number;
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      [input.clientId, input.clientId, `oauth_${input.endpoint}`, input.latencyMs, input.status, input.reason ?? null],
+      [input.grantType ? { grant_type: input.grantType } : null],
+    );
+  } catch { /* best effort — never block the response the caller already sent */ }
+}
+
+/**
+ * AUTHZ-INV-013 (Phase 3B-6): audit for admin-panel Authority-mutating
+ * routes — the 9 historical routes named in Phase 9C's own scope doc
+ * (admin login, issue-magic-link, magic-link redemption, sign-out-
+ * everywhere, api-keys issue/revoke, register-client, update-client-ttl,
+ * revoke-client) PLUS rescope-client, an Authority-mutating route added to
+ * this codebase after the historical Phase 9C snapshot (it changes a
+ * client's write source / federated-read / slug-fence / surface grant —
+ * unambiguously "Authority state" by Phase 9C's own category test, "does
+ * this event record a change in Identity/Credential/Authority state").
+ * None of these 10 routes had any audit at all before this change — Phase
+ * 9C's own audit_events wiring for them never landed in current,
+ * independently-evolved upstream (same finding as every other Phase 9
+ * artifact investigated across this reconciliation).
+ *
+ * Actor representation: admin sessions are NOT OAuth clients and must never
+ * be treated as one. This reuses the exact convention this codebase's own
+ * src/core/surface-audit.ts (writeSurfaceChangeAudit, pre-existing, already
+ * called by the current rescope-client handler for its surface sub-mutation)
+ * already established for the identical problem: the fixed, non-secret
+ * literal 'admin-api' as both token_name and agent_name — never a session
+ * ID, cookie value, or any per-request identity, because none exists to
+ * safely use (an admin session is a bearer credential over an anonymous
+ * capability, not a Principal). This function is a general-purpose sibling
+ * of that one, covering success/deny/error rather than only ever recording
+ * one fixed successful surface_change row.
+ *
+ * `credentialRef`, when present, is a SHA-256 hash of a real secret (the
+ * bootstrap token or a magic-link nonce) TRUNCATED to 16 hex chars — never
+ * the secret itself — mirroring Phase 9C's own historical `credential_ref`
+ * pattern for the same 3 routes (login, issue-magic-link, redeem). Every
+ * other route passes no credentialRef at all, matching history: routes
+ * whose input is a client_id/name (not a secret) never had one either.
+ * `target`, when present, is always a safe, non-secret identifier (a
+ * client_id, an access_tokens row's UUID, or a human-given key name) — the
+ * SAME identifier historical Phase 9C used as `resource_ref`. Neither field
+ * is ever a client_secret, issued API-key token, session cookie value, or
+ * request body content — no call site in this file constructs one from
+ * such a value.
+ */
+export async function logAdminAuthorityAudit(
+  engine: BrainEngine,
+  input: {
+    action: string;
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+    target?: string | null;
+    credentialRef?: string | null;
+    latencyMs: number;
+  },
+): Promise<void> {
+  try {
+    const hasParams = input.target != null || input.credentialRef != null;
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['admin-api', 'admin-api', input.action, input.latencyMs, input.status, input.reason ?? null],
+      [hasParams ? { target: input.target ?? null, credential_ref: input.credentialRef ?? null } : null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[admin-audit] failed to write ${input.action}/${input.status} audit row: ${msg}\n`);
+  }
+}
+
+/**
+ * AUTHZ-INV-013 (Phase 3B-7): audit for POST /webhooks/github.
+ *
+ * Historical Phase 9C (4a33a63e) precedent for this EXACT route, read in
+ * full: audited exactly 6 of its 13 terminal branches — missing_signature,
+ * webhook_not_configured, the two signature-mismatch branches, sync-job
+ * success, and sync-job queue-submission failure. The other 7 (event!=push
+ * ignore, empty_body, malformed_json, missing_fields, source lookup_failed,
+ * unknown_repo, ref_mismatch ignore) were deliberately left unaudited —
+ * they either fire on UNVERIFIED payload content (before HMAC
+ * verification even runs) or are legitimate webhook-protocol no-ops
+ * (GitHub sends non-push events and off-branch pushes routinely; auditing
+ * every one would flood the log with routine, non-security-relevant
+ * noise, and an attacker can trivially forge any repository/ref/payload
+ * shape without ever holding the real secret — attributing a "denial" to
+ * unverified content would be misleading). This port follows the same
+ * split, for the same reasons, re-derived independently and confirmed
+ * against the historical diff rather than assumed.
+ *
+ * Actor: a GitHub webhook has no OAuth client identity to check — AUTHZ-
+ * INV-010's own source-of-truth text names exactly this adapter shape
+ * ("GitHub Webhookのような...主体認証を伴わないメッセージ真正性検証の
+ * みのアダプター") as the explicit exception to principal/client
+ * identification. Never invent one — use the fixed, non-secret literal
+ * 'github-webhook', the sibling of logAdminAuthorityAudit's 'admin-api'
+ * for the same reason (a verified-message-source adapter is a different,
+ * genuinely distinct actor category from an admin session, so it gets
+ * its own literal rather than reusing that one).
+ *
+ * `target`, when present, is always the internal `sources` table row id
+ * (safe, non-secret, already the identifier every OTHER call site in this
+ * route uses for the same source) — NEVER the GitHub repository full_name
+ * or ref/branch name, matching the historical implementation's own choice
+ * to exclude both even though they were available in scope. `reason` is
+ * always a fixed classified string for every denial/validation-adjacent
+ * branch (Phase 14's own instruction: unverified content is never trusted
+ * as audit metadata) — the one exception, matching /ingest's established
+ * precedent (Phase 3B-4), is the queue-submission-failure branch, which
+ * runs only AFTER signature verification succeeds and carries an internal
+ * exception message, not GitHub-controlled content.
+ */
+export async function logGithubWebhookAudit(
+  engine: BrainEngine,
+  input: {
+    status: 'success' | 'denied' | 'error';
+    reason?: string;
+    target?: string | null;
+    latencyMs: number;
+  },
+): Promise<void> {
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['github-webhook', 'github-webhook', 'webhooks_github', input.latencyMs, input.status, input.reason ?? null],
+      [input.target != null ? { target: input.target } : null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[webhook-audit] failed to write webhooks_github/${input.status} audit row: ${msg}\n`);
+  }
+}
+
+/**
+ * AUTHZ-INV-013 (Phase 3B-8): audit for the MCP SDK's own POST /token and
+ * POST /revoke handlers — reached only by public/PKCE clients (no secret
+ * presented), since confidential clients are fully handled — and already
+ * audited — by this file's own custom handlers before the SDK is ever
+ * reached (Phase 3B-5, logOAuthCredentialAudit).
+ *
+ * Historical note: Phase 9C EXPLICITLY DEFERRED instrumenting any
+ * SDK-owned OAuth surface (its own implementation report names this exact
+ * gap — "SDKマウント境界...サードパーティコードであり直接編集できない
+ * ...別途必要", dashboard-4xj73) and never built anything here. There is
+ * no historical actor/redaction precedent to port for this specific
+ * mechanism; the wrapping TECHNIQUE below (rebinding res.json on a
+ * middleware registered before the SDK router mount) is not new to this
+ * codebase, though — it mirrors the pre-existing OAuth-metadata-patching
+ * middleware a few lines below this file's own `mcpAuthRouter(...)` call,
+ * which does the exact same rebind-then-call-original pattern for a
+ * different purpose (adding a grant type to the discovery document).
+ *
+ * Classification relies ONLY on: (a) the HTTP status code, already set by
+ * the time res.json runs (res.status(nnn) always precedes .json(body) in
+ * this SDK version — confirmed by reading its actual source, not assumed),
+ * and (b) the response body's `error` field IF the status is non-2xx —
+ * the RFC 6749 §5.2 / RFC 7009 §2.2.1 STANDARD OAuth error-response shape
+ * (`{error, error_description, error_uri}`), which this SDK version's own
+ * OAuthError.toResponseObject() implements verbatim (confirmed by reading
+ * its source). `error_description` and `error_uri` are never read — only
+ * the fixed, small-enum `error` field name is inspected, and only on the
+ * non-2xx path; the 2xx path (whose body IS the issued token itself for
+ * /token) is never inspected at all, only its status code.
+ *
+ * GET/POST /authorize is deliberately NOT covered by this mechanism — see
+ * the accompanying report's feasibility findings. Its actual grant/deny
+ * decision is signaled exclusively via res.redirect() to a URL that embeds
+ * the authorization code (success) or an error code (denial) in the query
+ * string itself; there is no status-code-only or body-only discriminator
+ * available the way there is for /token and /revoke, and distinguishing
+ * the two would require inspecting a URL containing a live credential.
+ */
+const OAUTH_SDK_DENIAL_ERROR_CODES = new Set([
+  'invalid_client', 'invalid_grant', 'access_denied', 'unauthorized_client',
+]);
+
+/**
+ * Pure, exported so the security-critical part of Phase 3B-8's res.json
+ * interception — "what, if anything, is safe to read out of this response
+ * body" — is independently unit-testable with real credential-shaped
+ * bodies, not just exercised indirectly through the DB-writing helper
+ * below. Returns the RFC-standard `error` field's value ONLY when the
+ * status is non-2xx AND the body is a plain object with a string `error`
+ * property — never anything else from the body, and never anything at all
+ * from a 2xx body (which, for /token, IS the issued token).
+ */
+export function extractSdkOAuthErrorCode(statusCode: number, body: unknown): string | null {
+  if (statusCode >= 200 && statusCode < 300) return null;
+  if (body == null || typeof body !== 'object' || Array.isArray(body)) return null;
+  const errorField = (body as Record<string, unknown>).error;
+  return typeof errorField === 'string' ? errorField : null;
+}
+
+export async function logSdkOAuthFallbackAudit(
+  engine: BrainEngine,
+  input: { endpoint: 'token' | 'revoke'; statusCode: number; errorCode?: string | null; latencyMs: number },
+): Promise<void> {
+  const status: 'success' | 'denied' | 'error' = input.statusCode >= 200 && input.statusCode < 300
+    ? 'success'
+    : (input.errorCode && OAUTH_SDK_DENIAL_ERROR_CODES.has(input.errorCode)) ? 'denied' : 'error';
+  try {
+    await executeRawJsonb(
+      engine,
+      `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+      ['oauth-sdk-fallback', 'oauth-sdk-fallback', `oauth_${input.endpoint}_sdk_fallback`, input.latencyMs, status, status === 'success' ? null : (input.errorCode ?? null)],
+      [null],
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`[oauth-sdk-audit] failed to write oauth_${input.endpoint}_sdk_fallback/${status} audit row: ${msg}\n`);
+  }
+}
+
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
   const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
@@ -981,14 +1294,6 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   app.use(cookieParser());
 
-  // #3893 (reimplemented from @y2688): request metrics. Mounted here, BEFORE
-  // every route — Express only applies `app.use` middleware to routes
-  // registered after it, and the original PR mounted the tracker after most
-  // routes, so they were never counted. The /metrics route itself lives
-  // below requireAdmin's definition.
-  const metricsCounters = createMetricsCounters();
-  app.use(metricsTrackingMiddleware(metricsCounters));
-
   // ---------------------------------------------------------------------------
   // CORS (v0.41.3, T7 — default-deny on every OAuth endpoint)
   // ---------------------------------------------------------------------------
@@ -1016,7 +1321,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   };
-  app.use('/mcp', cors(corsOAuthOptions));
+  // v0.43-port (dashboard-h0cfe): /mcp-v2 is a full alias of /mcp, sharing
+  // this exact CORS config, the auth middleware below, and the same route
+  // handlers (registered as an array on both routes) — never a duplicated,
+  // independently-maintained implementation. Kept for ChatGPT Connector
+  // compatibility (the live Connector is configured against /mcp-v2).
+  app.use(['/mcp', '/mcp-v2'], cors(corsOAuthOptions));
+  app.use('/token', cors(corsOAuthOptions));
   app.use('/authorize', cors(corsOAuthOptions));
   // /token, /revoke and /register are shadowed by the MCP SDK's own bare
   // `cors()` (origin `*`) mounted inside mcpAuthRouter. A denied preflight must
@@ -1071,18 +1382,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
+    const startTime = Date.now();
 
     try {
       const { client_id, client_secret, scope } = req.body;
       if (!client_id || !client_secret) {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'token', grantType: 'client_credentials', clientId: client_id ?? null,
+          latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+        });
         res.status(400).json({ error: 'invalid_request', error_description: 'client_id and client_secret required' });
         return;
       }
 
       const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType: 'client_credentials', clientId: client_id,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       res.json(tokens);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType: 'client_credentials', clientId: req.body?.client_id ?? null,
+        latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_grant',
+      });
       res.status(400).json({ error: 'invalid_grant', error_description: msg });
     }
   });
@@ -1126,6 +1450,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (!clientId || !presentedSecret) {
       return next(); // Public client path; SDK handles.
     }
+    const startTime = Date.now();
 
     try {
       const client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
@@ -1135,6 +1460,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const redirectUri = req.body.redirect_uri;
         const codeVerifier = req.body.code_verifier;
         if (!code) {
+          await logOAuthCredentialAudit(engine, {
+            endpoint: 'token', grantType, clientId,
+            latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+          });
           res.status(400).json({ error: 'invalid_request', error_description: 'code required' });
           return;
         }
@@ -1143,17 +1472,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         const refreshToken = req.body.refresh_token;
         const scopeParam = typeof req.body.scope === 'string' ? req.body.scope.split(/\s+/) : undefined;
         if (!refreshToken) {
+          await logOAuthCredentialAudit(engine, {
+            endpoint: 'token', grantType, clientId,
+            latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+          });
           res.status(400).json({ error: 'invalid_request', error_description: 'refresh_token required' });
           return;
         }
         tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam);
       }
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType, clientId,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       res.json(tokens);
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       // RFC 6749: invalid_client for auth failures, invalid_grant for
       // code/token problems. "Invalid client" → 401; everything else 400.
-      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+      const authFailure = msg === 'Invalid client' || msg === 'Client has been revoked';
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'token', grantType, clientId,
+        latencyMs: Date.now() - startTime, status: 'denied',
+        reason: authFailure ? 'invalid_client' : 'invalid_grant',
+      });
+      if (authFailure) {
         res.status(401).json({ error: 'invalid_client', error_description: msg });
       } else {
         res.status(400).json({ error: 'invalid_grant', error_description: msg });
@@ -1168,6 +1511,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // secret and continue through to the SDK's PKCE-compatible handler.
   app.post('/revoke', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
+    const startTime = Date.now();
 
     const rawClientId: unknown = req.body?.client_id;
     const rawBodySecret: unknown = req.body?.client_secret;
@@ -1182,6 +1526,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       (rawBodySecret !== undefined && typeof rawBodySecret !== 'string') ||
       (hasBasicAuth && (rawClientId !== undefined || rawBodySecret !== undefined))
     ) {
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId: null,
+        latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+      });
       res.status(400).json({ error: 'invalid_request', error_description: 'Malformed or mixed client authentication' });
       return;
     }
@@ -1201,6 +1549,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         presentedSecret = decodeURIComponent(decoded.slice(idx + 1).replace(/\+/g, ' '));
         if (!presentedSecret) throw new Error('Malformed Basic authentication');
       } catch {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'revoke', clientId: null,
+          latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_client',
+        });
         res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
         res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
         return;
@@ -1210,6 +1562,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
     const parsedRequest = OAuthTokenRevocationRequestSchema.safeParse(req.body);
     if (!parsedRequest.success || parsedRequest.data.token.length === 0) {
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error', reason: 'invalid_request',
+      });
       res.status(400).json({ error: 'invalid_request', error_description: 'Valid token required' });
       return;
     }
@@ -1220,12 +1576,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     } catch (e) {
       const msg = e instanceof Error ? e.message : '';
       if (msg === 'Invalid client' || msg === 'Client has been revoked') {
+        await logOAuthCredentialAudit(engine, {
+          endpoint: 'revoke', clientId,
+          latencyMs: Date.now() - startTime, status: 'denied', reason: 'invalid_client',
+        });
         if (hasBasicAuth) res.setHeader('WWW-Authenticate', 'Basic realm="gbrain"');
         res.status(401).json({ error: 'invalid_client', error_description: 'Invalid client' });
         return;
       }
       console.error('[serve-http] revoke client verification failed:', msg || 'Unknown error');
       const retryable = isRetryableError(e);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error',
+        reason: retryable ? 'temporarily_unavailable' : 'server_error',
+      });
       res.status(retryable ? 503 : 500).json({
         error: retryable ? 'temporarily_unavailable' : 'server_error',
         error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
@@ -1235,12 +1600,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
     try {
       await oauthProvider.revokeToken(client, parsedRequest.data);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'success',
+      });
       // RFC 7009 §2.2: successful revocation, including an unknown token, is 200.
       res.status(200).end();
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Unknown error';
       console.error('[serve-http] token revocation failed:', msg);
       const retryable = isRetryableError(e);
+      await logOAuthCredentialAudit(engine, {
+        endpoint: 'revoke', clientId,
+        latencyMs: Date.now() - startTime, status: 'error',
+        reason: retryable ? 'temporarily_unavailable' : 'server_error',
+      });
       res.status(retryable ? 503 : 500).json({
         error: retryable ? 'temporarily_unavailable' : 'server_error',
         error_description: retryable ? 'Token revocation temporarily unavailable' : 'Token revocation failed',
@@ -1307,8 +1681,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Patch the SDK's OAuth metadata to include client_credentials grant type.
   // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
   // the response and add client_credentials before it reaches the client.
+  // v0.43-port (dashboard-h0cfe): also applies to the openid-configuration
+  // compat route below, which reuses the same createOAuthMetadata() output —
+  // without this the two discovery documents would silently diverge.
   app.use((req, res, next) => {
-    if (req.path === '/.well-known/oauth-authorization-server' && req.method === 'GET') {
+    if (
+      (req.path === '/.well-known/oauth-authorization-server' || req.path === '/.well-known/openid-configuration')
+      && req.method === 'GET'
+    ) {
       const origJson = res.json.bind(res);
       (res as any).json = (body: any) => {
         if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
@@ -1324,6 +1704,58 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         if (body?.revocation_endpoint_auth_methods_supported && !body.revocation_endpoint_auth_methods_supported.includes('client_secret_basic')) {
           body.revocation_endpoint_auth_methods_supported.push('client_secret_basic');
         }
+        return origJson(body);
+      };
+    }
+    next();
+  });
+
+  // COMPAT ENDPOINT (v0.43-port, dashboard-h0cfe) — OIDC Discovery-style
+  // alias. Some OAuth/OIDC-aware clients probe
+  // /.well-known/openid-configuration in addition to (or instead of) the
+  // RFC 8414 /.well-known/oauth-authorization-server path the SDK
+  // implements; this SDK version does not register that path at all.
+  // Reuses the SDK's own exported createOAuthMetadata(authRouterOptions) —
+  // the exact same pure function the SDK calls internally for
+  // oauth-authorization-server — so the two documents are guaranteed
+  // identical in content. Does not modify the SDK, does not touch
+  // /authorize, /token, PKCE, or DCR in any way.
+  app.get('/.well-known/openid-configuration', (req, res) => {
+    res.status(200).json(createOAuthMetadata(authRouterOptions));
+  });
+
+  // AUTHZ-INV-013 (Phase 3B-8): observe the outcome of the SDK's own
+  // POST /token and POST /revoke handlers — reached only by public/PKCE
+  // clients, since every confidential-client request is fully handled (and
+  // already audited, Phase 3B-5) by this file's own custom handlers above,
+  // which never call next() on their own success/handled-failure paths —
+  // this middleware never even runs for those requests. Registered here,
+  // immediately before the SDK router mount, so it wraps the exact
+  // response object the SDK's handler will use.
+  //
+  // Same technique the metadata-patching middleware just above already
+  // uses (rebind res.json, call the original inside the replacement) —
+  // not a new interception mechanism for this codebase, only a new
+  // consumer of it. Reads ONLY res.statusCode (already set by the SDK's
+  // own res.status(nnn) call, which always precedes .json() in this SDK
+  // version) and, on a non-2xx response only, the body's `error` field —
+  // the RFC 6749/7009 standard OAuth error-response field. The 2xx body
+  // (the issued token itself, for /token) is never inspected. No request
+  // data (headers, cookies, body, query string) is ever read here.
+  app.use((req, res, next) => {
+    if (req.path === '/token' || req.path === '/revoke') {
+      const endpoint = req.path === '/token' ? 'token' : 'revoke';
+      const startTime = Date.now();
+      const origJson = res.json.bind(res);
+      // Not awaited: res.json is a synchronous Express API, and this
+      // middleware must not add latency or change response timing. The
+      // helper never throws (own try/catch) so this is a safe fire-and-
+      // forget — no unhandled rejection risk.
+      (res as any).json = (body: any) => {
+        const errorCode = extractSdkOAuthErrorCode(res.statusCode, body);
+        void logSdkOAuthFallbackAudit(engine, {
+          endpoint, statusCode: res.statusCode, errorCode, latencyMs: Date.now() - startTime,
+        });
         return origJson(body);
       };
     }
@@ -1347,15 +1779,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
   // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
+  app.post('/admin/login', express.json(), async (req, res) => {
+    const startTime = Date.now();
     const token = req.body?.token;
     if (!token || typeof token !== 'string') {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_login', status: 'error', reason: 'missing_token', latencyMs: Date.now() - startTime,
+      });
       res.status(400).json({ error: 'Token required' });
       return;
     }
 
     const tokenHash = createHash('sha256').update(token).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_login', status: 'denied', reason: 'invalid_bootstrap_token',
+        credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
       return;
     }
@@ -1364,6 +1804,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
     adminSessions.set(sessionId, expiresAt);
 
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_login', status: 'success',
+      credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+    });
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
     res.json({ status: 'authenticated' });
   });
@@ -1417,21 +1861,33 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  app.post('/admin/api/issue-magic-link', express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_issue_magic_link', status: 'error', reason: 'missing_bearer', latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Authorization: Bearer <bootstrap-token> required' });
       return;
     }
     const tokenHash = createHash('sha256').update(m[1]).digest('hex');
     if (!safeHexEqual(tokenHash, bootstrapHash)) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_issue_magic_link', status: 'denied', reason: 'invalid_bootstrap_token',
+        credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.status(401).json({ error: 'Invalid bootstrap token' });
       return;
     }
     pruneExpiredNonces();
     const nonce = randomBytes(32).toString('hex');
     magicLinkNonces.set(nonce, Date.now() + NONCE_TTL_MS);
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_issue_magic_link', status: 'success',
+      credentialRef: tokenHash.slice(0, 16), latencyMs: Date.now() - startTime,
+    });
     const baseUrl = publicUrl || `http://localhost:${port}`;
     res.json({ url: `${baseUrl}/admin/auth/${nonce}`, expires_in: NONCE_TTL_MS / 1000 });
   });
@@ -1440,14 +1896,23 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // Browser hits it, server validates the nonce (exists + unconsumed +
   // unexpired), marks consumed, sets cookie, redirects to dashboard.
   // Rate-limited at 10/min/IP to harden against DoS via bad-token loops.
-  app.get('/admin/auth/:token', adminAuthRateLimiter, (req: Request, res: Response) => {
+  app.get('/admin/auth/:token', adminAuthRateLimiter, async (req: Request, res: Response) => {
+    const startTime = Date.now();
     const nonce = String(req.params.token ?? '');
     pruneExpiredNonces();
 
     const expiresAt = magicLinkNonces.get(nonce);
     const isValid = !!nonce && !!expiresAt && expiresAt > Date.now() && !consumedNonces.has(nonce);
+    // Referenced, never stored raw — matches the historical credential_ref
+    // pattern for the same route (Phase 9C, hashed+truncated, never the
+    // nonce itself).
+    const nonceRef = nonce ? createHash('sha256').update(nonce).digest('hex').slice(0, 16) : null;
 
     if (!isValid) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_magic_link_redeem', status: 'denied', reason: 'invalid_or_expired_nonce',
+        credentialRef: nonceRef, latencyMs: Date.now() - startTime,
+      });
       res.status(401).send(`<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GBrain</title>
@@ -1475,11 +1940,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     const sessionExpiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days for magic link
     adminSessions.set(sessionId, sessionExpiresAt);
 
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_magic_link_redeem', status: 'success',
+      credentialRef: nonceRef, latencyMs: Date.now() - startTime,
+    });
     res.cookie('gbrain_admin', sessionId, adminCookie(req, 7 * 24 * 60 * 60 * 1000));
     res.redirect('/admin/');
   });
 
-  // Admin auth middleware
+  // Admin auth middleware.
+  //
+  // AUTHZ-INV-010 (Phase 9D, historically 7fa7cc7f; reimplemented here on
+  // current architecture, Phase 3B-3): this middleware verifies
+  // Credential/Session validity (cookie presence, session existence,
+  // expiry) itself — that part is adapter-appropriate, not a Policy
+  // Decision. But the final allow/deny Capability check must route through
+  // the same shared Policy Decision function (hasScope) that the MCP
+  // tool-call dispatch below (ListTools/CallTool handlers) uses, not
+  // complete its own separate decision. An established admin session
+  // always carries the 'admin' scope (the strongest, catch-all scope in
+  // scope.ts's IMPLIES table) — this does not change who is allowed to do
+  // what today; it removes requireAdmin's own independent allow/deny
+  // branch so a future change to hasScope's decision logic applies here
+  // too, automatically, instead of needing a second, hand-synced copy.
   function requireAdmin(req: express.Request, res: express.Response, next: express.NextFunction) {
     const sessionId = (req.cookies as Record<string, string>)?.gbrain_admin;
     if (!sessionId || !adminSessions.has(sessionId)) {
@@ -1492,16 +1975,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.status(401).json({ error: 'Session expired' });
       return;
     }
+    const allowed = hasScope(['admin'], 'admin');
+    if (!allowed) {
+      res.status(403).json({ error: 'Forbidden' });
+      return;
+    }
     next();
   }
-
-  // #3893 (reimplemented from @y2688): Prometheus exposition. Admin-gated —
-  // request/error/latency series profile a personal brain's usage, so this
-  // is not a public surface (the original PR served it unauthenticated).
-  app.get('/metrics', requireAdmin, (_req: Request, res: Response) => {
-    res.set('Content-Type', 'text/plain; version=0.0.4');
-    res.send(renderPrometheusMetrics(metricsCounters));
-  });
 
   // ---------------------------------------------------------------------------
   // Admin API endpoints
@@ -1511,9 +1991,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // browser/tab fails its next request, gets 401, redirects to login.
   // The bootstrap token itself is unaffected (still valid for new
   // magic-link mints) — this only revokes existing cookie sessions.
-  app.post('/admin/api/sign-out-everywhere', requireAdmin, (_req: Request, res: Response) => {
+  app.post('/admin/api/sign-out-everywhere', requireAdmin, async (_req: Request, res: Response) => {
+    const startTime = Date.now();
     const count = adminSessions.size;
     adminSessions.clear();
+    await logAdminAuthorityAudit(engine, {
+      action: 'admin_sign_out_everywhere', status: 'success', latencyMs: Date.now() - startTime,
+    });
     res.json({ revoked_sessions: count });
   });
 
@@ -1866,33 +2350,68 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   });
 
   app.post('/admin/api/api-keys', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_create_api_key', status: 'error', reason: 'missing_name', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       const { generateToken, hashToken } = await import('../core/utils.ts');
       const token = generateToken('gbrain_');
       const hash = hashToken(token);
       const id = (await import('crypto')).randomUUID();
       await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_create_api_key', status: 'success',
+        target: id, credentialRef: hash.slice(0, 16), latencyMs: Date.now() - startTime,
+      });
       res.json({ name, token, id });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_create_api_key', status: 'error', reason: 'create_api_key_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
     }
   });
 
   app.post('/admin/api/api-keys/revoke', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { name } = req.body;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_revoke_api_key', status: 'error', reason: 'missing_name', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_api_key', status: 'success', target: name, latencyMs: Date.now() - startTime,
+      });
       res.json({ revoked: true });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_api_key', status: 'error', reason: 'revoke_api_key_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
     }
   });
 
   // Register client from admin dashboard
   app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
+    // AUTHZ-INV-013: this route has many validation branches — a local
+    // closure over startTime avoids repeating the same 5-line
+    // logAdminAuthorityAudit call at each one.
+    const auditRegister = (status: 'success' | 'error', reason?: string, target?: string) =>
+      logAdminAuthorityAudit(engine, {
+        action: 'admin_register_client', status, reason, target, latencyMs: Date.now() - startTime,
+      });
     // Set only once the client row has COMMITTED — the catch below folds it
     // into the 500 payload so a post-commit failure never reads as
     // "nothing was created".
@@ -1910,11 +2429,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // missing, empty) and rejects the rest with a structured 400.
       const { name, source, federatedRead, tokenTtl, grantTypes, redirectUris, tokenEndpointAuthMethod } = req.body;
       const rawScopes = (req.body as Record<string, unknown>).scopes ?? (req.body as Record<string, unknown>).scope;
-      if (!name) { res.status(400).json({ error: 'Name required' }); return; }
+      if (!name) {
+        await auditRegister('error', 'missing_name');
+        res.status(400).json({ error: 'Name required' });
+        return;
+      }
       let scopeString: string;
       try {
         scopeString = normalizeScopesInput(rawScopes);
       } catch (e) {
+        await auditRegister('error', 'invalid_scopes', name);
         res.status(400).json({
           error: 'invalid_scopes',
           message: e instanceof Error ? e.message : String(e),
@@ -1934,6 +2458,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       try {
         validatedAuthMethod = validateTokenEndpointAuthMethod(tokenEndpointAuthMethod);
       } catch (e) {
+        await auditRegister('error', 'invalid_token_endpoint_auth_method', name);
         res.status(400).json({
           error: 'invalid_token_endpoint_auth_method',
           message: e instanceof Error ? e.message : String(e),
@@ -1953,6 +2478,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         sourceId = normalizeSourceInput(source);
         federatedReadIds = normalizeFederatedReadInput(federatedRead);
       } catch (e) {
+        await auditRegister('error', 'invalid_source', name);
         res.status(400).json({
           error: 'invalid_source',
           message: e instanceof Error ? e.message : String(e),
@@ -1974,6 +2500,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         for (const id of idsToCheck) {
           const row = byId.get(id);
           if (!row) {
+            await auditRegister('error', 'unknown_source', name);
             res.status(400).json({
               error: 'unknown_source',
               message: `source "${id}" does not exist — create it first (gbrain sources add ${id})`,
@@ -1981,6 +2508,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             return;
           }
           if (row.archived) {
+            await auditRegister('error', 'archived_source', name);
             res.status(400).json({
               error: 'archived_source',
               message: `source "${id}" is archived — unarchive it or drop it from the grant`,
@@ -1998,6 +2526,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (tokenTtl) {
         const v = Number(tokenTtl);
         if (!Number.isInteger(v) || v < TOKEN_TTL_MIN_SECONDS || v > TOKEN_TTL_MAX_SECONDS) {
+          await auditRegister('error', 'invalid_token_ttl', name);
           res.status(400).json({
             error: 'invalid_token_ttl',
             message: `tokenTtl must be an integer number of seconds between ${TOKEN_TTL_MIN_SECONDS} and ${TOKEN_TTL_MAX_SECONDS} (90 days); got ${JSON.stringify(tokenTtl)}. Omit the field (or pass 0/null) to keep the server default.`,
@@ -2014,6 +2543,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // without token_ttl.
       const columns = await preflightOauthClientColumns(sql);
       if (!columns.has('source_id') || !columns.has('federated_read')) {
+        await auditRegister('error', 'brain_too_old', name);
         res.status(400).json({
           error: 'brain_too_old',
           message: 'this brain predates scoped OAuth clients (source_id/federated_read columns) — run `gbrain apply-migrations --yes` first.',
@@ -2059,6 +2589,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         }, { tokenTtlSeconds: ttlNum, columns });
       });
       if (dupClientId !== null) {
+        await auditRegister('error', 'duplicate_name', name);
         res.status(409).json({
           error: 'duplicate_name',
           client_id: dupClientId,
@@ -2069,6 +2600,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // name the created client (no false "nothing was created").
       const reg = registered!;
       createdClientId = reg.clientId;
+      // clientSecret is returned to the caller (the one time it's ever
+      // visible) but NEVER passed to the audit call below — only the
+      // client_id, matching the historical Phase 9C pattern for this exact
+      // route (resource_ref: created.clientId, never the secret).
+      await auditRegister('success', undefined, reg.clientId);
       res.json({
         clientId: reg.clientId,
         ...(reg.clientSecret !== undefined ? { clientSecret: reg.clientSecret } : {}),
@@ -2078,6 +2614,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // A throw INSIDE the tx rolls the row back (no client persists); the
       // only window where a client exists at failure time is post-commit,
       // marked by createdClientId — include it so the operator can revoke.
+      await auditRegister('error', 'register_client_failed', createdClientId);
       res.status(500).json({
         error: e instanceof Error ? e.message : 'Registration failed',
         ...(createdClientId !== undefined ? { client_id: createdClientId } : {}),
@@ -2087,13 +2624,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // Update client TTL
   app.post('/admin/api/update-client-ttl', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { clientId, tokenTtl } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_update_client_ttl', status: 'error', reason: 'missing_client_id', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
       const ttl = tokenTtl === null || tokenTtl === 0 ? null : Number(tokenTtl);
       await sql`UPDATE oauth_clients SET token_ttl = ${ttl} WHERE client_id = ${clientId}`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_update_client_ttl', status: 'success', target: clientId, latencyMs: Date.now() - startTime,
+      });
       res.json({ updated: true, tokenTtl: ttl });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_update_client_ttl', status: 'error', reason: 'update_ttl_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Update failed' });
     }
   });
@@ -2104,18 +2654,30 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // `gbrain auth rescope-client`. Source ids are validated by the canonical
   // validator inside rescopeClient.
   app.post('/admin/api/rescope-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
+    // AUTHZ-INV-013: not in Phase 9C's original 9 — this route was added to
+    // the codebase after that historical snapshot — but it unambiguously
+    // fits the SAME category (changes a client's write source / federated-
+    // read / slug-fence / surface Authority grant), so it's covered too.
+    const auditRescope = (status: 'success' | 'error', reason?: string, target?: string) =>
+      logAdminAuthorityAudit(engine, {
+        action: 'admin_rescope_client', status, reason, target, latencyMs: Date.now() - startTime,
+      });
     try {
       const { clientId, sourceId, federatedRead, boundSlugPrefixes, surface } = req.body ?? {};
       if (!clientId || typeof clientId !== 'string') {
+        await auditRescope('error', 'missing_client_id');
         res.status(400).json({ error: 'clientId required' });
         return;
       }
       if (federatedRead !== undefined &&
           !(Array.isArray(federatedRead) && federatedRead.every((s: unknown) => typeof s === 'string'))) {
+        await auditRescope('error', 'invalid_federated_read', clientId);
         res.status(400).json({ error: 'federatedRead must be an array of source id strings' });
         return;
       }
       if (sourceId !== undefined && typeof sourceId !== 'string') {
+        await auditRescope('error', 'invalid_source_id', clientId);
         res.status(400).json({ error: 'sourceId must be a string' });
         return;
       }
@@ -2124,6 +2686,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // --bound-slug-prefixes p1,p2|none).
       if (boundSlugPrefixes !== undefined && boundSlugPrefixes !== null &&
           !(Array.isArray(boundSlugPrefixes) && boundSlugPrefixes.every((s: unknown) => typeof s === 'string'))) {
+        await auditRescope('error', 'invalid_bound_slug_prefixes', clientId);
         res.status(400).json({ error: 'boundSlugPrefixes must be null or an array of slug-prefix strings' });
         return;
       }
@@ -2132,6 +2695,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // (mirrors the CLI's --surface verbs|starter|full|clear).
       if (surface !== undefined && surface !== null &&
           surface !== 'verbs' && surface !== 'starter' && surface !== 'full') {
+        await auditRescope('error', 'invalid_surface', clientId);
         res.status(400).json({ error: 'surface must be null or one of: verbs, starter, full' });
         return;
       }
@@ -2147,27 +2711,45 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           via: 'admin_api',
         });
       }
+      // Covers the route's overall outcome (source/federated-read/slug-fence
+      // rescope); writeSurfaceChangeAudit above separately covers the
+      // surface sub-mutation specifically — no need to duplicate that detail.
+      await auditRescope('success', undefined, clientId);
       res.json(result);
     } catch (e) {
       const message = e instanceof Error ? e.message : 'Rescope failed';
-      const status = /No OAuth client found/.test(message) ? 404
-        : /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message) ? 400
-        : 500;
+      const notFound = /No OAuth client found/.test(message);
+      const badRequest = /Invalid source_id|requires --source|cannot be empty|does not exist|cannot be an empty list|bound_slug_prefixes entr|--surface must be/.test(message);
+      const status = notFound ? 404 : badRequest ? 400 : 500;
+      await auditRescope('error', notFound ? 'client_not_found' : badRequest ? 'invalid_rescope_request' : 'rescope_failed');
       res.status(status).json({ error: message });
     }
   });
 
   // Revoke OAuth client
   app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+    const startTime = Date.now();
     try {
       const { clientId } = req.body;
-      if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
+      if (!clientId) {
+        await logAdminAuthorityAudit(engine, {
+          action: 'admin_revoke_client', status: 'error', reason: 'missing_client_id', latencyMs: Date.now() - startTime,
+        });
+        res.status(400).json({ error: 'clientId required' });
+        return;
+      }
       // Soft-delete the client
       await sql`UPDATE oauth_clients SET deleted_at = now() WHERE client_id = ${clientId} AND deleted_at IS NULL`;
       // Revoke all active tokens for this client
       await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_client', status: 'success', target: clientId, latencyMs: Date.now() - startTime,
+      });
       res.json({ revoked: true });
     } catch (e) {
+      await logAdminAuthorityAudit(engine, {
+        action: 'admin_revoke_client', status: 'error', reason: 'revoke_client_failed', latencyMs: Date.now() - startTime,
+      });
       res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
     }
   });
@@ -2307,12 +2889,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (not 404) so probing clients (claude.ai, etc.) recognize this as an MCP
   // endpoint, not a missing route. Without this, clients display "endpoint not
   // found" instead of "endpoint exists but no SSE channel."
-  app.get('/mcp', (_req: Request, res: Response) => {
+  // /mcp-v2 is registered alongside /mcp using the same middleware and
+  // handlers (v0.43-port, dashboard-h0cfe) — retained for ChatGPT connector
+  // compatibility.
+  app.get(['/mcp', '/mcp-v2'], (_req: Request, res: Response) => {
     res.set('Allow', 'POST, DELETE');
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  app.post(['/mcp', '/mcp-v2'], requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
 
@@ -2765,6 +3350,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // throw TypeError. Express's default error handler then served an HTML
       // 500 page. Guard fires first to keep the response shape JSON.
       if (req.body == null) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: 'empty_body',
+        });
         res.status(400).json({
           error: 'empty_body',
           message: 'POST /ingest requires a non-empty body',
@@ -2788,6 +3377,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       if (body.length === 0) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: 'empty_body',
+        });
         res.status(400).json({ error: 'empty_body', message: 'POST /ingest requires a non-empty body' });
         return;
       }
@@ -2810,6 +3403,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         contentType = 'text/plain';
       } else {
         // Binary or unknown — rejected in v1.
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `unsupported_content_type: ${declared}`,
+        });
         res.status(415).json({
           error: 'unsupported_content_type',
           message: `content_type '${declared}' not supported. Use one of: ${[...INGEST_ALLOWED_CONTENT_TYPES].join(', ')}. ` +
@@ -2819,6 +3416,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       if (!INGEST_ALLOWED_CONTENT_TYPES.has(contentType)) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `unsupported_content_type: ${contentType}`,
+        });
         res.status(415).json({
           error: 'unsupported_content_type',
           message: `content_type '${contentType}' is in the taxonomy but not currently accepted by POST /ingest`,
@@ -2846,6 +3447,16 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // clients.
       const boundPrefixes = authInfo.boundSlugPrefixes;
       if (boundPrefixes || authInfo.fenceProjectionDegraded) {
+        // AUTHZ-INV-013: the one genuine authorization decision in this
+        // route (as opposed to input validation or an operational failure)
+        // — status: 'denied', matching the vocabulary's intent even though
+        // this file's existing MCP call sites happen to spell it
+        // 'denied_after_list' for their own specific reason.
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'denied',
+          errorMessage: authInfo.fenceProjectionDegraded ? 'fence_projection_degraded' : 'slug_bound_client',
+        });
         res.status(403).json({
           error: 'permission_denied',
           message: authInfo.fenceProjectionDegraded
@@ -2878,6 +3489,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const validationErr = validateIngestionEvent(event);
       if (validationErr) {
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `invalid_event: ${validationErr.field}`,
+        });
         res.status(400).json({
           error: 'invalid_event',
           message: validationErr.message,
@@ -2949,6 +3564,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('POST /ingest queue submission error:', msg);
+        await logIngestAudit(engine, {
+          clientId: authInfo.clientId, agentName, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `queue_submission_failed: ${msg}`,
+        });
         res.status(500).json({
           error: 'queue_submission_failed',
           message: msg,
@@ -2963,6 +3582,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } catch (outerErr) {
         const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
         console.error('POST /ingest unexpected handler error:', msg);
+        // authInfo may be unset if the throw happened before it was read —
+        // requireBearerAuth already ran (this route can't be reached
+        // otherwise), so req.auth is always present even if the local
+        // `authInfo` binding above wasn't reached yet.
+        const clientId = (req as Request & { auth?: AuthInfo }).auth?.clientId ?? 'unknown';
+        await logIngestAudit(engine, {
+          clientId, agentName: clientId, latencyMs: Date.now() - startTime,
+          status: 'error', errorMessage: `internal_error: ${msg}`,
+        });
         if (!res.headersSent) {
           res.status(500).json({
             error: 'internal_error',
@@ -3109,10 +3737,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     githubWebhookLimiter,
     express.raw({ type: '*/*', limit: '1mb' }),
     async (req: Request, res: Response) => {
+      const startTime = Date.now();
       // D3 pre-DB short-circuit: missing signature → 401 without any
       // source lookup. Bot probe traffic ends here.
       const sigHeader = req.header('X-Hub-Signature-256');
       if (!sigHeader) {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'missing_signature', latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'missing_signature', message: 'X-Hub-Signature-256 header is required' });
         return;
       }
@@ -3210,6 +3842,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const secret = cfg.webhook_secret;
       if (!secret || typeof secret !== 'string') {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'webhook_not_configured', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'webhook_not_configured', message: 'Run: gbrain sources webhook set ' + source.id });
         return;
       }
@@ -3224,10 +3859,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const computedHex = createHmac('sha256', secret).update(payload).digest('hex');
       const prefix = 'sha256=';
       if (!/^sha256=[0-9a-f]{64}$/.test(sigHeader)) {
+        // Fixed reason only — never the raw sigHeader value (Phase 14: an
+        // unverified signature-shaped header is not trustworthy audit
+        // metadata, and it's the one piece of this request that's
+        // security-sensitive by construction).
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'missing_signature_prefix', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'signature_mismatch', message: 'expected sha256=<64 hex> signature' });
         return;
       }
       if (!safeHexEqual(sigHeader.slice(prefix.length), computedHex)) {
+        await logGithubWebhookAudit(engine, {
+          status: 'denied', reason: 'signature_mismatch', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(401).json({ error: 'signature_mismatch' });
         return;
       }
@@ -3249,10 +3894,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             maxWaiting: 1,
           },
         );
+        await logGithubWebhookAudit(engine, {
+          status: 'success', target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(202).json({ job_id: job.id, source_id: source.id });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
+        // Post-signature-verification, trusted: this is an internal
+        // exception message (queue/DB failure), not GitHub-controlled
+        // content, matching /ingest's established precedent (Phase 3B-4)
+        // for the analogous post-auth operational-failure branch.
+        await logGithubWebhookAudit(engine, {
+          status: 'error', reason: `queue_submission_failed: ${msg}`, target: source.id, latencyMs: Date.now() - startTime,
+        });
         res.status(500).json({ error: 'queue_submission_failed', message: msg });
       }
     },
