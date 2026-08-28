@@ -115,6 +115,21 @@ if [ -f "$GBRAIN_LAUNCHD_PLIST" ]; then
   fi
 fi
 
+# --- DCR-disabled deployment invariant (official-first policy, Phase 3B-34).
+# Official upstream's DCR registration path has no scope ceiling below the
+# full ALLOWED_SCOPES_LIST — a self-registered client can obtain
+# admin/sources_admin/users_admin/agent unless --enable-dcr is absent. Our
+# fork no longer carries a source patch for this; the deployment gate is the
+# entire control. Reads ONLY :ProgramArguments (the launch command/flags) —
+# never :EnvironmentVariables — so this can never touch or print the
+# bootstrap token. No mutation; PlistBuddy Print only.
+if [ -f "$GBRAIN_LAUNCHD_PLIST" ] && command -v /usr/libexec/PlistBuddy >/dev/null 2>&1; then
+  PROGRAM_ARGS="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$GBRAIN_LAUNCHD_PLIST" 2>/dev/null || true)"
+  if printf '%s' "$PROGRAM_ARGS" | grep -q -- '--enable-dcr'; then
+    die "DCR enabled — official-first deployment blocked; security review required (see docs: DCR ceiling hardening must be reapplied before --enable-dcr may ship, or an upstream-equivalent registration-time scope ceiling must exist first)"
+  fi
+fi
+
 # --- shared/ must exist (or be creatable) and be writable.
 mkdir -p "$SHARED_LOGS_DIR" "$SHARED_BACKUPS_DIR"
 [ -w "$SHARED_LOGS_DIR" ] || die "shared/logs is not writable: $SHARED_LOGS_DIR"
