@@ -24,10 +24,13 @@
 
 import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
-import { operations } from '../../operations.ts';
-import type { Operation, OperationContext } from '../../operations.ts';
+import { operations, OperationError } from '../../operations.ts';
+import type { Operation, OperationContext, AuthInfo } from '../../operations.ts';
 import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
-import { validateSourceId } from '../../utils.ts';
+import { validateSourceId, isUndefinedColumnError } from '../../utils.ts';
+import { hasScope, parseScopeString } from '../../scope.ts';
+import { sqlQueryForEngine } from '../../sql-query.ts';
+import { logAgentGrantDecision } from '../agent-audit.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
 
 /**
@@ -214,6 +217,19 @@ export interface BuildBrainToolsOpts {
    * Unset → legacy 'default'.
    */
   sourceId?: string;
+  /**
+   * Phase 3B-13 (AUTHZ-INV-005/006): the OAuth client_id that delegated this
+   * job (SubagentHandlerData.__owner_client_id, written by submit_agent's
+   * jobData at grant time). When set, every tool-call re-resolves this
+   * client's CURRENT scope/deleted_at from oauth_clients and gates the call
+   * through the same hasScope() primitive normal MCP/HTTP dispatch uses
+   * (src/commands/serve-http.ts's CallToolRequestSchema handler) — closing
+   * the AUTHZ-INV-005/006 gap where exercise-time execution only ever
+   * checked the grant-time allow-list, never the owner's LIVE authority.
+   * When unset (cycle.ts's non-delegated child jobs never set it), the gate
+   * is skipped and behavior is unchanged from pre-3B-13.
+   */
+  ownerClientId?: string;
 }
 
 interface OpContextDeps {
@@ -226,6 +242,7 @@ interface OpContextDeps {
   allowedSlugPrefixes?: readonly string[];
   sourceId?: string;
   deferEmbeds?: boolean;
+  auth?: AuthInfo;
 }
 
 function buildOpContext(deps: OpContextDeps): OperationContext {
@@ -251,7 +268,89 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     // #4216: server-side-only — the oneshot runner defers chunk embeddings on
     // its programmatic writes; never hydrated from any wire payload.
     ...(deps.deferEmbeds ? { deferEmbeds: true } : {}),
+    // Phase 3B-13: undefined for non-delegated (ownerClientId-less) child
+    // jobs, matching pre-3B-13 behavior exactly (OperationContext.auth was
+    // always undefined here before this phase).
+    auth: deps.auth,
   };
+}
+
+/**
+ * Phase 3B-13 (AUTHZ-INV-005/006) — re-resolve the delegating OAuth client's
+ * CURRENT state from the DB (not the job payload snapshot) so exercise-time
+ * authorization reflects revoke/scope-change since grant time. Mirrors the
+ * established revocation-probe idiom in src/core/oauth-provider.ts
+ * (exchangeClientCredentials / the secret-verification path): a row absent
+ * OR `deleted_at IS NOT NULL` both mean "no longer authorized" — the CLI's
+ * `gbrain auth revoke-client` hard-DELETEs the row (src/commands/auth.ts
+ * revokeClient) while the admin console soft-deletes via `deleted_at`, so
+ * both must be treated as the same "revoked" outcome here. `deleted_at`
+ * missing entirely (pre-migration brain) falls back to a scope-only query,
+ * matching that same idiom's `isUndefinedColumnError` tolerance — a schema
+ * predating the column has no revocation signal to check, not a reason to
+ * fail closed on every delegated call.
+ */
+async function resolveOwnerAuthority(
+  engine: BrainEngine,
+  ownerClientId: string,
+): Promise<{ ok: true; scopes: string[] } | { ok: false; reasonCode: string; message: string }> {
+  const sql = sqlQueryForEngine(engine);
+  type ClientRow = { scope: string | null; deleted_at?: string | null };
+  let rows: ClientRow[];
+  try {
+    rows = (await sql`SELECT scope, deleted_at FROM oauth_clients WHERE client_id = ${ownerClientId}`) as ClientRow[];
+  } catch (err) {
+    if (!isUndefinedColumnError(err, 'deleted_at')) {
+      return {
+        ok: false,
+        reasonCode: 'owner_lookup_failed',
+        message: `delegated tool execution: could not resolve owner client "${ownerClientId}"'s current authority (internal lookup error).`,
+      };
+    }
+    try {
+      rows = (await sql`SELECT scope FROM oauth_clients WHERE client_id = ${ownerClientId}`) as ClientRow[];
+    } catch {
+      return {
+        ok: false,
+        reasonCode: 'owner_lookup_failed',
+        message: `delegated tool execution: could not resolve owner client "${ownerClientId}"'s current authority (internal lookup error).`,
+      };
+    }
+  }
+  if (rows.length === 0 || rows[0].deleted_at != null) {
+    return {
+      ok: false,
+      reasonCode: 'owner_client_revoked',
+      message: `delegated tool execution: owner client "${ownerClientId}" was not found or is no longer active. The delegating job cannot continue exercising its authority.`,
+    };
+  }
+  return { ok: true, scopes: parseScopeString(rows[0].scope) };
+}
+
+/**
+ * Phase 3B-13 — record an exercise-time delegated-execution denial. Reuses
+ * the EXISTING agent-audit JSONL stream (src/core/minions/agent-audit.ts),
+ * the same file submit_agent's own grant-time denials already write to —
+ * one mechanism, not a second audit subsystem. logAgentGrantDecision is
+ * itself best-effort (internal try/catch, writes to stderr on failure,
+ * never throws) so a broken audit sink can never suppress the denial this
+ * function is called alongside.
+ */
+function auditExerciseTimeDeny(
+  ownerClientId: string,
+  jobId: number,
+  operationName: string,
+  reasonCode: string,
+  message: string,
+): void {
+  logAgentGrantDecision({
+    client_id: ownerClientId,
+    decision: 'denied',
+    reason_code: reasonCode,
+    reason: message,
+    job_id: jobId,
+    operation: operationName,
+  });
 }
 
 /**
@@ -293,6 +392,35 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
       // Keyed by the unprefixed op name. Undefined when no hint is registered.
       usage_hint: BRAIN_TOOL_USAGE_HINTS[op.name],
       async execute(input: unknown, ctx: ToolCtx): Promise<unknown> {
+        // Phase 3B-13 (AUTHZ-INV-005/006): re-resolve + gate ONLY when this
+        // job was delegated via submit_agent (ownerClientId set).
+        // Non-delegated child jobs (cycle.ts) skip this block entirely —
+        // identical to pre-3B-13 behavior.
+        let auth: AuthInfo | undefined;
+        if (opts.ownerClientId !== undefined) {
+          const resolved = await resolveOwnerAuthority(ctx.engine, opts.ownerClientId);
+          if (!resolved.ok) {
+            auditExerciseTimeDeny(opts.ownerClientId, ctx.jobId, op.name, resolved.reasonCode, resolved.message);
+            throw new OperationError('permission_denied', resolved.message);
+          }
+          const requiredScope = op.scope ?? 'read';
+          // Same primitive + same agentCallable carve-out as the canonical
+          // MCP/HTTP dispatch gate (src/commands/serve-http.ts's
+          // CallToolRequestSchema handler) — no second authorization
+          // language for the same decision.
+          const scopeSatisfied = hasScope(resolved.scopes, requiredScope)
+            || (op.agentCallable === true && hasScope(resolved.scopes, 'agent'));
+          if (!scopeSatisfied) {
+            const msg = `brain tool "${op.name}" requires scope "${requiredScope}", but owner client "${opts.ownerClientId}"'s current scopes (${resolved.scopes.join(', ') || '(none)'}) do not satisfy it.`;
+            auditExerciseTimeDeny(opts.ownerClientId, ctx.jobId, op.name, 'owner_scope_insufficient', msg);
+            throw new OperationError('permission_denied', msg);
+          }
+          auth = {
+            token: '(delegated — re-resolved from oauth_clients at exercise time, no live bearer token)',
+            clientId: opts.ownerClientId,
+            scopes: resolved.scopes,
+          };
+        }
         const opCtx = buildOpContext({
           engine: ctx.engine,
           config: opts.config,
@@ -303,6 +431,7 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
           allowedSlugPrefixes: opts.allowedSlugPrefixes,
           sourceId: opts.sourceId,
           deferEmbeds: opts.deferEmbeds,
+          auth,
         });
         const params = (input && typeof input === 'object') ? input as Record<string, unknown> : {};
         return op.handler(opCtx, params);
