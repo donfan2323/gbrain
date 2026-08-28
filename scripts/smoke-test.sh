@@ -22,6 +22,21 @@ FIXES=0
 TOTAL=0
 SKIPPED=0
 
+# Portable timeout: GNU coreutils `timeout` isn't on a vanilla macOS box
+# (Homebrew's coreutils installs it as `gtimeout`, and plenty of machines have
+# neither). Fall back to running the command unbounded rather than treating a
+# missing binary as a smoke-test failure.
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 timestamp() { date -u '+%Y-%m-%d %H:%M:%S'; }
 pass()    { TOTAL=$((TOTAL + 1)); echo "✅ $1"; echo "$(timestamp) PASS: $1" >> "$LOG"; }
 fail()    { TOTAL=$((TOTAL + 1)); FAILURES=$((FAILURES + 1)); echo "❌ $1"; echo "$(timestamp) FAIL: $1" >> "$LOG"; }
@@ -75,12 +90,12 @@ fi
 
 # ── 2. GBrain CLI loads ────────────────────────────────────
 if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+  if run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
     pass "GBrain CLI ($GBRAIN_DIR)"
   else
     # Auto-fix: reinstall deps
     cd "$GBRAIN_DIR" && "$BUN_PATH" install --frozen-lockfile 2>/dev/null
-    if timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
+    if run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" --help >/dev/null 2>&1; then
       fixed "GBrain deps reinstalled"
       pass "GBrain CLI (after dep fix)"
     else
@@ -94,7 +109,7 @@ fi
 
 # ── 3. GBrain database ────────────────────────────────────
 if [ -n "$DB_URL" ] && [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ]; then
-  DOCTOR_OUT=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" timeout 20 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor 2>&1)
+  DOCTOR_OUT=$(DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" run_with_timeout 20 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" doctor 2>&1)
   if echo "$DOCTOR_OUT" | grep -q "Health score\|brain_score\|Health Check"; then
     # #4182: BSD grep (macOS) has no -P; keep this shipped smoke test POSIX-portable.
     SCORE=$(printf '%s\n' "$DOCTOR_OUT" | sed -n 's/.*Health score: \([0-9][0-9]*\).*/\1/p' | head -1)
@@ -113,7 +128,7 @@ if [ -n "$GBRAIN_DIR" ] && [ -n "$BUN_PATH" ] && [ -n "$DB_URL" ]; then
   SUPERVISOR_RUNNING=0
   LEGACY_WORKER_RUNNING=0
   if DATABASE_URL="$DB_URL" GBRAIN_DATABASE_URL="$DB_URL" \
-      timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
+      run_with_timeout 15 "$BUN_PATH" run "$GBRAIN_DIR/src/cli.ts" jobs supervisor status --json >/dev/null 2>&1; then
     SUPERVISOR_RUNNING=1
   fi
   if [ -f "$WORKER_PID_FILE" ] && kill -0 "$(cat "$WORKER_PID_FILE")" 2>/dev/null; then

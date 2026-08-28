@@ -294,9 +294,21 @@ describe('TIMELINE-1/2: remote_auto_timeline enabled', () => {
 // ── ERROR: partial-failure consistency ────────────────────────────────────
 describe('ERROR: config-read failure degrades gracefully', () => {
   test('a throwing ctx.engine.getConfig does not crash put_page; the write still succeeds and auto_links becomes {error}', async () => {
+    // Scoped to the auto-links feature's OWN config read (`remote_auto_link`)
+    // — a blanket getConfig throw would also break write-through's unrelated
+    // `sync.repo_path`/`sync.write_through` reads, which upstream's #3935
+    // fail-loud-on-write-through-failure change (reconciled in Phase 3B-30)
+    // now correctly treats as fatal to the whole call, not just to auto_links.
     const throwingEngine = new Proxy(engine, {
       get(target, prop, receiver) {
-        if (prop === 'getConfig') return async () => { throw new Error('config read failed (simulated)'); };
+        if (prop === 'getConfig') {
+          return async (key: string) => {
+            if (key === 'remote_auto_link' || key === 'remote_auto_timeline') {
+              throw new Error('config read failed (simulated)');
+            }
+            return (target as BrainEngine).getConfig(key);
+          };
+        }
         return Reflect.get(target, prop, receiver);
       },
     }) as unknown as BrainEngine;

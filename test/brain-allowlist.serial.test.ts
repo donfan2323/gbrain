@@ -331,6 +331,10 @@ describe('delegated tool execution re-authorization (Phase 3B-13, AUTHZ-INV-005/
   });
 
   test('[Case E] source scoping is unchanged by the new authz gate — still writes to the job-scoped sourceId', async () => {
+    // Write-through needs a real directory for this source's local_path —
+    // put_page now rejects a write whose file can't be written to disk
+    // (same fixture completion as the #1586 test above and the #2544 probe).
+    fs.mkdirSync('/tmp/case-e', { recursive: true });
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config, archived, created_at)
        VALUES ('case-e-source', 'Case E', '/tmp/case-e', '{}'::jsonb, false, now())
