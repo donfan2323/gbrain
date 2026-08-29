@@ -52,16 +52,39 @@ fi
 log "current release before this deploy: ${OLD_CURRENT:-<none — first deploy>}"
 log "previous release before this deploy: ${OLD_PREVIOUS:-<none>}"
 
-# --- 3. Stop.
-log "stopping service"
-service_stop
-wait_for_port_free 15 || log "WARNING: port $GBRAIN_HTTP_PORT still appears occupied after stop wait — continuing anyway (backup below reads a possibly-still-settling data dir)"
+# --- 3. Stop. Fail-closed: service_stop_and_wait confirms the OLD process
+# has actually exited (not just that its port is free — see lib.sh's
+# wait_for_pid_exit for why port-only was insufficient; #Phase-3B-36) before
+# anything below may touch the data dir. On timeout the old PID may still be
+# alive, so we do NOT attempt to restart it here — that risks a second
+# process racing the first for the port/PGLite lock. Current release is
+# still untouched at this point; a human needs to find out why the process
+# wouldn't exit.
+service_stop_and_wait "$GBRAIN_SERVICE_STOP_MAX_WAIT" || die "service did not stop within timeout — aborting BEFORE backup/swap/migration. Current release UNCHANGED (${OLD_CURRENT:-<none>}). Manual investigation required — see docs/PRODUCTION-DEPLOYMENT.md 'Emergency recovery'." 3
 
 # --- 4. Backup data (post-stop, matches the existing manual cp -a
 # .gbrain_backup_<timestamp> precedent — no new backup mechanism invented).
+# The race that historically caused this step to fail (Phase 3B-35) is
+# eliminated by step 3's confirmed-exit wait above — no process is left
+# alive to mutate $GBRAIN_DATA_DIR mid-copy. If cp -a still fails for some
+# OTHER reason (disk full, permissions), the swap/migration/start below
+# have NOT happened yet, so it is safe and narrow (Phase 8) to restart the
+# unchanged OLD_CURRENT release directly: service_stop_and_wait already
+# PROVED the old process is gone, so there is no dual-process/lock-conflict
+# risk the forward-path stop-timeout branch above had to avoid. This is a
+# restart, not a rollback — nothing was ever swapped.
 if [ -d "$GBRAIN_DATA_DIR" ]; then
   BACKUP_NAME="$(date -u '+%Y%m%d%H%M%S')-pre-$(basename "$RELEASE_DIR")"
-  cp -a "$GBRAIN_DATA_DIR" "$SHARED_BACKUPS_DIR/$BACKUP_NAME"
+  if ! cp -a "$GBRAIN_DATA_DIR" "$SHARED_BACKUPS_DIR/$BACKUP_NAME"; then
+    log "ERROR: backup failed — current release is UNCHANGED (${OLD_CURRENT:-<none>}); attempting narrow auto-recovery (restart, not rollback)"
+    if [ -n "$OLD_CURRENT" ]; then
+      if service_start "$OLD_CURRENT/bin/gbrain" && "$SCRIPT_DIR/smoke-test.sh"; then
+        die "backup failed for $RELEASE_DIR; auto-recovery restarted the unchanged release ($OLD_CURRENT) and it is confirmed healthy. Investigate the backup failure (disk space? permissions on $SHARED_BACKUPS_DIR?) before retrying." 3
+      fi
+      die "backup failed for $RELEASE_DIR, AND auto-recovery restart of the unchanged release ($OLD_CURRENT) also failed its smoke test. Automation stops here — this needs a human. See docs/PRODUCTION-DEPLOYMENT.md 'Emergency recovery'." 3
+    fi
+    die "backup failed for $RELEASE_DIR and there is no prior release to restart (first-ever deploy). Manual recovery required." 3
+  fi
   log "data backed up to $SHARED_BACKUPS_DIR/$BACKUP_NAME"
 fi
 
@@ -111,8 +134,17 @@ if [ -z "$OLD_CURRENT" ]; then
   die "deploy failed smoke test and there is no previous release (first-ever deploy). Service left on the FAILED release. Manual recovery required — see docs/PRODUCTION-DEPLOYMENT.md 'Emergency recovery'." 3
 fi
 
-service_stop
-wait_for_port_free 15 || true
+# No backup/cp -a happens on this path (rollback only swaps a symlink), so
+# the file-disappears-mid-copy race doesn't apply here — but a confirmed
+# exit still meaningfully reduces the chance of the about-to-start OLD
+# release racing the FAILED release for the port/PGLite lock. Unlike the
+# forward-path stop above, we deliberately do NOT die on timeout here:
+# there is no in-flight mutation to protect, and the swap-back + smoke-test
+# below already exist specifically to be the final arbiter of whether this
+# recovery attempt actually worked — dying instead of attempting it would
+# only make automatic recovery less likely to succeed, weakening existing
+# rollback behavior.
+service_stop_and_wait "$GBRAIN_SERVICE_STOP_MAX_WAIT" || log "WARNING: pid did not confirm exit within timeout — attempting rollback swap+restart anyway; the smoke test below is the final arbiter"
 atomic_symlink "$OLD_CURRENT" "$CURRENT_LINK"
 log "current rolled back -> $OLD_CURRENT"
 # Restore `previous` to what it was before this deploy attempt (may be

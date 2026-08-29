@@ -32,9 +32,12 @@ PREV_MANIFEST_VERSION="$(bun -e '
   console.log(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).version);
 ' "$PREV/manifest.json" 2>/dev/null || echo "")"
 
-log "stopping service"
-service_stop
-wait_for_port_free 15 || log "WARNING: port $GBRAIN_HTTP_PORT still appears occupied after stop wait"
+# Fail-closed (Phase 3B-36): confirm the currently-running process has
+# actually exited — not just freed its port — before swapping symlinks.
+# No cp -a here (rollback never touches the data dir), but starting the
+# rolled-back-to release while the old process might still hold the
+# port/PGLite lock is exactly the failure mode a confirmed wait avoids.
+service_stop_and_wait "$GBRAIN_SERVICE_STOP_MAX_WAIT" || die "service did not stop within timeout — aborting BEFORE the current/previous swap. 'current' remains unchanged ($CUR). Manual investigation required." 3
 
 # Swap: previous <- old current, current <- old previous. This preserves the
 # "there are always two named slots, and they always point at each other's
