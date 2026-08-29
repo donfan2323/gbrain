@@ -25,6 +25,12 @@ GBRAIN_PROD_ROOT="${GBRAIN_PROD_ROOT:-/Users/lab/AI_Production/gbrain}"
 GBRAIN_DATA_DIR="${GBRAIN_DATA_DIR:-$HOME/.gbrain}"
 
 GBRAIN_HTTP_PORT="${GBRAIN_HTTP_PORT:-8765}"
+
+# Bound for service_stop_and_wait's confirmed-exit poll (Phase 3B-36).
+# Overridable for tests that need to exercise the timeout path without a
+# real 30s wait — matches the existing GBRAIN_SMOKE_MAX_WAIT/
+# GBRAIN_DEPLOY_LOCK_MAX_TRIES pattern.
+GBRAIN_SERVICE_STOP_MAX_WAIT="${GBRAIN_SERVICE_STOP_MAX_WAIT:-30}"
 GBRAIN_PUBLIC_URL="${GBRAIN_PUBLIC_URL:-https://fumitakamac-mini.tailcb4b20.ts.net}"
 GBRAIN_LAUNCHD_LABEL="${GBRAIN_LAUNCHD_LABEL:-com.user.gbrain}"
 GBRAIN_LAUNCHD_PLIST="${GBRAIN_LAUNCHD_PLIST:-$HOME/Library/LaunchAgents/${GBRAIN_LAUNCHD_LABEL}.plist}"
@@ -233,18 +239,87 @@ release_deploy_lock() {
 
 TEST_PID_FILE="$SHARED_DIR/.test-service.pid"
 
+# Discovers the actual OS PID of the currently-running service, if any.
+# Prints it on stdout and returns 0; prints nothing and returns 1 if no
+# service appears to be running (safe to treat as "already stopped" by
+# callers). Must be called BEFORE service_stop — the whole point is to
+# capture what to wait for prior to issuing the stop request.
+discover_service_pid() {
+  if [ "$GBRAIN_DEPLOY_TEST_MODE" = "1" ]; then
+    [ -f "$TEST_PID_FILE" ] || return 1
+    local pid
+    pid="$(cat "$TEST_PID_FILE")"
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+    return 0
+  fi
+  # `launchctl list` prints "PID\tStatus\tLabel" per job, one per line; a
+  # loaded-but-not-running job shows "-" for PID. awk field 3 is the label
+  # (fields are tab-separated but awk's default FS splits on any
+  # whitespace run, which still works here since the label has none).
+  local pid
+  pid="$(launchctl list 2>/dev/null | awk -v label="$GBRAIN_LAUNCHD_LABEL" '$3 == label { print $1; exit }')"
+  [ -n "$pid" ] && [ "$pid" != "-" ] || return 1
+  echo "$pid"
+  return 0
+}
+
+# Portable, GNU-independent bounded wait for a PID to actually disappear
+# from the process table. #4XXX (Phase 3B-36): `launchctl bootout`
+# returning — or a plain `kill` in test mode — does NOT guarantee the
+# underlying process has finished its own shutdown. PGLite's disconnect()
+# drains in-flight work, releases its advisory .gbrain-lock, and disposes
+# before actually exiting (src/core/pglite-engine.ts) — that takes a real,
+# if normally brief, amount of wall-clock time. wait_for_port_free alone
+# proved insufficient in production (Phase 3B-35): the service can unbind
+# its listening port before it finishes deleting its own transient lock
+# files, and the original code only WARNED on a port-wait timeout instead
+# of gating the backup step on it. This helper is the authoritative
+# fail-closed gate — poll for the PID's actual disappearance, no GNU
+# `timeout`/`gtimeout` dependency, pure portable shell.
+wait_for_pid_exit() {
+  local pid="$1"
+  local max_wait_s="${2:-30}"
+  local interval_s=0.25
+  local elapsed_s=0
+  while :; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    # awk for float comparison — bash arithmetic is integer-only and
+    # max_wait_s/interval_s are not guaranteed to be whole numbers.
+    awk -v e="$elapsed_s" -v m="$max_wait_s" 'BEGIN { exit !(e < m) }' || break
+    sleep "$interval_s"
+    elapsed_s="$(awk -v e="$elapsed_s" -v i="$interval_s" 'BEGIN { print e + i }')"
+  done
+  kill -0 "$pid" 2>/dev/null || return 0
+  return 1
+}
+
+# Stop the service AND wait for confirmed process exit before returning.
+# Fail-closed: a non-zero return means the OLD process may still be alive
+# — callers MUST NOT proceed to backup/current-swap/migration on failure.
+service_stop_and_wait() {
+  local max_wait_s="${1:-30}"
+  local pid
+  if ! pid="$(discover_service_pid)"; then
+    log "no running service PID found — treating as already stopped"
+    return 0
+  fi
+  log "stopping service (pid $pid)"
+  service_stop
+  if wait_for_pid_exit "$pid" "$max_wait_s"; then
+    log "confirmed process exit (pid $pid)"
+    return 0
+  fi
+  log "ERROR: pid $pid still alive after ${max_wait_s}s wait — refusing to proceed to backup/swap"
+  return 1
+}
+
 service_stop() {
   if [ "$GBRAIN_DEPLOY_TEST_MODE" = "1" ]; then
     if [ -f "$TEST_PID_FILE" ]; then
       local pid
       pid="$(cat "$TEST_PID_FILE")"
-      if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        for _ in $(seq 1 20); do
-          kill -0 "$pid" 2>/dev/null || break
-          sleep 0.2
-        done
-      fi
+      kill "$pid" 2>/dev/null || true
       rm -f "$TEST_PID_FILE"
     fi
     return 0
@@ -274,9 +349,13 @@ service_start() {
   launchctl bootstrap "gui/$(id -u)" "$GBRAIN_LAUNCHD_PLIST"
 }
 
-# Bounded wait until nothing is listening on GBRAIN_HTTP_PORT — called after
-# service_stop so a subsequent data backup reads a truly-quiesced DB, and so
-# service_start never races the previous holder's PGLite lock release.
+# Bounded wait until nothing is listening on GBRAIN_HTTP_PORT. Historically
+# used as the sole pre-backup gate in deploy.sh/rollback.sh; superseded
+# there by service_stop_and_wait's PID-based wait (Phase 3B-36) — a
+# service can unbind its port well before it finishes its own internal
+# shutdown cleanup, so port-freedom alone proved insufficient to gate a
+# data backup on. Kept as a general-purpose helper (e.g. for a future
+# script that only cares about the listener, not process cleanup).
 wait_for_port_free() {
   local max_wait="${1:-15}"
   local waited=0

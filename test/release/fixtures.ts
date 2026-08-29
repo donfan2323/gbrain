@@ -268,6 +268,138 @@ esac
   writeFileSync(join(dir, 'source.diff'), '');
 }
 
+/**
+ * A fixture release whose `serve` genuinely binds the port and answers
+ * smoke-test.sh's real checks (/health with matching version, /mcp and
+ * /mcp-v2 both 401) — unlike makeFixtureRelease's launcher, which never
+ * binds anything. Used for Phase 3B-36's end-to-end deploy simulation: on
+ * TERM it releases its port IMMEDIATELY (mirroring how gbrain unbinds its
+ * listener early) but only deletes its lock-like files, and actually
+ * exits, after `shutdownDelaySeconds` — reproducing the real incident's
+ * shape (port-free does not imply process-gone) against the REAL
+ * deploy.sh, not a reimplementation. Requires a real `bun` on PATH (the
+ * dev/test machine's own — never a fixture stub) to run the inline HTTP
+ * server; `runtime/bun`'s own file content is irrelevant here since this
+ * launcher never delegates to it.
+ */
+export function makeSlowShutdownFixtureRelease(
+  dir: string,
+  opts: FixtureReleaseOptions & { shutdownDelaySeconds: number; unhealthy?: boolean },
+): void {
+  mkdirSync(join(dir, 'app', 'src'), { recursive: true });
+  mkdirSync(join(dir, 'app', 'node_modules'), { recursive: true });
+  mkdirSync(join(dir, 'runtime'), { recursive: true });
+  mkdirSync(join(dir, 'bin'), { recursive: true });
+
+  const version = opts.version ?? '0.0.0-fixture';
+  const gitSha = opts.gitSha ?? '0'.repeat(40);
+
+  writeFileSync(join(dir, 'app', 'src', 'cli.ts'), '// fixture cli.ts — not real gbrain\n');
+  writeFileSync(join(dir, 'app', 'package.json'), '{"name":"gbrain-fixture"}\n');
+  writeFileSync(join(dir, 'app', 'bun.lock'), '');
+  writeFileSync(join(dir, 'runtime', 'bun'), '#!/usr/bin/env bash\necho "fixture-bun-stub"\n');
+  chmodSync(join(dir, 'runtime', 'bun'), 0o555);
+
+  // Inline HTTP server run via the REAL system bun (not runtime/bun, which
+  // stays a checksummed-but-inert stub here, matching the base fixture).
+  const serverScript = `
+const port = Number(process.env.GBRAIN_HTTP_PORT || '${opts.port}');
+const dataDir = process.env.GBRAIN_DATA_DIR || process.env.GBRAIN_HOME + '/.gbrain';
+const fs = require('fs');
+try { fs.mkdirSync(dataDir, { recursive: true }); } catch {}
+fs.writeFileSync(dataDir + '/.gbrain-lock', '');
+fs.writeFileSync(dataDir + '/postmaster.pid', '');
+const server = Bun.serve({
+  port,
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === '/health') {
+      ${opts.unhealthy ? "return new Response('unhealthy', { status: 500 });" : `return new Response(JSON.stringify({ status: 'ok', version: '${version}', engine: 'fixture' }), {
+        headers: { 'content-type': 'application/json' },
+      });`}
+    }
+    if (url.pathname === '/mcp' || url.pathname === '/mcp-v2') {
+      return new Response('unauthorized', { status: 401 });
+    }
+    if (url.pathname === '/.well-known/oauth-authorization-server') {
+      return new Response(JSON.stringify({ code_challenge_methods_supported: ['S256'] }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response('not found', { status: 404 });
+  },
+});
+process.on('SIGTERM', () => {
+  server.stop(true); // port released immediately — mirrors the real race window
+  setTimeout(() => {
+    try { fs.unlinkSync(dataDir + '/.gbrain-lock'); } catch {}
+    try { fs.unlinkSync(dataDir + '/postmaster.pid'); } catch {}
+    process.exit(0);
+  }, ${Math.round(opts.shutdownDelaySeconds * 1000)});
+});
+`;
+  writeFileSync(join(dir, 'app', 'src', 'fixture-server.js'), serverScript);
+
+  const launcher = `#!/usr/bin/env bash
+set -euo pipefail
+DIR="$(cd "$(dirname "${'${BASH_SOURCE[0]}'}")/.." && pwd)"
+case "\${1:-}" in
+  --version)
+    echo "gbrain ${version}"
+    exit 0
+    ;;
+  serve)
+    exec bun "$DIR/app/src/fixture-server.js"
+    ;;
+  *)
+    echo "fixture-gbrain: unsupported command: $*" >&2
+    exit 1
+    ;;
+esac
+`;
+  writeFileSync(join(dir, 'bin', 'gbrain'), launcher);
+  chmodSync(join(dir, 'bin', 'gbrain'), 0o555);
+
+  const cliChecksum = sha256OfSync(join(dir, 'app', 'src', 'cli.ts'));
+  const bunChecksum = sha256OfSync(join(dir, 'runtime', 'bun'));
+  const launcherChecksum = sha256OfSync(join(dir, 'bin', 'gbrain'));
+  const pkgChecksum = sha256OfSync(join(dir, 'app', 'package.json'));
+  const lockChecksum = sha256OfSync(join(dir, 'app', 'bun.lock'));
+  const nmDigest = nodeModulesDigestSync(dir);
+
+  writeFileSync(
+    join(dir, 'checksums.txt'),
+    [
+      `${cliChecksum}  app/src/cli.ts`,
+      `${pkgChecksum}  app/package.json`,
+      `${lockChecksum}  app/bun.lock`,
+      `${bunChecksum}  runtime/bun`,
+      `${launcherChecksum}  bin/gbrain`,
+      '',
+    ].join('\n'),
+  );
+
+  const manifest = {
+    release_name: dir.split('/').pop(),
+    version,
+    git_sha: gitSha,
+    git_sha_short: gitSha.slice(0, 7),
+    source_dirty: false,
+    built_at: new Date().toISOString(),
+    bundle_type: 'runtime-bundle',
+    port: opts.port,
+    public_url: 'https://example.invalid',
+    routes_expected: ['/mcp', '/mcp-v2', '/health'],
+    launcher_checksum_sha256: launcherChecksum,
+    bun_runtime: { source_path: join(dir, 'runtime', 'bun'), version: 'fixture', sha256: bunChecksum },
+    dependency_count: 0,
+    node_modules_digest_sha256: nmDigest,
+    install_flags: '--production --frozen-lockfile --ignore-scripts',
+  };
+  writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+  writeFileSync(join(dir, 'source.diff'), '');
+}
+
 /** Reads and JSON.parses a release's manifest.json. */
 export function readManifest(releaseDir: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(releaseDir, 'manifest.json'), 'utf8'));
