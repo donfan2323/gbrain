@@ -1,0 +1,243 @@
+{
+  "$schema_notes": "Source of truth for the Official-First maintenance model (Phase 3B-38). Read by scripts/release/official-first-plan.ts. Do not hand-edit patch entries without also updating the commit series on official-first/<version> and re-running the drift checker (official-first-plan.ts --drift).",
+  "official_base": {
+    "version": "0.47.4.0",
+    "sha": "c860a411f6fee694a9668cf9d5ffb60af9a7b1eb",
+    "branch": "official-tracking/v0.47.4",
+    "committed_at": "2026-08-28T10:15:06-07:00"
+  },
+  "official_first_head": {
+    "branch": "official-first/v0.47.4",
+    "sha": "03c318efee4e0d3fa36b59b5b6e0df713d44c79f"
+  },
+  "migration_ceiling": 144,
+  "patches": [
+    {
+      "id": "authz-005-006",
+      "commit": "ca0d29648",
+      "subject": "fix(authz): revalidate delegated owner authority at execution",
+      "category": "SECURITY_RUNTIME",
+      "required": true,
+      "risk": "high",
+      "files": [
+        "src/core/minions/agent-audit.ts",
+        "src/core/minions/handlers/subagent.ts",
+        "src/core/minions/tools/brain-allowlist.ts",
+        "src/core/minions/types.ts"
+      ],
+      "notes": "Live re-authorization of a delegated subagent's owning OAuth client at tool-execution time. Upstream has no equivalent — a revoked/rescoped owner would otherwise still be trusted for the lifetime of an in-flight job."
+    },
+    {
+      "id": "authz-016-017",
+      "commit": "00c8ef5c1",
+      "subject": "fix(authz): enforce null-binding-folds-to-empty + delegating-scope coverage",
+      "category": "SECURITY_RUNTIME",
+      "required": true,
+      "risk": "high",
+      "files": [
+        "src/core/ops/jobs.ts"
+      ],
+      "notes": "Registration-time submit_agent validation: null bound_slug_prefixes must fold to empty (deny), and a delegating client's own scope must cover what it delegates. Confirmed upstream v0.47.4 still has the underlying 016-class gap (null bypasses validation)."
+    },
+    {
+      "id": "mcp-v2-authz-013",
+      "commit": "c8898d0e3",
+      "subject": "feat(mcp): restore /mcp-v2 alias + AUTHZ-INV-013 admin/OAuth/webhook audit trail",
+      "category": ["COMPAT_RUNTIME", "SECURITY_RUNTIME"],
+      "required": true,
+      "risk": "high",
+      "files": [
+        "src/commands/serve-http.ts"
+      ],
+      "notes": "Bundled by design: /mcp-v2 backs a live, configured external Connector (compatibility); AUTHZ-INV-013 adds admin/OAuth/webhook audit logging (security). Highest-risk file in the whole stack — most actively developed by upstream, and the one place a real regression occurred (see mcp-v2-metrics-fix)."
+    },
+    {
+      "id": "release-ops-governance",
+      "commit": "6f4752064",
+      "subject": "chore(ops): bring over governed release pipeline + local git governance",
+      "category": "DEPLOY_OPS",
+      "required": true,
+      "risk": "low",
+      "files": [
+        ".git-governance/profile.conf",
+        ".githooks/pre-push",
+        ".githooks/reference-transaction",
+        "scripts/git_safe_checkpoint.sh",
+        "scripts/git_safe_update.sh",
+        "scripts/release/build-release.sh",
+        "scripts/release/cleanup.sh",
+        "scripts/release/deploy.sh",
+        "scripts/release/lib.sh",
+        "scripts/release/preflight.sh",
+        "scripts/release/rollback.sh",
+        "scripts/release/smoke-test.sh",
+        "scripts/release/status.sh",
+        "scripts/smoke-test.sh"
+      ],
+      "test_files": [
+        "test/admin-authority-audit-coverage.test.ts",
+        "test/brain-allowlist.serial.test.ts",
+        "test/helpers/short-socket-dir.ts",
+        "test/ingest-audit-coverage.test.ts",
+        "test/jobs-owner-fence-delegated-tool-interaction.test.ts",
+        "test/mcp-v2-route-alias.test.ts",
+        "test/oauth-credential-audit-coverage.test.ts",
+        "test/oauth-sdk-fallback-audit-coverage.test.ts",
+        "test/release/build-release.serial.test.ts",
+        "test/release/cleanup.serial.test.ts",
+        "test/release/deploy.serial.test.ts",
+        "test/release/fixtures.ts",
+        "test/release/lib-scan-for-secrets.test.ts",
+        "test/release/preflight.serial.test.ts",
+        "test/release/rollback.serial.test.ts",
+        "test/release/scripts-safety-static.test.ts",
+        "test/webhook-audit-coverage.test.ts"
+      ],
+      "notes": "None of these files exist in pure official — purely additive, zero shared lines with official's own files, so conflict probability on future rebases is ~zero regardless of upstream churn."
+    },
+    {
+      "id": "worker-registry-etime",
+      "commit": "64ec05b1b",
+      "subject": "fix(minions): use ps -o etime= instead of lstart= (test-tooling only)",
+      "category": "TOOLING_RUNTIME",
+      "required": false,
+      "risk": "low",
+      "files": [
+        "src/core/minions/worker-registry.ts"
+      ],
+      "notes": "Non-security, test-determinism-only (avoids a timezone-sensitive PID-reuse guard flake under bun test's UTC pinning). Explicitly classified as a LOW-COST TOOLING PATCH — the one item in the stack that could be revisited/dropped in a future review without materially changing security or runtime behavior."
+    },
+    {
+      "id": "dcr-deployment-invariant",
+      "commit": "efe7e2d1f",
+      "subject": "feat(ops): add DCR-disabled deployment invariant to preflight gate",
+      "category": "DEPLOY_OPS",
+      "required": true,
+      "risk": "high",
+      "files": [
+        "scripts/release/preflight.sh"
+      ],
+      "notes": "Replaces the old DCR_ALLOWED_SCOPES SOURCE patch (intentionally dropped — see dropped_from_old_fork) with a deployment-time policy gate: fails closed if --enable-dcr appears in the launchd ProgramArguments. Reads ONLY :ProgramArguments, never :EnvironmentVariables — cannot expose the bootstrap token."
+    },
+    {
+      "id": "authz-test-fixture-fix",
+      "commit": "1c94d9b6c",
+      "subject": "test(authz): fix official fixture gap + drop stale DCR assertion (Phase 16)",
+      "category": "TEST_ONLY",
+      "required": true,
+      "risk": "low",
+      "files": [
+        "test/jobs-owner-fence-delegated-tool-interaction.test.ts",
+        "test/submit-agent.test.ts"
+      ],
+      "notes": "Required companion to authz-016-017/authz-005-006 — without it, official's own pre-existing test fixtures fail closed against the new AUTHZ-INV-017 scope-coverage check for reasons unrelated to the patch's correctness (mock ctx.auth never populated scopes)."
+    },
+    {
+      "id": "dcr-invariant-test",
+      "commit": "eebd357ed",
+      "subject": "test(ops): add DCR-disabled deployment invariant test (Phase 17)",
+      "category": "TEST_ONLY",
+      "required": true,
+      "risk": "low",
+      "files": [
+        "test/release/fixtures.ts",
+        "test/release/preflight.serial.test.ts"
+      ],
+      "notes": "Proves dcr-deployment-invariant fails closed (incl. no bypass by ProgramArguments reordering, zero token exposure, byte-identical plist before/after)."
+    },
+    {
+      "id": "mcp-v2-metrics-fix",
+      "commit": "e6aaa08d2",
+      "subject": "fix(serve-http): restore official's #3893 /metrics wiring dropped by the mcp-v2/AUTHZ-INV-013 patch",
+      "category": ["COMPAT_RUNTIME", "GENERATED"],
+      "required": true,
+      "risk": "high",
+      "files": [
+        "src/commands/serve-http.ts",
+        "src/core/cli-flag-registry.generated.ts"
+      ],
+      "notes": "Corrective patch: reconstructing mcp-v2-authz-013 via a historical fork-wide diff (forbidden going forward — see docs/OFFICIAL-FIRST-UPGRADE.md) silently reverted official's own #3893 (Prometheus /metrics endpoint) because the fork's historical baseline predated it. Caught by the one-time full-suite gate, not by inspection. cli-flag-registry.generated.ts is a regenerated build artifact (scripts/generate-flag-registry.ts), not hand-authored."
+    },
+    {
+      "id": "deploy-stop-backup-race-fix",
+      "commit": "03c318efe",
+      "subject": "fix(deploy): wait for confirmed process exit before backup, not just port-free",
+      "category": "DEPLOY_OPS",
+      "required": true,
+      "risk": "high",
+      "files": [
+        "scripts/release/deploy.sh",
+        "scripts/release/lib.sh",
+        "scripts/release/rollback.sh"
+      ],
+      "test_files": [
+        "test/release/deploy-stop-wait-e2e.serial.test.ts",
+        "test/release/fixtures.ts",
+        "test/release/service-stop-wait.serial.test.ts"
+      ],
+      "notes": "Fixes the TOCTOU race that caused a real Phase 3B-35 production deploy failure (backup raced a still-shutting-down process). Proven closed in production during Phase 3B-37."
+    }
+  ],
+  "approved_runtime_files": [
+    "src/commands/serve-http.ts",
+    "src/core/cli-flag-registry.generated.ts",
+    "src/core/minions/agent-audit.ts",
+    "src/core/minions/handlers/subagent.ts",
+    "src/core/minions/tools/brain-allowlist.ts",
+    "src/core/minions/types.ts",
+    "src/core/minions/worker-registry.ts",
+    "src/core/ops/jobs.ts"
+  ],
+  "high_risk_files": [
+    {
+      "path": "src/commands/serve-http.ts",
+      "reason": "Carries mcp-v2-authz-013 (highest risk in the stack) — most actively developed file by upstream; the one place a real regression (dropped /metrics) already occurred once via the now-forbidden reconstruction method."
+    },
+    {
+      "path": "src/core/ops/jobs.ts",
+      "reason": "Carries authz-016-017 (submit_agent registration-time delegation validation) — moderate upstream churn expected."
+    },
+    {
+      "path": "src/core/minions/tools/brain-allowlist.ts",
+      "reason": "Carries authz-005-006 (execution-time owner-authority reauth) — the core delegated-tool trust boundary."
+    },
+    {
+      "path": "src/core/minions/types.ts",
+      "reason": "Shared types for authz-005-006 — a narrow, low-churn file, but a signature change here ripples into brain-allowlist.ts/subagent.ts."
+    },
+    {
+      "path": "src/core/minions/handlers/subagent.ts",
+      "reason": "Carries authz-005-006's job-handler wiring."
+    },
+    {
+      "path": "src/core/minions/agent-audit.ts",
+      "reason": "Shared audit-log writer used by both authz-005-006 and mcp-v2-authz-013."
+    }
+  ],
+  "security_sensitive_upstream_areas": [
+    "oauth",
+    "dcr",
+    "source-scope-privacy",
+    "migration-schema",
+    "auth-session",
+    "remote-file-upload",
+    "path-confinement",
+    "credential-redaction"
+  ],
+  "dropped_from_old_fork": [
+    {
+      "feature": "DCR_ALLOWED_SCOPES source-level registration ceiling",
+      "replaced_by": "dcr-deployment-invariant (deployment-time policy gate in preflight.sh)"
+    },
+    {
+      "feature": "remote_auto_link / remote_auto_timeline",
+      "reason": "Confirmed default-off/unused in production config (~/.gbrain/config.json has no reference). Safe to drop. If it ever reappears in a future official-first diff without an explicit manifest entry, the drift checker must flag it (Phase 8)."
+    }
+  ],
+  "forbidden_reconciliation_methods": [
+    "historical fork/master merge into a new official base",
+    "broad old-fork-to-new-fork whole-tree diff application",
+    "any reconstruction method that diffs against a fork snapshot older than the CURRENT official_base"
+  ],
+  "approved_reconciliation_method": "pure official base (official-tracking/<version>) + cherry-pick/rebase-replay of the patches[] commits in the listed order, resolving conflicts only in the flagged high_risk_files"
+}
