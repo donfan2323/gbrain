@@ -411,9 +411,10 @@ export function driftCheck(manifest: Manifest = loadManifest(), trackingRef = 'o
     reappeared.push('DCR_ALLOWED_SCOPES source-level ceiling has returned to src/core/scope.ts — this was intentionally replaced by the deployment invariant');
   }
   for (const f of ['remote_auto_link', 'remote_auto_timeline']) {
-    const hit = git(['diff', '--name-only', trackingRef, firstRef], repoRoot, { allowFail: true })
-      .split('\n')
-      .some(path => git(['diff', trackingRef, firstRef, '--', path], repoRoot, { allowFail: true }).includes(f));
+    // Scoped to the SAME src/-only file list as actualChanged — a docs page
+    // or the manifest itself mentioning the feature name as a documented,
+    // intentional drop must never register as it "reappearing" in runtime.
+    const hit = actualChanged.some(path => git(['diff', trackingRef, firstRef, '--', path], repoRoot, { allowFail: true }).includes(f));
     if (hit) reappeared.push(`${f} references have reappeared in the runtime diff — this feature was confirmed unused and dropped`);
   }
 
