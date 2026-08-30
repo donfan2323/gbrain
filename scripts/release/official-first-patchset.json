@@ -8,7 +8,7 @@
   },
   "official_first_head": {
     "branch": "official-first/v0.47.6",
-    "sha": "e290f4066624e9f457ef5e00f183ba8d9af9a424"
+    "sha": "fb66fb70ccd82c2853f4e992167e0f944d62b79c"
   },
   "migration_ceiling": 144,
   "patches": [
@@ -182,6 +182,18 @@
         "test/release/service-stop-wait.serial.test.ts"
       ],
       "notes": "Fixes the TOCTOU race that caused a real Phase 3B-35 production deploy failure (backup raced a still-shutting-down process). Proven closed in production during Phase 3B-37."
+    },
+    {
+      "id": "status-snapshot-scope-audit-test",
+      "commit": "fb66fb70c",
+      "subject": "test(security): pin get_status_snapshot's admin-scope gate + unscoped-source residual",
+      "category": "TEST_ONLY",
+      "required": true,
+      "risk": "low",
+      "files": [
+        "test/get-status-snapshot-scope-audit.test.ts"
+      ],
+      "notes": "v0.47.6 refresh audit finding: #4592 (get_stats/get_health/get_brain_identity source-grant confinement) never touched get_status_snapshot, a different file (src/core/ops/skills-catalog.ts) whose handler still runs an unscoped sources query. Pins that a read-only remote OAuth grant is denied at the serve-http admin-scope dispatch gate before reaching the handler, and documents (does not fix) the residual unscoped disclosure for any caller who does hold admin scope."
     }
   ],
   "approved_runtime_files": [
